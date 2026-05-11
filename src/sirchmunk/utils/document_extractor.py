@@ -11,8 +11,8 @@ All other modules should import from here rather than from kreuzberg directly.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import dataclasses
+import multiprocessing as mp
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,38 +22,93 @@ from loguru import logger
 
 
 # ---------------------------------------------------------------------------
-# Top-level helper for subprocess-based extraction (must be picklable)
+# Subprocess extraction helpers (module-level for picklability)
 # ---------------------------------------------------------------------------
 
-def _extract_in_worker(
+_EXTRACT_TIMEOUT_S = 600
+
+
+def _extraction_worker(
+    file_path: str,
+    profile_dict: dict[str, Any],
+    pipe_w: mp.connection.Connection,
+) -> None:
+    """Child process entry point: run kreuzberg, send result via pipe, exit.
+
+    Sends a plain dict so no native kreuzberg/Rust objects cross the
+    process boundary.  On failure sends ``{"_error": "<message>"}``.
+    """
+    try:
+        import asyncio as _aio
+
+        async def _run() -> dict[str, Any]:
+            from sirchmunk.utils.document_extractor import (
+                DocumentExtractor,
+                ExtractionProfile,
+            )
+            profile = ExtractionProfile(**profile_dict)
+            output = await DocumentExtractor.extract(file_path, profile)
+            return {
+                "content": output.content,
+                "mime_type": output.mime_type,
+                "metadata": output.metadata,
+                "tables": output.tables,
+                "detected_languages": output.detected_languages,
+                "page_count": output.page_count,
+            }
+
+        pipe_w.send(_aio.run(_run()))
+    except BaseException as exc:
+        try:
+            pipe_w.send({"_error": str(exc)})
+        except Exception:
+            pass
+    finally:
+        pipe_w.close()
+
+
+def _run_extraction_in_child(
     file_path: str,
     profile_dict: dict[str, Any],
 ) -> dict[str, Any]:
-    """Run kreuzberg extraction inside a worker process.
+    """Spawn an isolated child process, wait for its result.
 
-    Returns a plain dict so the result crosses the process boundary
-    without dragging native kreuzberg objects (and their Rust allocations)
-    back into the parent process.
+    Unlike ``ProcessPoolExecutor``, a crash in one child never
+    poisons future extractions — each call spawns a fresh process.
     """
-    import asyncio as _aio
+    pipe_r, pipe_w = mp.Pipe(duplex=False)
+    proc = mp.Process(
+        target=_extraction_worker,
+        args=(file_path, profile_dict, pipe_w),
+        daemon=True,
+    )
+    proc.start()
+    pipe_w.close()
 
-    async def _run() -> dict[str, Any]:
-        from sirchmunk.utils.document_extractor import (
-            DocumentExtractor,
-            ExtractionProfile,
+    try:
+        if not pipe_r.poll(timeout=_EXTRACT_TIMEOUT_S):
+            proc.kill()
+            proc.join(timeout=10)
+            raise RuntimeError(
+                f"Extraction timed out after {_EXTRACT_TIMEOUT_S}s"
+            )
+        result = pipe_r.recv()
+    except EOFError:
+        proc.join(timeout=10)
+        raise RuntimeError(
+            f"Worker crashed (exit code {proc.exitcode})"
         )
-        profile = ExtractionProfile(**profile_dict)
-        output = await DocumentExtractor.extract(file_path, profile)
-        return {
-            "content": output.content,
-            "mime_type": output.mime_type,
-            "metadata": output.metadata,
-            "tables": output.tables,
-            "detected_languages": output.detected_languages,
-            "page_count": output.page_count,
-        }
+    finally:
+        pipe_r.close()
 
-    return _aio.run(_run())
+    proc.join(timeout=30)
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
+
+    if isinstance(result, dict) and "_error" in result:
+        raise RuntimeError(result["_error"])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -269,31 +324,20 @@ class DocumentExtractor:
             )
             raise
 
-    # Shared process pool — lazily created, workers exit after every task
-    # so the OS reclaims all native memory (Rust arenas, layout-model caches).
-    _process_pool: ClassVar[Optional[concurrent.futures.ProcessPoolExecutor]] = None
-    _POOL_WORKERS: ClassVar[int] = max(1, min(os.cpu_count() or 4, 3))
-
-    @classmethod
-    def _get_process_pool(cls) -> concurrent.futures.ProcessPoolExecutor:
-        if cls._process_pool is None:
-            cls._process_pool = concurrent.futures.ProcessPoolExecutor(
-                max_workers=cls._POOL_WORKERS,
-                max_tasks_per_child=1,
-            )
-        return cls._process_pool
-
     @staticmethod
     async def extract_isolated(
         file_path: Union[str, Path],
         profile: Optional[ExtractionProfile] = None,
     ) -> ExtractionOutput:
-        """Extract content in an isolated subprocess.
+        """Extract content in a fully isolated child process.
 
-        Identical to :meth:`extract` but runs kreuzberg inside a child
-        process.  ``max_tasks_per_child=1`` ensures each worker exits
-        after one extraction, allowing the OS to reclaim all native
-        memory (Rust arenas, layout-model buffers, image caches).
+        Each call spawns a fresh ``multiprocessing.Process``.  When the
+        child exits (normally or via crash), the OS reclaims **all** of
+        its native memory — Rust arenas, layout-model buffers, image
+        caches — guaranteeing zero accumulation in the parent.
+
+        Unlike ``ProcessPoolExecutor``, a crash in one extraction never
+        poisons future calls.
 
         Falls back to in-process extraction on subprocess failure.
         """
@@ -304,11 +348,10 @@ class DocumentExtractor:
         }
 
         loop = asyncio.get_event_loop()
-        pool = DocumentExtractor._get_process_pool()
         try:
             raw = await loop.run_in_executor(
-                pool,
-                _extract_in_worker,
+                None,
+                _run_extraction_in_child,
                 str(file_path),
                 profile_dict,
             )
