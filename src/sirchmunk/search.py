@@ -1776,12 +1776,17 @@ class AgenticSearch(BaseSearch):
 
         # ==================== Stage 3: Adequacy check + gap-fill ====================
         adequate, gaps = self._deep_check_adequacy(query, evidence, decomposition)
-        if not adequate and gaps:
+        needs_gap_fill = (not adequate and gaps) or (
+            decomposition.query_type in ("calculation", "comparison")
+        )
+        if needs_gap_fill:
+            fill_gaps = gaps if gaps else ["numeric data for calculation"]
             await self._logger.info(
-                f"[DEEP:S3] Gaps detected ({len(gaps)}): {gaps[:3]}"
+                f"[DEEP:S3] Gaps detected ({len(fill_gaps)}): {fill_gaps[:3]}"
             )
             extra = await self._deep_fill_evidence_gaps(
-                query, gaps, retrieval, artifacts, context,
+                query, fill_gaps, retrieval, artifacts, context,
+                decomposition=decomposition,
             )
             if extra:
                 evidence = f"{evidence}\n\n---\n\n{extra}"
@@ -1810,8 +1815,11 @@ class AgenticSearch(BaseSearch):
             else:
                 return _NO_RESULTS_MESSAGE, None, context
 
-        # ==================== Stage 5: Verification ====================
-        if answer and decomposition.query_type == "calculation":
+        # ==================== Stage 5: Self-consistency + Verification ====================
+        if answer and decomposition.query_type in ("calculation", "comparison"):
+            answer = await self._deep_self_consistency(
+                query, answer, evidence, decomposition, artifacts, retrieval, context,
+            )
             answer, _ = self._deep_verify_answer(query, answer, evidence)
 
         # --- Token accounting ---
@@ -2039,24 +2047,24 @@ class AgenticSearch(BaseSearch):
         retrieval: "DeepRetrieval",
         artifacts: "CompileArtifacts",
         context: "SearchContext",
-        *,
-        max_chars: int = 80_000,
     ) -> str:
         """Stage 1: Evidence saturation for all retrieved files.
 
-        Gathers evidence from multiple sources per file, in priority order:
+        Gathers evidence from multiple sources per file:
         1. Tree navigation (LLM-guided section targeting)
-        2. Table digest (pre-compiled structured tables)
-        3. Tree-guided sampling (section-level content)
-        4. rga keyword sampling (grep-based snippets)
+        2. Table digest (pre-compiled structured tables, expanded budget)
+        3. Financial statement harvesting (rule-based section title match)
+        4. Tree-guided sampling / rga fallback
 
-        Runs tree navigation in parallel across files for efficiency.
+        Uses DEEP-specific budgets (_DEEP_EVIDENCE_TOTAL_CHARS) that are
+        larger than FAST's to maximize evidence quality.
         """
         if not retrieval.file_paths:
             return ""
 
         file_paths = retrieval.file_paths
         tree_paths = artifacts.tree_available_paths if artifacts else set()
+        max_chars = self._DEEP_EVIDENCE_TOTAL_CHARS
 
         async def _gather_for_file(fp: str) -> str:
             parts: List[str] = []
@@ -2082,8 +2090,8 @@ class AgenticSearch(BaseSearch):
                     tables = self._load_table_digest(self.work_path, fh)
                     if tables:
                         budget = (
-                            self._TABLE_EVIDENCE_NAV_OVERLAP_CHARS if nav_ev
-                            else self._TABLE_EVIDENCE_DEFAULT_CHARS
+                            self._DEEP_TABLE_BUDGET_WITH_NAV if nav_ev
+                            else self._DEEP_TABLE_BUDGET
                         )
                         table_ev = self._format_table_evidence(
                             tables, max_chars=budget, query=query,
@@ -2092,6 +2100,10 @@ class AgenticSearch(BaseSearch):
                 pass
             if table_ev:
                 parts.append(f"[{fname} - Table Evidence]\n{table_ev}")
+
+            stmt_ev = await self._harvest_financial_statements(fp, query, artifacts)
+            if stmt_ev:
+                parts.append(f"[{fname} - Financial Statements]\n{stmt_ev}")
 
             if not nav_ev and fp in tree_paths:
                 try:
@@ -2138,6 +2150,52 @@ class AgenticSearch(BaseSearch):
             f"{len(evidence_parts)} files"
         )
         return combined
+
+    async def _harvest_financial_statements(
+        self,
+        file_path: str,
+        query: str,
+        artifacts: "CompileArtifacts",
+    ) -> str:
+        """Proactively extract financial statement sections via tree index.
+
+        Scans tree section titles for income/balance/cashflow patterns and
+        extracts those pages. Complements tree navigation which may focus
+        on narrative sections instead of data-dense statements.
+        """
+        tree_paths = artifacts.tree_available_paths if artifacts else set()
+        if file_path not in tree_paths:
+            return ""
+
+        indexer = self._get_tree_indexer()
+        if indexer is None:
+            return ""
+
+        tree = indexer.load_tree(file_path)
+        if tree is None or tree.root is None:
+            return ""
+
+        statement_sections: List[Dict[str, Any]] = []
+        section_map, sections_meta = self._build_section_map(
+            tree.root, max_depth=self._DEEP_SECTION_MAP_MAX_DEPTH,
+        )
+
+        for sec in sections_meta:
+            title = (sec.get("title") or "").lower()
+            if any(pat.search(title) for pat in self._DEEP_STATEMENT_PATTERNS):
+                if sec.get("page_range"):
+                    statement_sections.append(sec)
+
+        if not statement_sections:
+            return ""
+
+        try:
+            ev = await self._extract_targeted_pages(
+                file_path, statement_sections[:6], query,
+            )
+            return ev or ""
+        except Exception:
+            return ""
 
     async def _deep_decompose_question(
         self,
@@ -2225,41 +2283,48 @@ class AgenticSearch(BaseSearch):
         retrieval: "DeepRetrieval",
         artifacts: "CompileArtifacts",
         context: "SearchContext",
+        decomposition: Optional["DeepDecomposition"] = None,
     ) -> str:
         """Fill identified evidence gaps with targeted retrieval.
 
-        Uses tree section selection for files with tree indices, or
-        keyword-based rga search for specific gap terms.
+        Strategy per file:
+          1. Tree section selection with expanded depth for gap-specific terms
+          2. Table digest supplement for numeric gaps
+          3. Keyword rga fallback for non-tree files
         """
         extra_parts: List[str] = []
         tree_paths = artifacts.tree_available_paths if artifacts else set()
         indexer = self._get_tree_indexer()
+        is_calc = decomposition and decomposition.query_type in ("calculation", "comparison")
 
         for fp in retrieval.file_paths[:3]:
-            if fp not in tree_paths or indexer is None:
-                continue
-
-            tree = indexer.load_tree(fp)
-            if tree is None or tree.root is None:
-                continue
-
-            section_map, sections_meta = self._build_section_map(
-                tree.root, max_depth=self._DEEP_SECTION_MAP_MAX_DEPTH + 1,
-            )
-            if not sections_meta:
-                continue
-
             gap_query = f"{query} — specifically looking for: {'; '.join(gaps[:5])}"
-            selected = await self._select_evidence_sections(
-                gap_query, section_map, sections_meta,
-            )
-            context.increment_loop()
 
-            if selected:
-                ev = await self._extract_targeted_pages(fp, selected, query)
-                if ev and len(ev.strip()) > 100:
-                    extra_parts.append(f"[Gap-fill: {Path(fp).name}]\n{ev}")
-                    context.mark_file_read(fp)
+            if fp in tree_paths and indexer is not None:
+                tree = indexer.load_tree(fp)
+                if tree is not None and tree.root is not None:
+                    section_map, sections_meta = self._build_section_map(
+                        tree.root, max_depth=self._DEEP_SECTION_MAP_MAX_DEPTH + 2,
+                    )
+                    if sections_meta:
+                        selected = await self._select_evidence_sections(
+                            gap_query, section_map, sections_meta,
+                        )
+                        context.increment_loop()
+                        if selected:
+                            ev = await self._extract_targeted_pages(fp, selected, query)
+                            if ev and len(ev.strip()) > 100:
+                                extra_parts.append(f"[Gap-fill: {Path(fp).name}]\n{ev}")
+                                context.mark_file_read(fp)
+
+            if is_calc and any("numeric" in g or "data" in g for g in gaps):
+                table_index = (artifacts.table_index or {}).get(fp, [])
+                if table_index:
+                    table_ev = self._format_table_evidence(
+                        table_index, max_chars=self._DEEP_TABLE_BUDGET_WITH_NAV, query=query,
+                    )
+                    if table_ev and len(table_ev.strip()) > 100:
+                        extra_parts.append(f"[Table-supplement: {Path(fp).name}]\n{table_ev}")
 
         if extra_parts:
             await self._logger.info(
@@ -2281,7 +2346,14 @@ class AgenticSearch(BaseSearch):
         Routes to specialized prompts based on query_type:
         - calculation: DEEP_CALCULATION_SYNTHESIS with explicit computation steps
         - lookup/comparison/synthesis: ROI_RESULT_SUMMARY with document context
+
+        Pre-processing: prunes evidence by entities/time_periods, and
+        appends format constraints derived from query semantics.
         """
+        evidence = self._deep_prune_evidence(evidence, decomposition)
+
+        format_hint = self._deep_format_constraint(query)
+
         doc_context: Optional[str] = None
         if artifacts and artifacts.catalog_map:
             ctx_parts = [
@@ -2299,20 +2371,23 @@ class AgenticSearch(BaseSearch):
             synth_prompt = DEEP_CALCULATION_SYNTHESIS.format(
                 calculation_steps=steps_text,
                 user_input=query,
-                text_content=evidence[:self._DEEP_STRUCTURED_MAX_CHARS * 2],
+                text_content=evidence[:self._DEEP_SYNTHESIS_MAX_CHARS],
             )
         elif doc_context:
             from sirchmunk.llm.prompts import ROI_RESULT_SUMMARY_WITH_CONTEXT
             synth_prompt = ROI_RESULT_SUMMARY_WITH_CONTEXT.format(
                 user_input=query,
-                text_content=evidence[:self._DEEP_STRUCTURED_MAX_CHARS * 2],
+                text_content=evidence[:self._DEEP_SYNTHESIS_MAX_CHARS],
                 document_context=doc_context,
             )
         else:
             synth_prompt = ROI_RESULT_SUMMARY.format(
                 user_input=query,
-                text_content=evidence[:self._DEEP_STRUCTURED_MAX_CHARS * 2],
+                text_content=evidence[:self._DEEP_SYNTHESIS_MAX_CHARS],
             )
+
+        if format_hint:
+            synth_prompt = f"{synth_prompt}\n\n### Format Constraint\n{format_hint}"
 
         resp = await self.llm.achat(
             messages=[{"role": "user", "content": synth_prompt}],
@@ -2332,6 +2407,14 @@ class AgenticSearch(BaseSearch):
         accepted, accept_reason = self._evaluate_evidence_acceptance(
             query, evidence, should_answer,
         )
+
+        if not accepted and decomposition.query_type in ("calculation", "comparison"):
+            accepted = self._deep_relaxed_acceptance(query, evidence)
+            if accepted:
+                accept_reason = "deep_calc_relaxed"
+                should_answer = True
+                should_save = True
+
         await self._logger.info(
             f"[DEEP:S4] Synthesis: accepted={accepted} ({accept_reason}), "
             f"type={decomposition.query_type}"
@@ -2342,6 +2425,121 @@ class AgenticSearch(BaseSearch):
         return answer, should_save, should_answer
 
     @staticmethod
+    def _deep_relaxed_acceptance(query: str, evidence: str) -> bool:
+        """Relaxed acceptance for calculation/comparison queries.
+
+        Accepts when evidence contains >=2 distinct numbers AND at least
+        one query-relevant keyword appears. This prevents false-negative
+        rejections on numeric data that the standard heuristic misses
+        due to low keyword coverage from formula-heavy queries.
+        """
+        numbers = re.findall(r'[\$€£]?\d[\d,]*\.?\d*', evidence[:20000])
+        if len(numbers) < 2:
+            return False
+        kw_coverage = AgenticSearch._compute_keyword_coverage(query, evidence)
+        return kw_coverage >= 0.3
+
+    @staticmethod
+    def _deep_prune_evidence(
+        evidence: str,
+        decomposition: "DeepDecomposition",
+    ) -> str:
+        """Prune evidence paragraphs not matching required time_periods/entities.
+
+        Splits evidence into paragraph-level blocks. Retains a block if it
+        mentions ANY required time period or entity. Blocks that match
+        neither are discarded (unless fewer than 30% of blocks would remain,
+        in which case no pruning is applied to avoid over-filtering).
+        """
+        if not decomposition.time_periods and not decomposition.entities:
+            return evidence
+
+        periods = {p.lower() for p in decomposition.time_periods}
+        year_patterns = {re.search(r"\d{4}", p).group() for p in periods if re.search(r"\d{4}", p)}
+        entities = {e.lower() for e in decomposition.entities}
+
+        blocks = re.split(r'\n{2,}', evidence)
+        if len(blocks) <= 3:
+            return evidence
+
+        kept: List[str] = []
+        for block in blocks:
+            block_lower = block.lower()
+            has_period = any(y in block for y in year_patterns) if year_patterns else True
+            has_entity = any(e in block_lower for e in entities) if entities else True
+            if has_period or has_entity:
+                kept.append(block)
+
+        if len(kept) < len(blocks) * 0.3:
+            return evidence
+        return "\n\n".join(kept)
+
+    @staticmethod
+    def _deep_format_constraint(query: str) -> str:
+        """Derive answer format guidance from query semantics.
+
+        Returns a short instruction string appended to the synthesis prompt
+        to steer PRECISE_ANSWER toward the expected format.
+        """
+        q_lower = query.lower()
+        if re.search(r'\b(is|does|did|was|were|has|have|can|will|should)\b', q_lower) and "?" in query:
+            return "Answer with Yes or No first, then provide justification."
+        if re.search(r'(?:million|billion|mn|bn)\b', q_lower):
+            unit = "billion" if re.search(r'\b(billion|bn)\b', q_lower) else "million"
+            return f"Express the final answer in {unit}s (e.g. $X {unit})."
+        if re.search(r'\bratio\b', q_lower):
+            return "Express the final answer as a decimal ratio (e.g. 1.5x or 0.75)."
+        if re.search(r'\b(percentage|percent|%)\b', q_lower):
+            return "Express the final answer as a percentage (e.g. 25.3%)."
+        if re.search(r'\bgrowth\b.*\brate\b|\brate\b.*\bgrowth\b', q_lower):
+            return "Express the final answer as a percentage change (e.g. +12.5% or -3.2%)."
+        return ""
+
+    async def _deep_self_consistency(
+        self,
+        query: str,
+        first_answer: str,
+        evidence: str,
+        decomposition: "DeepDecomposition",
+        artifacts: "CompileArtifacts",
+        retrieval: "DeepRetrieval",
+        context: "SearchContext",
+    ) -> str:
+        """Run a second synthesis and pick the consistent answer.
+
+        Compares PRECISE_ANSWER from both runs. If they match (within
+        numeric tolerance), returns the first. If they diverge, picks
+        the answer whose PRECISE_ANSWER contains a valid number.
+        """
+        second_answer, _, _ = await self._deep_synthesize(
+            query, evidence, decomposition, artifacts, retrieval, context,
+        )
+        if not second_answer:
+            return first_answer
+
+        precise_1 = re.search(r'\*\*Answer:\s*(.+?)\*\*', first_answer)
+        precise_2 = re.search(r'\*\*Answer:\s*(.+?)\*\*', second_answer)
+        if not precise_1 or not precise_2:
+            return first_answer
+
+        val_1 = re.sub(r'[^\d.\-]', '', precise_1.group(1).replace(',', ''))
+        val_2 = re.sub(r'[^\d.\-]', '', precise_2.group(1).replace(',', ''))
+
+        try:
+            n1, n2 = float(val_1), float(val_2)
+        except (ValueError, TypeError):
+            return first_answer
+
+        tolerance = max(abs(n1) * 0.05, 0.01)
+        if abs(n1 - n2) <= tolerance:
+            return first_answer
+
+        await self._logger.info(
+            f"[DEEP:S5] Self-consistency divergence: {val_1} vs {val_2}, using second"
+        )
+        return second_answer
+
+    @staticmethod
     def _deep_verify_answer(
         query: str,
         answer: str,
@@ -2349,35 +2547,70 @@ class AgenticSearch(BaseSearch):
     ) -> Tuple[str, bool]:
         """Stage 5: Verify calculation answers with Python eval.
 
-        Extracts numeric expressions from the answer, attempts to
-        evaluate them, and flags discrepancies. Returns
-        (potentially_corrected_answer, verified).
+        Extracts the COMPUTATION block from the answer, parses variable
+        assignments (``var = expr``), evaluates them in a safe namespace,
+        and compares the final result against PRECISE_ANSWER. When a
+        discrepancy is found, replaces the PRECISE_ANSWER with the
+        recomputed value.
+
+        Returns (potentially_corrected_answer, verified).
         """
-        num_pattern = re.compile(
-            r'[\$€£]?\s*([\d,]+\.?\d*)\s*(?:million|billion|%|percent)?',
-            re.IGNORECASE,
+        computation_match = re.search(
+            r'<COMPUTATION>(.*?)</COMPUTATION>', answer, re.DOTALL,
         )
-        answer_numbers = num_pattern.findall(answer[:500])
-        if len(answer_numbers) < 1:
+        precise_match = re.search(
+            r'<PRECISE_ANSWER>(.*?)</PRECISE_ANSWER>', answer, re.DOTALL,
+        )
+        if not computation_match:
             return answer, True
 
-        calc_patterns = [
-            re.compile(r'(\d[\d,]*\.?\d*)\s*[/÷]\s*(\d[\d,]*\.?\d*)', re.IGNORECASE),
-            re.compile(r'(\d[\d,]*\.?\d*)\s*[-−]\s*(\d[\d,]*\.?\d*)', re.IGNORECASE),
-            re.compile(r'\((\d[\d,]*\.?\d*)\s*[-−]\s*(\d[\d,]*\.?\d*)\)\s*[/÷]\s*(\d[\d,]*\.?\d*)', re.IGNORECASE),
-        ]
+        computation_text = computation_match.group(1)
+        assignments = re.findall(
+            r'(?:^|\n)\s*[\w\s]+?=\s*(.+?)(?:\s*\(|$|\n)',
+            computation_text,
+        )
+        if not assignments:
+            return answer, True
 
-        for pat in calc_patterns:
-            matches = pat.findall(evidence + " " + answer)
-            for m in matches:
-                try:
-                    nums = [float(n.replace(",", "")) for n in m if n]
-                    if len(nums) >= 2 and nums[-1] != 0:
-                        _ = nums[0] / nums[-1]
-                except (ValueError, ZeroDivisionError):
-                    pass
+        safe_ns: Dict[str, float] = {}
+        last_result: Optional[float] = None
 
-        return answer, True
+        for expr_raw in assignments:
+            expr = expr_raw.strip().rstrip("(")
+            expr = re.sub(r'[\$€£,]', '', expr)
+            expr = expr.replace('−', '-').replace('÷', '/').replace('×', '*')
+            expr = re.sub(r'[a-zA-Z%]+$', '', expr).strip()
+            if not expr or not re.search(r'\d', expr):
+                continue
+            try:
+                result = float(eval(expr, {"__builtins__": {}}, safe_ns))  # noqa: S307
+                last_result = result
+            except Exception:
+                continue
+
+        if last_result is None or not precise_match:
+            return answer, True
+
+        precise_text = precise_match.group(1).strip()
+        precise_num = re.sub(r'[^\d.\-]', '', precise_text.replace(',', ''))
+        try:
+            stated = float(precise_num) if precise_num else None
+        except ValueError:
+            stated = None
+
+        if stated is None:
+            return answer, True
+
+        tolerance = max(abs(stated) * 0.02, 0.01)
+        if abs(stated - last_result) <= tolerance:
+            return answer, True
+
+        fmt = f"{last_result:.1f}" if abs(last_result) < 100 else f"{last_result:,.0f}"
+        corrected = answer.replace(
+            precise_match.group(0),
+            f"<PRECISE_ANSWER>{fmt}</PRECISE_ANSWER>",
+        )
+        return corrected, False
 
     # ------------------------------------------------------------------
     # Phase 0a: Direct document analysis (intent-gated)
@@ -2765,6 +2998,22 @@ class AgenticSearch(BaseSearch):
     """Maximum rounds of missing-data recovery before final answer."""
     _DEEP_STRUCTURED_MAX_FILES: int = 3
     """Maximum files to process through structured reasoning pipeline."""
+
+    # --- DEEP v2 evidence budgets ---
+    _DEEP_EVIDENCE_TOTAL_CHARS: int = 120_000
+    """Total evidence budget for DEEP mode (uses more context than FAST)."""
+    _DEEP_TABLE_BUDGET: int = 40_000
+    """Table digest budget per file in DEEP mode (no tree nav overlap)."""
+    _DEEP_TABLE_BUDGET_WITH_NAV: int = 20_000
+    """Table digest budget per file when tree nav also provides evidence."""
+    _DEEP_SYNTHESIS_MAX_CHARS: int = 60_000
+    """Maximum evidence chars sent to the synthesis LLM call."""
+    _DEEP_STATEMENT_PATTERNS: Tuple[re.Pattern, ...] = (
+        re.compile(r"(?:income|operations|earnings|profit.loss)", re.IGNORECASE),
+        re.compile(r"(?:balance.sheet|financial.position|assets.liab)", re.IGNORECASE),
+        re.compile(r"(?:cash.flow|cash.provided|financing.activities)", re.IGNORECASE),
+    )
+    """Section title patterns for financial statement harvesting."""
 
     # --- Evidence acceptance thresholds ---
     _EVIDENCE_MIN_ACCEPT_LENGTH: int = 800
