@@ -16,9 +16,8 @@ with **150 expert-annotated questions** across **40+ US public companies** (10-K
 
 ### Metrics
 
-- **3-Class Scoring**: Correct / Hallucination / Refusal (per FinanceBench paper)
-- **EM / F1**: Exact Match and token-level F1 with financial value normalisation
-- **Evidence Recall**: Retrieved pages vs gold evidence pages
+- **Accuracy**: LLM Judge — semantic equivalence between prediction and gold answer (with numeric fast-path)
+- **Coverage**: LLM Judge — whether the prediction contains any relevant information for the question
 
 ## Prerequisites
 
@@ -74,7 +73,7 @@ You **must** set valid LLM credentials here before proceeding.
 |----------|----------|-------------|-----------------------------------------------------|
 | `LLM_API_KEY` | **Yes** | API key for the LLM provider | `sk-xxx`                                            |
 | `LLM_BASE_URL` | **Yes** | LLM API endpoint | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
-| `LLM_MODEL_NAME` | **Yes** | Model name for search & QA | `qwen3.6-plus`                                      |
+| `LLM_MODEL_NAME` | **Yes** | Model name for search & QA | `qwen3.5-plus`                                      |
 | `LLM_TIMEOUT` | No | Request timeout in seconds | `120`                                               |
 
 ```bash
@@ -148,7 +147,6 @@ This file controls FinanceBench-specific evaluation parameters.
 |----------|----------|-------------|---------|
 | `FB_EVAL_MODE` | No | `singleDoc` (per-PDF) or `sharedCorpus` (all PDFs) | `singleDoc` |
 | `FB_ENABLE_LLM_JUDGE` | No | Enable LLM Judge for semantic equivalence | `true` |
-| `FB_EXTRACT_ANSWER` | No | Extract short answer from verbose response | `true` |
 
 #### Concurrency Settings
 
@@ -245,7 +243,8 @@ benchmarks/financebench/
 ├── .env.example           # Config template (copy to .env.financebench)
 ├── config.py              # FinanceBenchConfig dataclass
 ├── data_loader.py         # Dataset + PDF corpus loader
-├── evaluate.py            # EM/F1/3-class scoring + aggregation
+├── evaluate.py            # LLM Judge metrics aggregation
+├── judge.py               # LLM-based judge (Accuracy + Coverage)
 ├── runner.py              # Async batch runner (AgenticSearch)
 ├── run_benchmark.py       # CLI entry point
 ├── analyze_results.py     # Post-hoc analysis tool
@@ -255,14 +254,3 @@ benchmarks/financebench/
 ├── output/                # Results + metrics (auto-created)
 └── logs/                  # Run logs (auto-created)
 ```
-
-## SOTA Reference
-
-| System | Accuracy | Coverage |
-|--------|----------|----------|
-| Mafin 2.5 (SOTA) | 98.7% | 100% |
-| Fintool | 98.0% | 66.7% |
-| Quantly | 94.0% | 100% |
-| GPT-4 (zero-shot) | 29.3% | 100% |
-
-> Mafin 2.5 uses PageIndex + Agentic Vectorless RAG 3.0 architecture.
