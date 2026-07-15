@@ -708,6 +708,20 @@ class KnowledgeStorage:
                 logger.warning(f"Cluster {cluster_id} does not exist")
                 return False
 
+            # Remove the edges from other clusters that point to this cluster
+            if existing.related_clusters:
+                for edge in existing.related_clusters:
+                    target_cluster = await self.get(edge.target_cluster_id)
+
+                    if target_cluster and target_cluster.related_clusters:
+                        # Remove the edge pointing to the cluster being deleted
+                        target_cluster.related_clusters = [
+                            e for e in target_cluster.related_clusters
+                            if e.target_cluster_id != cluster_id
+                        ]
+                        # Update the target cluster in the database
+                        await self.update(target_cluster)
+
             # Delete from database
             self.db.delete_data(self.table_name, "id = ?", [cluster_id])
 
@@ -810,9 +824,11 @@ class KnowledgeStorage:
 
         Strategy:
         - Use first cluster as base
-        - Merge evidences, patterns, constraints from all clusters
+        - Merge information from all clusters
+            - descriptions, contents, evidences, patterns, constraints
+            - search_results, queries, related_clusters
         - Average numeric scores (confidence, hotness, etc.)
-        - Update version and timestamps
+        - Update merge_count, version, and timestamps
 
         Args:
             clusters: List of KnowledgeCluster objects to merge
@@ -835,6 +851,8 @@ class KnowledgeStorage:
             # Merge content and descriptions
             all_descriptions = []
             all_contents = []
+            all_search_results = []
+            all_queries = []
 
             for cluster in clusters:
                 # Handle descriptions
@@ -849,8 +867,18 @@ class KnowledgeStorage:
                 else:
                     all_contents.append(cluster.content)
 
+                # Handle search results
+                if cluster.search_results:
+                    all_search_results.extend(cluster.search_results)
+
+                # Handle queries
+                if cluster.queries:
+                    all_queries.extend(cluster.queries)
+
             merged.description = list(set(all_descriptions))  # Deduplicate
             merged.content = list(set(all_contents))  # Deduplicate
+            merged.search_results = list(set(all_search_results))  # Deduplicate
+            merged.queries = list(set(all_queries))  # Deduplicate
 
             # Merge evidences (deduplicate by doc_id)
             evidences_map = {}
@@ -900,9 +928,11 @@ class KnowledgeStorage:
                 merged.landmark_potential = sum(valid_landmark) / len(valid_landmark)
 
             # Update metadata
-            merged.name = f"{merged.name} (merged)"
+            if not merged.name.endswith("(merged)"):
+                merged.name = f"{merged.name} (merged)"
             merged.last_modified = datetime.now()
             merged.version = (merged.version or 0) + 1
+            merged.merge_count = (merged.merge_count or 0) + len(clusters) - 1
 
             # Update the merged cluster in database
             await self.update(merged)

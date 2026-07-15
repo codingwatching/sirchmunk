@@ -13,6 +13,7 @@ class Lifecycle(Enum):
     EMERGING = "emerging"
     CONTESTED = "contested"
     DEPRECATED = "deprecated"
+    META = "meta"  # for meta clusters
 
 
 class AbstractionLevel(Enum):
