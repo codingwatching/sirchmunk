@@ -15,7 +15,7 @@ import os
 import json
 import atexit
 import threading
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 from pathlib import Path
 from datetime import datetime
 from loguru import logger
@@ -609,6 +609,33 @@ class KnowledgeStorage:
             logger.error(f"Failed to get cluster {cluster_id}: {e}")
             return None
 
+    async def get_with_embedding(self, cluster_id: str) -> Optional[Union[KnowledgeCluster, List[float]]]:
+        """
+        Get a knowledge cluster by ID (exact match) along with its embedding vector
+
+        Args:
+            cluster_id: Unique cluster ID
+
+        Returns:
+            Tuple of (KnowledgeCluster, embedding_vector) if found, None otherwise
+        """
+        try:
+            self._check_and_reload()
+            row = self.db.fetch_one(
+                f"SELECT * FROM {self.table_name} WHERE id = ?",
+                [cluster_id]
+            )
+
+            if row:
+                cluster = self._row_to_cluster(row)
+                embedding_vector = row[-4]
+                return cluster, embedding_vector
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to get cluster with embedding {cluster_id}: {e}")
+            return None
+
     async def insert(self, cluster: KnowledgeCluster) -> bool:
         """
         Insert a new knowledge cluster
@@ -780,11 +807,12 @@ class KnowledgeStorage:
             sql = f"""
             SELECT * FROM {self.table_name}
             WHERE
-                id LIKE ? OR
-                name LIKE ? OR
-                description LIKE ? OR
-                content LIKE ? OR
-                patterns LIKE ?
+                (id LIKE ? OR
+                 name LIKE ? OR
+                 description LIKE ? OR
+                 content LIKE ? OR
+                 patterns LIKE ?)
+                AND lifecycle != ?
             ORDER BY
                 CASE
                     WHEN id = ? THEN 1
@@ -796,14 +824,15 @@ class KnowledgeStorage:
             """
 
             params = [
-                search_pattern,  # id LIKE
-                search_pattern,  # name LIKE
-                search_pattern,  # description LIKE
-                search_pattern,  # content LIKE
-                search_pattern,  # patterns LIKE
-                query,           # exact id match
-                f"{query}%",     # name starts with
-                f"%{query}%",    # description contains
+                search_pattern,       # id LIKE
+                search_pattern,       # name LIKE
+                search_pattern,       # description LIKE
+                search_pattern,       # content LIKE
+                search_pattern,       # patterns LIKE
+                Lifecycle.META.name,  # META lifecycle exclusion
+                query,                # exact id match
+                f"{query}%",          # name starts with
+                f"%{query}%",         # description contains
                 limit
             ]
 
@@ -1232,20 +1261,79 @@ class KnowledgeStorage:
             # DuckDB cosine similarity query
             # Explicit cast on both sides ensures type parity regardless of
             # how the table was created (fresh schema vs parquet import).
-            query = f"""
-            SELECT
-                id, name, description, confidence, hotness, search_results,
-                list_cosine_similarity(
-                    embedding_vector::FLOAT[384],
-                    ?::FLOAT[384]
-                ) AS similarity
-            FROM {self.table_name}
-            WHERE embedding_vector IS NOT NULL
+            # Use meta cluster (community) to avoid computing similarity for all rows unnecessarily.
+            community_query = f"""
+            WITH topk_meta AS (
+              SELECT id AS meta_id, related_clusters,
+                     list_cosine_similarity(embedding_vector::FLOAT[384], ?::FLOAT[384]) AS meta_sim
+              FROM {self.table_name}
+              WHERE lifecycle = ?
+                AND embedding_vector IS NOT NULL
+              ORDER BY meta_sim DESC
+              LIMIT ?
+            )
+            community_ids AS (
+              SELECT DISTINCT json_extract_string(edge, '$.target_cluster_id') AS cluster_id
+              FROM topk_meta,
+                   unnest(CAST(related_clusters::JSON AS JSON[])) AS t(edge)
+              WHERE json_extract_string(edge, '$.target_cluster_id') IS NOT NULL
+            )
+            SELECT kc.id, kc.name, kc.description, kc.confidence, kc.hotness, kc.search_results,
+                   list_cosine_similarity(kc.embedding_vector::FLOAT[384], ?::FLOAT[384]) AS similarity
+            FROM {self.table_name} kc
+            WHERE kc.lifecycle != ?
+              AND kc.embedding_vector IS NOT NULL
+              AND kc.id IN (SELECT cluster_id FROM community_ids)
             ORDER BY similarity DESC
             LIMIT ?
             """
+            community_parameters = [
+                query_embedding,      # query embedding for meta similarity
+                Lifecycle.META.name,  # filter for meta clusters
+                top_k,                # limit for meta clusters
+                query_embedding,      # query embedding for community similarity
+                Lifecycle.META.name,  # filter for meta clusters
+                top_k                 # limit for community clusters
+            ]
 
-            results = self.db.fetch_all(query, [query_embedding, top_k])
+            community_results = self.db.fetch_all(community_query, community_parameters)
+
+            # Compute similarity for isolated clusters (non-community) if needed
+            isolated_query = f"""
+            WITH all_community_ids AS (
+              SELECT DISTINCT json_extract_string(edge, '$.target_cluster_id') AS cluster_id
+              FROM {self.table_name},
+                   unnest(CAST(related_clusters::JSON AS JSON[])) AS t(edge)
+              WHERE lifecycle = ?
+                AND related_clusters IS NOT NULL
+                AND related_clusters != '[]'
+                AND related_clusters != ''
+                AND json_extract_string(edge, '$.target_cluster_id') IS NOT NULL
+            )
+            SELECT kc.id, kc.name, kc.description, kc.confidence, kc.hotness, kc.search_results,
+                   list_cosine_similarity(kc.embedding_vector::FLOAT[384], ?::FLOAT[384]) AS similarity
+            FROM {self.table_name} kc
+            WHERE kc.lifecycle != ?
+              AND kc.embedding_vector IS NOT NULL
+              AND kc.id NOT IN (SELECT cluster_id FROM all_community_ids)
+            ORDER BY similarity DESC
+            LIMIT ?
+            """
+            isolated_parameters = [
+                Lifecycle.META.name,  # filter for meta clusters
+                query_embedding,      # query embedding for isolated similarity
+                Lifecycle.META.name,  # filter for meta clusters
+                top_k                 # limit for isolated clusters
+            ]
+
+            isolated_results = self.db.fetch_all(isolated_query, isolated_parameters)
+
+            # Merge community and isolated results (sort + topk)
+            results = sorted(
+                community_results + isolated_results,
+                key=lambda x: x[6] or 0.0,
+                reverse=True
+            )[:top_k]
 
             # Filter by similarity threshold
             filtered_results = []

@@ -393,6 +393,7 @@ class AgenticSearch(BaseSearch):
         # and callers should fall back to the heuristic.
         self._multi_source_intent: Optional[float] = None
 
+        self._background_tasks = set()  # For scheduler tasks
         # ---- Knowledge evolution ----
         self.knowledge_evolver: Optional[KnowledgeEvolver] = None
         # Since knowledge evolution relies on the embedding client,
@@ -1986,7 +1987,9 @@ class AgenticSearch(BaseSearch):
             # To avoid blocking the return of search results
             # `evolver.step` is invoked in a fire-and-forget manner.
             # In the `evolver.step`, there is a lock to ensure safety
-            asyncio.create_task(self.knowledge_evolver.step(cluster=cluster))
+            task = asyncio.create_task(self.knowledge_evolver.step(cluster=cluster))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
         # ---- Unified return wrapping ----
         if return_context:

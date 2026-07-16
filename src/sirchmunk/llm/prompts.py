@@ -992,3 +992,20 @@ Produce an updated, unified summary that:
 
 ### Output
 Return ONLY the merged summary text (no extra tags or metadata). Keep the same language as the inputs."""
+
+
+EVO_META_QUERY = """You are constructing a common query based on the provided queries.
+
+### Provided Queries
+{queries}
+
+### Task
+Produce a single, common search query that:
+1. Prioritizes semantic intersection across the provided queries without introducing external concepts
+2. Preserves unique critical qualifiers while eliminating redundant phrasing
+3. Removes conversational fillers, emotional expressions, and irrelevant context
+4. Avoids merging conflicting specifics. Use safer broader terms when ambiguity exists
+5. Reformats the query into a concise, search-optimized, and embedding-friendly expression (noun phrase or natural language question allowed)
+
+### Output
+Return ONLY the common query (no extra tags or metadata). Keep the same language as the inputs."""

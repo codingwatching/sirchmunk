@@ -19,16 +19,25 @@ and >= _EVO_GLOBAL_UPDATE_COUNT change in non-meta cluster count)
 
 import asyncio
 import json
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import igraph as ig
 import leidenalg
 
 from sirchmunk.llm.openai_chat import OpenAIChat
-from sirchmunk.schema.knowledge import KnowledgeCluster, Lifecycle, WeakSemanticEdge
+from sirchmunk.llm.prompts import (
+    EVO_META_QUERY,
+)
+from sirchmunk.schema.knowledge import (
+    AbstractionLevel,
+    KnowledgeCluster,
+    Lifecycle,
+    WeakSemanticEdge
+)
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
 from sirchmunk.utils.embedding_util import EmbeddingUtil, compute_text_hash
 from sirchmunk.utils import LogCallback, create_logger
@@ -71,9 +80,9 @@ class EvolveManifest:
     edge_refresh_cluster_ids: List[str] = field(default_factory=list)
 
     last_meta_detection_step: int = 0
-    last_meta_detection_count: int = 0
+    last_meta_detection_cluster_count: int = 0
     last_global_update_step: int = 0
-    last_global_update_count: int = 0
+    last_global_update_cluster_count: int = 0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, indent=2)
@@ -89,9 +98,9 @@ class EvolveManifest:
             connect_merge_cluster_ids=data.get("connect_merge_cluster_ids", []),
             edge_refresh_cluster_ids=data.get("edge_refresh_cluster_ids", []),
             last_meta_detection_step=data.get("last_meta_detection_step", 0),
-            last_meta_detection_count=data.get("last_meta_detection_count", 0),
+            last_meta_detection_cluster_count=data.get("last_meta_detection_cluster_count", 0),
             last_global_update_step=data.get("last_global_update_step", 0),
-            last_global_update_count=data.get("last_global_update_count", 0)
+            last_global_update_cluster_count=data.get("last_global_update_cluster_count", 0)
         )
 
 
@@ -164,9 +173,7 @@ class KnowledgeEvolver:
                 )
                 continue
 
-            cluster_last_modified = datetime.fromisoformat(cluster.last_modified)
-            cluster_create = datetime.fromisoformat(cluster.create_time)
-            if abs((cluster_last_modified - cluster_create).total_seconds()) < 1:
+            if abs((cluster.last_modified - cluster.create_time).total_seconds()) < 1:
                 # This cluster is newly created
                 self._manifest.connect_merge_cluster_ids.append(cluster.id)
             else:
@@ -262,7 +269,7 @@ class KnowledgeEvolver:
 
         # Check the cluster count condition
         non_meta_cluster_count = self._get_non_meta_cluster_count()
-        cluster_count_diff = abs(non_meta_cluster_count - self._manifest.last_meta_detection_count)
+        cluster_count_diff = abs(non_meta_cluster_count - self._manifest.last_meta_detection_cluster_count)
         return cluster_count_diff >= _EVO_META_DETECTION_COUNT
 
     def _should_global_update(self) -> bool:
@@ -280,7 +287,7 @@ class KnowledgeEvolver:
 
         # Check the cluster count condition
         non_meta_cluster_count = self._get_non_meta_cluster_count()
-        cluster_count_diff = abs(non_meta_cluster_count - self._manifest.last_global_update_count)
+        cluster_count_diff = abs(non_meta_cluster_count - self._manifest.last_global_update_cluster_count)
         return cluster_count_diff >= _EVO_GLOBAL_UPDATE_COUNT
 
     # ------------------------------------------------------------------ #
@@ -299,8 +306,7 @@ class KnowledgeEvolver:
         # Since these clusters are already in the storage, we need to pick them out, 
         # and perform connect & merge during putting them back in
         for cluster_id in self._manifest.connect_merge_cluster_ids:
-            cluster = self._storage.get(cluster_id)
-            cluster_embedding = self._get_cluster_embedding(cluster_id)
+            cluster, cluster_embedding = await self._storage.get_with_embedding(cluster_id)
             if cluster is None or cluster_embedding is None:
                 continue
 
@@ -308,7 +314,7 @@ class KnowledgeEvolver:
             # To avoid best match being in the list of newly created clusters, 
             # we search for top_k = len(connect_merge_cluster_ids) + 3
             best_match = None
-            similar = self._storage.search_similar_clusters(
+            similar = await self._storage.search_similar_clusters(
                 query_embedding=cluster_embedding,
                 top_k=len(self._manifest.connect_merge_cluster_ids) + 3,
                 similarity_threshold=_EVO_CONNECT_SIMILARITY_THRESHOLD
@@ -329,25 +335,29 @@ class KnowledgeEvolver:
             # If a best match is found, discuss whether to connect or merge
             if best_match["similarity"] >= _EVO_MERGE_SIMILARITY_THRESHOLD:
                 # Merge clusters
-                best_cluster = self._storage.get(best_match["id"])
+                best_cluster = await self._storage.get(best_match["id"])
                 if best_cluster:
                     # Merge and update embedding
                     await self._merge_clusters(source=cluster, target=best_cluster)
             elif best_match["similarity"] >= _EVO_CONNECT_SIMILARITY_THRESHOLD:
                 # Connect clusters with a weak semantic edge
-                best_cluster = self._storage.get(best_match["id"])
+                best_cluster = await self._storage.get(best_match["id"])
                 if best_cluster:
                     # Create a weak semantic edge between the two clusters
                     await self._create_weak_semantic_edge(
                         source=cluster,
                         target=best_cluster,
                         edge_source="embed_sim",
-                        weight=best_match["similarity"]
+                        weight=best_match["similarity"],
+                        use_max_weight=True
                     )
             else:
                 # No action needed if similarity is below the threshold
                 continue
 
+        await self._log.info(
+            f"[Evolve] Connected and merged clusters for {len(self._manifest.connect_merge_cluster_ids)} newly created clusters."
+        )
         # Clear the list of newly created clusters after processing
         self._manifest.connect_merge_cluster_ids.clear()
 
@@ -363,13 +373,12 @@ class KnowledgeEvolver:
         create a weak semantic edge between them.
         """
         for cluster_id in self._manifest.edge_refresh_cluster_ids:
-            cluster = self._storage.get(cluster_id)
-            cluster_embedding = self._get_cluster_embedding(cluster_id)
+            cluster, cluster_embedding = await self._storage.get_with_embedding(cluster_id)
             if cluster is None or cluster_embedding is None:
                 continue
 
             # Find similar clusters based on embedding similarity
-            similar = self._storage.search_similar_clusters(
+            similar = await self._storage.search_similar_clusters(
                 query_embedding=cluster_embedding,
                 top_k=_EVO_EDGE_REFRESH_TOPK,
                 similarity_threshold=_EVO_CONNECT_SIMILARITY_THRESHOLD
@@ -377,14 +386,22 @@ class KnowledgeEvolver:
             for similar_cluster in similar:
                 if similar_cluster["id"] == cluster_id:
                     continue  # Skip self
-                target_cluster = self._storage.get(similar_cluster["id"])
+                target_cluster = await self._storage.get(similar_cluster["id"])
                 if target_cluster:
+                    # Force update the weak semantic edge with the new similarity weight
                     await self._create_weak_semantic_edge(
                         source=cluster,
                         target=target_cluster,
                         edge_source="embed_sim",
-                        weight=similar_cluster["similarity"]
+                        weight=similar_cluster["similarity"],
+                        use_max_weight=False
                     )
+
+        await self._log.info(
+            f"[Evolve] Refreshed edges for {len(self._manifest.edge_refresh_cluster_ids)} clusters."
+        )
+        # Clear the list of clusters with refreshed embeddings after processing
+        self._manifest.edge_refresh_cluster_ids.clear()
 
     # ------------------------------------------------------------------ #
     #  Phase 3: Detect Meta Clusters                                     #
@@ -398,18 +415,67 @@ class KnowledgeEvolver:
         is created to represent the community to reduce complexity during search.       
         """
         # Before running the meta cluster detection, we need to clean up existing meta clusters
-        await self._clean_existing_meta_clusters()
+        self._cleanup_meta_clusters()
+        non_meta_cluster_count = self._get_non_meta_cluster_count()
 
         # Build edges for leiden algorithm
-        edges: List[Tuple[str, str, float]] = []
+        raw_edges, weights = self._get_edges_and_weights()
 
+        # Map cluster IDs to numeric indices for igraph
+        # Single cluster with no edges will not be included in the community detection
+        cluster_id_to_num, cluster_num_to_id, num = {}, {}, 0
+        for source, target in raw_edges:
+            if source not in cluster_id_to_num:
+                cluster_id_to_num[source] = num
+                cluster_num_to_id[num] = source
+                num += 1
+            if target not in cluster_id_to_num:
+                cluster_id_to_num[target] = num
+                cluster_num_to_id[num] = target
+                num += 1
 
+        # Run Leiden algorithm to detect communities
+        edges = [(cluster_id_to_num[src], cluster_id_to_num[tgt]) for src, tgt in raw_edges]
+        graph = ig.Graph(n=num, edges=edges, directed=False)
+        partition = leidenalg.find_partition(
+            graph=graph,
+            partition_type=leidenalg.ModularityVertexPartition,
+            weights=weights,
+        )
+        membership = partition.membership
+
+        # Group clusters by community
+        community_to_cluster_ids: Dict[int, List[str]] = defaultdict(list)
+        for cluster_num, community_id in enumerate(membership):
+            cluster_id = cluster_num_to_id.get(cluster_num, None)
+            # If cluster_id is None, it means this cluster has no edges and
+            # should not be included in any community. We skip it.
+            if cluster_id is None:
+                continue
+            community_to_cluster_ids[community_id].append(cluster_id)
+    
+        # Build meta clusters for each community with more than 1 cluster
+        for community_id, cluster_ids in community_to_cluster_ids.items():
+            if len(cluster_ids) <= 1:
+                continue
+
+            await self._build_meta_cluster(community_id, cluster_ids)
+
+        await self._log.info(
+            f"[Evolve] Created {len(community_to_cluster_ids)} meta clusters "
+            f"from {non_meta_cluster_count} non-meta clusters."
+        )
+
+        # Update the last meta detection step and cluster count in the manifest
+        self._manifest.last_meta_detection_step = self._manifest.current_step
+        self._manifest.last_meta_detection_cluster_count = non_meta_cluster_count
 
     # ------------------------------------------------------------------ #
     #  Phase 4: Global Update                                            #
     # ------------------------------------------------------------------ #
 
     async def _global_update(self):
+        """Phase 4: Global Update including refining, """
         pass
 
     # ------------------------------------------------------------------ #
@@ -423,34 +489,6 @@ class KnowledgeEvolver:
             f"WHERE lifecycle != ?", [Lifecycle.META.name]
         )
         return result[0] if result else 0
-
-    def _get_cluster_embedding(self, cluster_id: str) -> Optional[List[float]]:
-        """Get the embedding vector for a given cluster ID."""
-        try:
-            row = self._storage.db.fetch_one(
-                f"SELECT embedding_vector FROM {self._storage.table_name} "
-                f"WHERE id = ?", [cluster_id]
-            )
-            return row[0] if row else None
-        except Exception as e:
-            self._log.error(f"Failed to fetch embedding for cluster {cluster_id}: {e}")
-        return None
-
-    # ------------------------------------------------------------------ #
-    #  Phase 1 Helper Functions                                          #
-    # ------------------------------------------------------------------ #
-
-    async def _merge_clusters(self, source: KnowledgeCluster, target: KnowledgeCluster):
-        """Merge source cluster into target cluster and update the storage."""
-        merged_cluster = await self._storage.merge([target, source])
-        # Update embedding with merged queries
-        await self._update_cluster_embedding(merged_cluster)
-        self._manifest.edge_refresh_cluster_ids.append(merged_cluster.id)
-
-        # Update lifecycle if merge count exceeds threshold
-        if merged_cluster.merge_count >= 3 and merged_cluster.lifecycle == Lifecycle.EMERGING:
-            merged_cluster.lifecycle = Lifecycle.STABLE
-        await self._storage.update(merged_cluster)
 
     async def _update_cluster_embedding(self, cluster: KnowledgeCluster):
         """Update the embedding of a cluster based on its queries."""
@@ -468,8 +506,24 @@ class KnowledgeEvolver:
                 embedding_text_hash=text_hash
             )
         except Exception as e:
-            self._log.error(f"Failed to update embedding for cluster {cluster.id}: {e}")
+            await self._log.error(f"Failed to update embedding for cluster {cluster.id}: {e}")
             return
+
+    # ------------------------------------------------------------------ #
+    #  Phase 1 Helper Functions                                          #
+    # ------------------------------------------------------------------ #
+
+    async def _merge_clusters(self, source: KnowledgeCluster, target: KnowledgeCluster):
+        """Merge source cluster into target cluster and update the storage."""
+        merged_cluster = await self._storage.merge([target, source])
+        # Update embedding with merged queries
+        await self._update_cluster_embedding(merged_cluster)
+        self._manifest.edge_refresh_cluster_ids.append(merged_cluster.id)
+
+        # Update lifecycle if merge count exceeds threshold
+        if merged_cluster.merge_count >= 3 and merged_cluster.lifecycle == Lifecycle.EMERGING:
+            merged_cluster.lifecycle = Lifecycle.STABLE
+        await self._storage.update(merged_cluster)
 
     # ------------------------------------------------------------------ #
     #  Phase 2 Helper Functions                                          #
@@ -500,11 +554,12 @@ class KnowledgeEvolver:
         source: KnowledgeCluster,
         target: KnowledgeCluster,
         edge_source: str,
-        weight: float
+        weight: float,
+        use_max_weight: bool = True
     ):
         """Create a weak semantic edge between two clusters and update the storage."""
-        self._add_edge(source, target.id, edge_source, weight)
-        self._add_edge(target, source.id, edge_source, weight)
+        self._add_edge(source, target.id, edge_source, weight, use_max_weight)
+        self._add_edge(target, source.id, edge_source, weight, use_max_weight)
         # Update the clusters in storage
         await self._storage.update(source)
         await self._storage.update(target)
@@ -513,14 +568,103 @@ class KnowledgeEvolver:
     #  Phase 3 Helper Functions                                          #
     # ------------------------------------------------------------------ #
 
-    async def _clean_existing_meta_clusters(self):
-        """Clean up existing meta clusters from the knowledge storage."""
-        meta_cluster_ids = self._storage.db.fetch_all(
-            f"SELECT id FROM {self._storage.table_name} "
+    def _cleanup_meta_clusters(self):
+        """Remove all existing meta clusters from the knowledge storage."""
+        # Since we don't build edge from other clusters to meta clusters 
+        # to avoid breaking change in one-hop expansion,
+        # we do not need to remove edges pointing to meta clusters.
+
+        # remove meta clusters themselves via DuckDB query to avoid N+1 queries
+        self._storage.db.execute(
+            f"DELETE FROM {self._storage.table_name} "
             f"WHERE lifecycle = ?", [Lifecycle.META.name]
         )
-        for meta_cluster_id in meta_cluster_ids:
-            await self._storage.remove(meta_cluster_id[0])
+
+    def _get_edges_and_weights(self) -> Union[List[Tuple[str, str]], List[float]]:
+        """Get all edges and corresponding weights via DuckDB query to avoid N+1 queries."""
+        query = f"""
+        SELECT kc.id                                         AS source,
+            json_extract_string(edge, '$.target_cluster_id') AS target,
+            CAST(json_extract(edge, '$.weight') AS DOUBLE)   AS weight
+        FROM {self._storage.table_name} kc,
+            unnest(CAST(kc.related_clusters::JSON AS JSON[])) AS t(edge)
+        WHERE kc.related_clusters IS NOT NULL
+        AND kc.related_clusters != '[]'
+        AND kc.related_clusters != ''
+        AND kc.id < json_extract_string(edge, '$.target_cluster_id')
+        """
+        rows = self._storage.db.fetch_all(query)
+        edges, weights = [], []
+        for row in rows:
+            edges.append((row[0], row[1]))
+            weights.append(row[2])
+        return edges, weights
+
+    async def _build_meta_cluster(self, community_id: int, cluster_ids: List[str]):
+        """Build a meta cluster for a given community of clusters."""
+        meta_cluster_id = f"M{community_id:04d}"
+        # Fetch queries and abstraction_level from the clusters in the community
+        rows = self._storage.db.fetch_one(f"""
+            WITH matched AS (
+                SELECT queries, abstraction_level FROM {self._storage.table_name}
+                WHERE id IN (SELECT unnest(?::VARCHAR[]))
+            )
+            SELECT
+                ( SELECT json_group_array(q) 
+                  FROM matched, unnest(CAST(queries::JSON AS JSON[])) AS t(q)
+                ) AS cluster_queries,
+                ( SELECT abstraction_level
+                  FROM matched
+                  WHERE abstraction_level IS NOT NULL
+                  GROUP BY abstraction_level
+                  ORDER BY COUNT(*) DESC
+                  LIMIT 1
+                ) AS most_common_abstraction_level
+        """, [cluster_ids])
+        if rows:
+            cluster_queries, most_common_abstraction_level = rows[0], rows[1]
+        else:
+            await self._log.error(f"[Evolve] Failed to fetch queries for meta cluster {meta_cluster_id}.")
+            return
+
+        # Build query for the meta cluster by summary common queries from the community clusters
+        queries = json.loads(cluster_queries) if cluster_queries else []
+        prompt = EVO_META_QUERY.format(
+            queries="\n".join(queries)
+        )
+        meta_query = await self._llm.achat({"role": "user", "content": prompt})
+
+        # Build related clusters
+        related_clusters = [
+            WeakSemanticEdge(target_cluster_id=cluster_id, weight=1.0, source="meta")
+            for cluster_id in cluster_ids
+        ]
+
+        # Build the meta cluster object
+        # For meta clusters, the queries and embeddings are the most important
+        if most_common_abstraction_level is not None:
+            most_common_abstraction_level = AbstractionLevel[most_common_abstraction_level]
+
+        meta_cluster = KnowledgeCluster(
+            id=meta_cluster_id,
+            name=meta_query,
+            description=[f"Meta cluster ({len(cluster_ids)} clusters) for: {meta_query}"],
+            content="Meta cluster",
+            confidence=0.5,
+            abstraction_level=most_common_abstraction_level,
+            hotness=0.5,
+            lifecycle=Lifecycle.META,
+            related_clusters=related_clusters,
+            queries=[meta_query],
+        )
+
+        await self._storage.insert(meta_cluster)
+        await self._update_cluster_embedding(meta_cluster)
+
+    # ------------------------------------------------------------------ #
+    #  Phase 4 Helper Functions                                          #
+    # ------------------------------------------------------------------ #
+
 
     # ------------------------------------------------------------------ #
     #  Manifest I/O                                                      #
