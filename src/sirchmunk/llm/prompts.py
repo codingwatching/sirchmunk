@@ -1009,3 +1009,25 @@ Produce a single, common search query that:
 
 ### Output
 Return ONLY the common query (no extra tags or metadata). Keep the same language as the inputs."""
+
+
+EVO_REFINE_CLUSTER = """You are refining a knowledge cluster by polishing its queries and content.
+
+### Existing quries
+{queries}
+
+### Existing content (may be truncated)
+{content}
+
+### Task
+Produce a clear and concise query and content that:
+1. Follows the common patterns in existing queries without introducing external concepts
+2. Ensures the query is search-optimized and embedding-friendly (noun phrase or natural language question allowed)
+3. Keeps the content clear and concise without losing key information from the existing content
+4. Makes the query and content semantically aligned in a question-and-answer relationship
+5. Removes conversational fillers, emotional expressions, and irrelevant context
+6. Preserves unique critical qualifiers while eliminating redundant phrasing
+
+### Output
+Return ONLY a JSON object, no extra text:
+{{"query": "...", "content": "..."}}"""

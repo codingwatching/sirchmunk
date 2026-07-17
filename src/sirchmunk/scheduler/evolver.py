@@ -31,6 +31,7 @@ import leidenalg
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import (
     EVO_META_QUERY,
+    EVO_REFINE_CLUSTER
 )
 from sirchmunk.schema.knowledge import (
     AbstractionLevel,
@@ -62,6 +63,24 @@ _EVO_META_DETECTION_COUNT = 100
 
 # Minimum number of clusters required to trigger global update phase
 _EVO_GLOBAL_UPDATE_COUNT = 500
+
+# Threshold for low hotness and confidence to trigger global update phase
+_EVO_GLOBAL_UPDATE_HOTNESS_THRESHOLD = 0.1
+
+# Threshold for low hotness and confidence to trigger global update phase
+_EVO_GLOBAL_UPDATE_CONFIDENCE_THRESHOLD = 0.3
+
+# Refined hotness value for clusters after global update phase
+_EVO_GLOBAL_UPDATE_REFINED_HOTNESS = 0.3
+
+# Refined confidence value for clusters after global update phase
+_EVO_GLOBAL_UPDATE_REFINED_CONFIDENCE = 0.5
+
+# Maximum number of clusters to consider for global update in a single step
+_EVO_GLOBAL_UPDATE_MAX_CLUSTERS = 20
+
+# Maximum number of concurrent LLM calls during evolver phases
+_EVO_LLM_MAX_CONCURRENCY = 5
 
 # Step interval for meta cluster detection and global update phases
 _EVO_STEP_INTERVAL = 10
@@ -131,6 +150,9 @@ class KnowledgeEvolver:
 
         # A lock to ensure that only one evolve step is processed at a time
         self._evolve_lock = asyncio.Lock()
+        
+        # A semaphore to limit the concurrent LLM calls during evolver phases
+        self._llm_semaphore = asyncio.Semaphore(_EVO_LLM_MAX_CONCURRENCY)
 
     # ------------------------------------------------------------------ #
     #  Public API                                                        #
@@ -475,8 +497,50 @@ class KnowledgeEvolver:
     # ------------------------------------------------------------------ #
 
     async def _global_update(self):
-        """Phase 4: Global Update including refining, """
-        pass
+        """Phase 4: Global Update to ensure the knowledge graph is up-to-date.
+
+        Since Phase 2 does not remove existing edges with low similarity,
+        for each edge (source = embed_sim), we need to re-calculate the similarity.
+        If the similarity falls below _EVO_CONNECT_SIMILARITY_THRESHOLD, remove the edge.
+        
+        Then, refine the clusters with hotness and confidence below the thresholds.
+        There are at most _EVO_GLOBAL_UPDATE_MAX_CLUSTERS clusters to consider for global update in a single step.
+        
+        Finally, perform Phase 1, 2 and 3 again to ensure the knowledge graph is up-to-date.
+        """
+        # Update the edges and remove the invalid edges based on the similarity threshold
+        embed_sim_edges = self._get_all_embed_sim_edges()
+
+        updates = defaultdict(list)
+        for (source_id, target_id, old_weight, new_weight) in embed_sim_edges:
+            updates[source_id].append((target_id, new_weight))
+
+        # Update the edges in the storage
+        for source_id, edge_updates in updates.items():
+            cluster = await self._storage.get(source_id)
+            if cluster is None:
+                continue
+            # Update the edges with new weights and remove edges below the threshold
+            embed_sim_edges = [
+                WeakSemanticEdge(target_cluster_id=target_id, weight=new_weight, source="embed_sim")
+                for target_id, new_weight in edge_updates
+                if new_weight >= _EVO_CONNECT_SIMILARITY_THRESHOLD
+            ]
+            other_edges = [edge for edge in cluster.related_clusters if edge.source != "embed_sim"]
+            cluster.related_clusters = embed_sim_edges + other_edges
+            await self._storage.update(cluster)
+
+        # Refine the clusters with hotness and confidence below the thresholds
+        cluster_ids_to_refine = self._get_cluster_ids_to_refine()
+        refine_coroutines = [
+            self._refine_cluster(cluster_id) for cluster_id in cluster_ids_to_refine
+        ]
+        await asyncio.gather(*refine_coroutines, return_exceptions=True)
+
+        # Perform phase 1, 2 and 3 again to ensure the knowledge graph is up-to-date
+        await self._connect_and_merge()
+        await self._refresh_edges()
+        await self._detect_meta_clusters()
 
     # ------------------------------------------------------------------ #
     #  Shared Helper Functions                                           #
@@ -665,6 +729,81 @@ class KnowledgeEvolver:
     #  Phase 4 Helper Functions                                          #
     # ------------------------------------------------------------------ #
 
+    def _get_all_embed_sim_edges(self) -> List[Tuple[str, str, float, float]]:
+        """Get all edges with their old and new weights for global update phase."""
+        query = f"""
+        SELECT
+            kc.id AS source_id,
+            json_extract_string(edge, '$.target_cluster_id') AS target_id,
+            CAST(json_extract(edge, '$.weight') AS DOUBLE) AS old_weight,
+            list_cosine_similarity(
+                kc.embedding_vector::FLOAT[384],
+                target.embedding_vector::FLOAT[384]
+            ) AS new_weight
+        FROM {self._storage.table_name} kc,
+             unnest(CAST(kc.related_clusters::JSON AS JSON[])) AS t(edge),
+             {self._storage.table_name} target
+        WHERE json_extract_string(edge, '$.source') = 'embed_sim'
+          AND target.id = json_extract_string(edge, '$.target_cluster_id')
+          AND target.embedding_vector IS NOT NULL
+          AND kc.embedding_vector IS NOT NULL
+        """
+        return self._storage.db.fetch_all(query)
+
+    def _get_cluster_ids_to_refine(self) -> List[str]:
+        """Get cluster IDs to be refined based on hotness and confidence thresholds."""
+        query = f"""
+        SELECT id FROM {self._storage.table_name}
+        WHERE lifecycle != ?
+          AND hotness < ?
+          AND confidence < ?
+        LIMIT ?
+        """
+        parameters = [
+            Lifecycle.META.name,
+            _EVO_GLOBAL_UPDATE_HOTNESS_THRESHOLD,
+            _EVO_GLOBAL_UPDATE_CONFIDENCE_THRESHOLD,
+            _EVO_GLOBAL_UPDATE_MAX_CLUSTERS
+        ]
+        rows = self._storage.db.fetch_all(query, parameters)
+        return [row[0] for row in rows]
+
+    async def _refine_cluster(self, cluster_id: str):
+        """Refine a cluster by invoking the LLM to improve its queries and content."""
+        async with self._llm_semaphore:
+            cluster = await self._storage.get(cluster_id)
+            if cluster is None:
+                await self._log.warning(f"[Evolve] Cluster {cluster_id} not found for refinement.")
+                return
+
+            # Build prompt for the LLM to refine the cluster's queries and content
+            prompt = EVO_REFINE_CLUSTER.format(
+                queries=self._storage.combine_cluster_fields(cluster.queries),
+                content=str(cluster.content)[:3000]
+            )
+
+            response = await self._llm.achat({"role": "user", "content": prompt})
+            try:
+                # Parse the response
+                refined_data = json.loads(response)
+                query = refined_data["query"]
+                content = refined_data["content"]
+
+                # Update the cluster with refined data
+                cluster.queries = [query]
+                cluster.content = content
+                cluster.hotness = _EVO_GLOBAL_UPDATE_REFINED_HOTNESS
+                cluster.confidence = _EVO_GLOBAL_UPDATE_REFINED_CONFIDENCE
+                cluster.lifecycle = Lifecycle.EMERGING
+
+                # Update the storage and embedding
+                await self._storage.update(cluster)
+                await self._update_cluster_embedding(cluster)
+                self._manifest.edge_refresh_cluster_ids.append(cluster_id)
+
+            except Exception as e:
+                await self._log.error(f"[Evolve] Failed to parse LLM response for cluster {cluster_id}: {e}")
+                return
 
     # ------------------------------------------------------------------ #
     #  Manifest I/O                                                      #
