@@ -272,7 +272,7 @@ class AgenticSearch(BaseSearch):
         verbose: bool = True,
         log_callback: LogCallback = None,
         reuse_knowledge: bool = True,
-        enable_knowledge_evolution: bool = True,
+        enable_knowledge_evolution: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)

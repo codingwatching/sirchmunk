@@ -56,13 +56,19 @@ _EVO_MERGE_SIMILARITY_THRESHOLD = 0.90
 _EVO_EDGE_REFRESH_COUNT = 20
 
 # Maximum number of clusters to consider for edge refresh in a single step
-_EVO_EDGE_REFRESH_TOPK = 10
+_EVO_EDGE_REFRESH_TOPK = 5
 
 # Minimum number of clusters required to trigger meta cluster detection phase
 _EVO_META_DETECTION_COUNT = 100
 
+# Maximum number of queries to consider for building meta cluster query
+_EVO_META_DETECTION_MAX_QUERIES = 50
+
 # Minimum number of clusters required to trigger global update phase
 _EVO_GLOBAL_UPDATE_COUNT = 500
+
+# Similarity threshold for disconnecting clusters during global update phase
+_EVO_GLOBAL_UPDATE_DISCONNECT_SIMILARITY_THRESHOLD = 0.30
 
 # Threshold for low hotness and confidence to trigger global update phase
 _EVO_GLOBAL_UPDATE_HOTNESS_THRESHOLD = 0.1
@@ -185,9 +191,13 @@ class KnowledgeEvolver:
 
     async def _step(self):
         """Step the evolver to process the clusters in the buffer."""
+        # Deduplicate and clear the buffer after processing
+        cluster_ids = list(set(self._manifest.cluster_ids_buffer))
+        self._manifest.cluster_ids_buffer.clear()
+
         # Check the cluster is created or reused
         # created: | last_modified - created | < 1 second
-        for cluster_id in self._manifest.cluster_ids_buffer:
+        for cluster_id in cluster_ids:
             cluster = await self._storage.get(cluster_id)
             if cluster is None:
                 await self._log.warning(
@@ -201,9 +211,6 @@ class KnowledgeEvolver:
             else:
                 # This cluster is reused with embedding refresh
                 self._manifest.edge_refresh_cluster_ids.append(cluster.id)
-        
-        # Clear the buffer after processing
-        self._manifest.cluster_ids_buffer.clear()
 
         # Update the current step count
         self._manifest.current_step += 1
@@ -371,7 +378,6 @@ class KnowledgeEvolver:
                         target=best_cluster,
                         edge_source="embed_sim",
                         weight=best_match["similarity"],
-                        use_max_weight=True
                     )
             else:
                 # No action needed if similarity is below the threshold
@@ -416,7 +422,6 @@ class KnowledgeEvolver:
                         target=target_cluster,
                         edge_source="embed_sim",
                         weight=similar_cluster["similarity"],
-                        use_max_weight=False
                     )
 
         await self._log.info(
@@ -477,11 +482,14 @@ class KnowledgeEvolver:
             community_to_cluster_ids[community_id].append(cluster_id)
     
         # Build meta clusters for each community with more than 1 cluster
+        meta_cluster_coroutines = []
         for community_id, cluster_ids in community_to_cluster_ids.items():
             if len(cluster_ids) <= 1:
                 continue
 
-            await self._build_meta_cluster(community_id, cluster_ids)
+            meta_cluster_coroutines.append(self._build_meta_cluster(community_id, cluster_ids))
+        
+        await asyncio.gather(*meta_cluster_coroutines, return_exceptions=True)
 
         await self._log.info(
             f"[Evolve] Created {len(community_to_cluster_ids)} meta clusters "
@@ -511,9 +519,12 @@ class KnowledgeEvolver:
         # Update the edges and remove the invalid edges based on the similarity threshold
         embed_sim_edges = self._get_all_embed_sim_edges()
 
-        updates = defaultdict(list)
+        updates = defaultdict(dict)  # source_id -> {target_id: new_weight}
         for (source_id, target_id, old_weight, new_weight) in embed_sim_edges:
-            updates[source_id].append((target_id, new_weight))
+            if old_weight == new_weight:
+                continue  # No change in weight, skip
+            updates[source_id][target_id] = new_weight
+            updates[target_id][source_id] = new_weight
 
         # Update the edges in the storage
         for source_id, edge_updates in updates.items():
@@ -521,13 +532,15 @@ class KnowledgeEvolver:
             if cluster is None:
                 continue
             # Update the edges with new weights and remove edges below the threshold
-            embed_sim_edges = [
-                WeakSemanticEdge(target_cluster_id=target_id, weight=new_weight, source="embed_sim")
-                for target_id, new_weight in edge_updates
-                if new_weight >= _EVO_CONNECT_SIMILARITY_THRESHOLD
-            ]
-            other_edges = [edge for edge in cluster.related_clusters if edge.source != "embed_sim"]
-            cluster.related_clusters = embed_sim_edges + other_edges
+            updated_related_clusters = []
+            for edge in cluster.related_clusters:
+                if edge.source == "embed_sim" and edge.target_cluster_id in edge_updates:
+                    if edge_updates[edge.target_cluster_id] >= _EVO_GLOBAL_UPDATE_DISCONNECT_SIMILARITY_THRESHOLD:
+                        edge.weight = edge_updates[edge.target_cluster_id]
+                        updated_related_clusters.append(edge)
+                else:
+                    updated_related_clusters.append(edge)
+            cluster.related_clusters = updated_related_clusters
             await self._storage.update(cluster)
 
         # Refine the clusters with hotness and confidence below the thresholds
@@ -541,6 +554,10 @@ class KnowledgeEvolver:
         await self._connect_and_merge()
         await self._refresh_edges()
         await self._detect_meta_clusters()
+
+        # Update the last global update step and cluster count in the manifest
+        self._manifest.last_global_update_step = self._manifest.current_step
+        self._manifest.last_global_update_cluster_count = self._get_non_meta_cluster_count()
 
     # ------------------------------------------------------------------ #
     #  Shared Helper Functions                                           #
@@ -580,6 +597,8 @@ class KnowledgeEvolver:
     async def _merge_clusters(self, source: KnowledgeCluster, target: KnowledgeCluster):
         """Merge source cluster into target cluster and update the storage."""
         merged_cluster = await self._storage.merge([target, source])
+        if merged_cluster is None:
+            return
         # Update embedding with merged queries
         await self._update_cluster_embedding(merged_cluster)
         self._manifest.edge_refresh_cluster_ids.append(merged_cluster.id)
@@ -599,15 +618,11 @@ class KnowledgeEvolver:
         target_cluster_id: str, 
         edge_source: str,
         weight: float,
-        use_max_weight: bool = True
     ):
         """Add a weak semantic edge to the cluster or update the weight"""
         for edge in cluster.related_clusters:
             if edge.target_cluster_id == target_cluster_id and edge.source == edge_source:
-                if use_max_weight:
-                    edge.weight = max(edge.weight, weight)
-                else:
-                    edge.weight = weight
+                edge.weight = max(edge.weight, weight)
                 return
         cluster.related_clusters.append(
             WeakSemanticEdge(target_cluster_id=target_cluster_id, weight=weight, source=edge_source)
@@ -619,11 +634,10 @@ class KnowledgeEvolver:
         target: KnowledgeCluster,
         edge_source: str,
         weight: float,
-        use_max_weight: bool = True
     ):
         """Create a weak semantic edge between two clusters and update the storage."""
-        self._add_edge(source, target.id, edge_source, weight, use_max_weight)
-        self._add_edge(target, source.id, edge_source, weight, use_max_weight)
+        self._add_edge(source, target.id, edge_source, weight)
+        self._add_edge(target, source.id, edge_source, weight)
         # Update the clusters in storage
         await self._storage.update(source)
         await self._storage.update(target)
@@ -644,7 +658,7 @@ class KnowledgeEvolver:
             f"WHERE lifecycle = ?", [Lifecycle.META.name]
         )
 
-    def _get_edges_and_weights(self) -> Union[List[Tuple[str, str]], List[float]]:
+    def _get_edges_and_weights(self) -> Tuple[List[Tuple[str, str]], List[float]]:
         """Get all edges and corresponding weights via DuckDB query to avoid N+1 queries."""
         query = f"""
         SELECT kc.id                                         AS source,
@@ -666,64 +680,75 @@ class KnowledgeEvolver:
 
     async def _build_meta_cluster(self, community_id: int, cluster_ids: List[str]):
         """Build a meta cluster for a given community of clusters."""
-        meta_cluster_id = f"M{community_id:04d}"
-        # Fetch queries and abstraction_level from the clusters in the community
-        rows = self._storage.db.fetch_one(f"""
-            WITH matched AS (
-                SELECT queries, abstraction_level FROM {self._storage.table_name}
-                WHERE id IN (SELECT unnest(?::VARCHAR[]))
+        async with self._llm_semaphore:
+            meta_cluster_id = f"M{community_id:04d}"
+            # Fetch queries and abstraction_level from the clusters in the community
+            if _EVO_META_DETECTION_MAX_QUERIES >= len(cluster_ids):
+                num_queries_per_cluster = _EVO_META_DETECTION_MAX_QUERIES // len(cluster_ids)
+            else:
+                num_queries_per_cluster = 1
+
+            rows = self._storage.db.fetch_one(f"""
+                WITH matched AS (
+                    SELECT queries, abstraction_level FROM {self._storage.table_name}
+                    WHERE id IN (SELECT unnest(?::VARCHAR[]))
+                ),
+                limited_queries AS (
+                    SELECT queries
+                    FROM matched, unnest(CAST(queries::JSON AS JSON[])) WITH ORDINALITY AS t(queries, row_num)
+                    WHERE row_num <= ?
+                )
+                SELECT
+                    ( SELECT json_group_array(queries) FROM limited_queries ) AS cluster_queries,
+                    ( SELECT abstraction_level
+                    FROM matched
+                    WHERE abstraction_level IS NOT NULL
+                    GROUP BY abstraction_level
+                    ORDER BY COUNT(*) DESC
+                    LIMIT 1
+                    ) AS most_common_abstraction_level
+            """, [cluster_ids, num_queries_per_cluster])
+            if rows:
+                cluster_queries, most_common_abstraction_level = rows[0], rows[1]
+            else:
+                await self._log.error(f"[Evolve] Failed to fetch queries for meta cluster {meta_cluster_id}.")
+                return
+
+            # Build query for the meta cluster by summary common queries from the community clusters
+            queries = json.loads(cluster_queries) if cluster_queries else []
+            queries = queries[:_EVO_META_DETECTION_MAX_QUERIES]  # Limit the number of queries for the prompt
+            prompt = EVO_META_QUERY.format(
+                queries="\n".join(queries)
             )
-            SELECT
-                ( SELECT json_group_array(q) 
-                  FROM matched, unnest(CAST(queries::JSON AS JSON[])) AS t(q)
-                ) AS cluster_queries,
-                ( SELECT abstraction_level
-                  FROM matched
-                  WHERE abstraction_level IS NOT NULL
-                  GROUP BY abstraction_level
-                  ORDER BY COUNT(*) DESC
-                  LIMIT 1
-                ) AS most_common_abstraction_level
-        """, [cluster_ids])
-        if rows:
-            cluster_queries, most_common_abstraction_level = rows[0], rows[1]
-        else:
-            await self._log.error(f"[Evolve] Failed to fetch queries for meta cluster {meta_cluster_id}.")
-            return
+            response = await self._llm.achat([{"role": "user", "content": prompt}])
+            meta_query = response.content.strip()
 
-        # Build query for the meta cluster by summary common queries from the community clusters
-        queries = json.loads(cluster_queries) if cluster_queries else []
-        prompt = EVO_META_QUERY.format(
-            queries="\n".join(queries)
-        )
-        meta_query = await self._llm.achat({"role": "user", "content": prompt})
+            # Build related clusters
+            related_clusters = [
+                WeakSemanticEdge(target_cluster_id=cluster_id, weight=1.0, source="meta")
+                for cluster_id in cluster_ids
+            ]
 
-        # Build related clusters
-        related_clusters = [
-            WeakSemanticEdge(target_cluster_id=cluster_id, weight=1.0, source="meta")
-            for cluster_id in cluster_ids
-        ]
+            # Build the meta cluster object
+            # For meta clusters, the queries and embeddings are the most important
+            if most_common_abstraction_level is not None:
+                most_common_abstraction_level = AbstractionLevel[most_common_abstraction_level]
 
-        # Build the meta cluster object
-        # For meta clusters, the queries and embeddings are the most important
-        if most_common_abstraction_level is not None:
-            most_common_abstraction_level = AbstractionLevel[most_common_abstraction_level]
+            meta_cluster = KnowledgeCluster(
+                id=meta_cluster_id,
+                name=meta_query,
+                description=[f"Meta cluster ({len(cluster_ids)} clusters) for: {meta_query}"],
+                content="Meta cluster",
+                confidence=0.5,
+                abstraction_level=most_common_abstraction_level,
+                hotness=0.5,
+                lifecycle=Lifecycle.META,
+                related_clusters=related_clusters,
+                queries=[meta_query],
+            )
 
-        meta_cluster = KnowledgeCluster(
-            id=meta_cluster_id,
-            name=meta_query,
-            description=[f"Meta cluster ({len(cluster_ids)} clusters) for: {meta_query}"],
-            content="Meta cluster",
-            confidence=0.5,
-            abstraction_level=most_common_abstraction_level,
-            hotness=0.5,
-            lifecycle=Lifecycle.META,
-            related_clusters=related_clusters,
-            queries=[meta_query],
-        )
-
-        await self._storage.insert(meta_cluster)
-        await self._update_cluster_embedding(meta_cluster)
+            await self._storage.insert(meta_cluster)
+            await self._update_cluster_embedding(meta_cluster)
 
     # ------------------------------------------------------------------ #
     #  Phase 4 Helper Functions                                          #
@@ -747,6 +772,7 @@ class KnowledgeEvolver:
           AND target.id = json_extract_string(edge, '$.target_cluster_id')
           AND target.embedding_vector IS NOT NULL
           AND kc.embedding_vector IS NOT NULL
+          AND kc.id < target.id
         """
         return self._storage.db.fetch_all(query)
 
@@ -757,6 +783,7 @@ class KnowledgeEvolver:
         WHERE lifecycle != ?
           AND hotness < ?
           AND confidence < ?
+        ORDER BY hotness + confidence ASC
         LIMIT ?
         """
         parameters = [
@@ -782,10 +809,11 @@ class KnowledgeEvolver:
                 content=str(cluster.content)[:3000]
             )
 
-            response = await self._llm.achat({"role": "user", "content": prompt})
             try:
+                response = await self._llm.achat([{"role": "user", "content": prompt}])
                 # Parse the response
-                refined_data = json.loads(response)
+                raw_content = response.content.strip() or ""
+                refined_data = self._extract_json_object(raw_content)
                 query = refined_data["query"]
                 content = refined_data["content"]
 
@@ -804,6 +832,17 @@ class KnowledgeEvolver:
             except Exception as e:
                 await self._log.error(f"[Evolve] Failed to parse LLM response for cluster {cluster_id}: {e}")
                 return
+
+    def _extract_json_object(self, text: str) -> Optional[Dict]:
+        """Extract the first JSON object from a string."""
+        start = text.index('{')
+        end = text.rindex('}')
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return None
 
     # ------------------------------------------------------------------ #
     #  Manifest I/O                                                      #

@@ -1013,7 +1013,7 @@ Return ONLY the common query (no extra tags or metadata). Keep the same language
 
 EVO_REFINE_CLUSTER = """You are refining a knowledge cluster by polishing its queries and content.
 
-### Existing quries
+### Existing queries
 {queries}
 
 ### Existing content (may be truncated)

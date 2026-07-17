@@ -15,9 +15,9 @@ import os
 import json
 import atexit
 import threading
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from loguru import logger
 
 from .duckdb import DuckDBManager
@@ -609,7 +609,7 @@ class KnowledgeStorage:
             logger.error(f"Failed to get cluster {cluster_id}: {e}")
             return None
 
-    async def get_with_embedding(self, cluster_id: str) -> Optional[Union[KnowledgeCluster, List[float]]]:
+    async def get_with_embedding(self, cluster_id: str) -> Optional[Tuple[KnowledgeCluster, List[float]]]:
         """
         Get a knowledge cluster by ID (exact match) along with its embedding vector
 
@@ -622,13 +622,13 @@ class KnowledgeStorage:
         try:
             self._check_and_reload()
             row = self.db.fetch_one(
-                f"SELECT * FROM {self.table_name} WHERE id = ?",
+                f"SELECT *, embedding_vector FROM {self.table_name} WHERE id = ?",
                 [cluster_id]
             )
 
             if row:
-                cluster = self._row_to_cluster(row)
-                embedding_vector = row[-4]
+                cluster = self._row_to_cluster(row[:-1])  # Exclude embedding_vector from cluster
+                embedding_vector = row[-1]  # Last column is embedding_vector
                 return cluster, embedding_vector
             return None
 
@@ -655,9 +655,9 @@ class KnowledgeStorage:
 
             # Set creation and modification times if not set
             if not cluster.create_time:
-                cluster.create_time = datetime.now()
+                cluster.create_time = datetime.now(timezone.utc)
             if not cluster.last_modified:
-                cluster.last_modified = datetime.now()
+                cluster.last_modified = datetime.now(timezone.utc)
             if cluster.version is None:
                 cluster.version = 1
 
@@ -693,7 +693,7 @@ class KnowledgeStorage:
                 return False
 
             # Update modification time and version
-            cluster.last_modified = datetime.now()
+            cluster.last_modified = datetime.now(timezone.utc)
             cluster.version = (cluster.version or 0) + 1
 
             # Prepare update data
@@ -959,7 +959,7 @@ class KnowledgeStorage:
             # Update metadata
             if not merged.name.endswith("(merged)"):
                 merged.name = f"{merged.name} (merged)"
-            merged.last_modified = datetime.now()
+            merged.last_modified = datetime.now(timezone.utc)
             merged.version = (merged.version or 0) + 1
             merged.merge_count = (merged.merge_count or 0) + len(clusters) - 1
 
@@ -1030,8 +1030,8 @@ class KnowledgeStorage:
                     landmark_potential=cluster.landmark_potential,
                     hotness=cluster.hotness,
                     lifecycle=Lifecycle.EMERGING,  # New clusters are emerging
-                    create_time=datetime.now(),
-                    last_modified=datetime.now(),
+                    create_time=datetime.now(timezone.utc),
+                    last_modified=datetime.now(timezone.utc),
                     version=1,
                     related_clusters=cluster.related_clusters,
                 )
@@ -1305,6 +1305,7 @@ class KnowledgeStorage:
               FROM {self.table_name},
                    unnest(CAST(related_clusters::JSON AS JSON[])) AS t(edge)
               WHERE lifecycle = ?
+                AND embedding_vector IS NOT NULL
                 AND related_clusters IS NOT NULL
                 AND related_clusters != '[]'
                 AND related_clusters != ''
