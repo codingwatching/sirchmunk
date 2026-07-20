@@ -1271,7 +1271,7 @@ class KnowledgeStorage:
                 AND embedding_vector IS NOT NULL
               ORDER BY meta_sim DESC
               LIMIT ?
-            )
+            ),
             community_ids AS (
               SELECT DISTINCT json_extract_string(edge, '$.target_cluster_id') AS cluster_id
               FROM topk_meta,

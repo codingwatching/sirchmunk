@@ -171,6 +171,9 @@ class KnowledgeEvolver:
         Args:
             cluster (KnowledgeCluster): The new knowledge cluster to process.
         """
+        # Update the current step count
+        self._manifest.current_step += 1
+
         self._manifest.cluster_ids_buffer.append(cluster.id)
         self._save_manifest(self._manifest)
 
@@ -211,9 +214,6 @@ class KnowledgeEvolver:
             else:
                 # This cluster is reused with embedding refresh
                 self._manifest.edge_refresh_cluster_ids.append(cluster.id)
-
-        # Update the current step count
-        self._manifest.current_step += 1
 
         # Check and execute phases based on triggers
         has_evolved = False
@@ -694,7 +694,7 @@ class KnowledgeEvolver:
                     WHERE id IN (SELECT unnest(?::VARCHAR[]))
                 ),
                 limited_queries AS (
-                    SELECT queries
+                    SELECT t.queries
                     FROM matched, unnest(CAST(queries::JSON AS JSON[])) WITH ORDINALITY AS t(queries, row_num)
                     WHERE row_num <= ?
                 )
