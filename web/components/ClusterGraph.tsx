@@ -294,9 +294,11 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(
 
     function currentZoomScale(): number {
       const s = stateRef.current;
-      if (!s.g) return 1;
+      if (!s.svg) return 1;
+      const node = s.svg.node();
+      if (!node) return 1;
       try {
-        const t = d3.zoomTransform(s.svg!.node()!);
+        const t = d3.zoomTransform(node);
         return t.k;
       } catch {
         return 1;
@@ -323,7 +325,7 @@ export const ClusterGraph = forwardRef<ClusterGraphHandle, Props>(
 
     function fitView(animate = true) {
       const s = stateRef.current;
-      if (!s.svg || !s.g || s.simNodes.length === 0) return;
+      if (!s.svg || !s.g || !s.zoom || s.simNodes.length === 0) return;
       const xs = s.simNodes.map((n) => n.x!);
       const ys = s.simNodes.map((n) => n.y!);
       if (xs.length === 0) return;

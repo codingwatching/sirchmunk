@@ -255,8 +255,8 @@ from sirchmunk.llm import OpenAIChat
 llm = OpenAIChat(
         api_key="your-api-key",
         base_url="your-base-url",         # e.g., https://api.openai.com/v1
-        model="your-model-name"           # e.g., gpt-5.2
-        enable_knowledge_evolution=False  # whether to enable runtime knowledge evolution，defaults to False
+        model="your-model-name",          # e.g., gpt-5.2
+        enable_knowledge_evolution=False  # whether to enable runtime knowledge evolution, defaults to False
     )
 
 async def main():

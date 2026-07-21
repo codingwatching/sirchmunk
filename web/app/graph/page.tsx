@@ -1018,7 +1018,7 @@ function DetailPanel({
 
           {/* Timestamps */}
           {(detail.create_time || detail.last_modified) && (
-            <div className="text-[11px] text-slate-400 dark:text-slate-500 pt-2 border-t border-slate-100 dark:border-slate-700 space-y-0.5">
+            <div suppressHydrationWarning className="text-[11px] text-slate-400 dark:text-slate-500 pt-2 border-t border-slate-100 dark:border-slate-700 space-y-0.5">
               {detail.create_time && (
                 <p>
                   {t("Created")}:{" "}

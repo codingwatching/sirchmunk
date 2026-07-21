@@ -252,7 +252,7 @@ from sirchmunk.llm import OpenAIChat
 llm = OpenAIChat(
         api_key="your-api-key",
         base_url="your-base-url",         # 例如 https://api.openai.com/v1
-        model="your-model-name"           # 例如 gpt-5.2
+        model="your-model-name",          # 例如 gpt-5.2
         enable_knowledge_evolution=False  # 是否启用运行时知识进化，默认为 False
     )
 
