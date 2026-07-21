@@ -36,6 +36,7 @@ from sirchmunk.llm.prompts import (
     DEEP_TOC_ANALYSIS,
 )
 from sirchmunk.retrieve.text_retriever import GrepRetriever
+from sirchmunk.scheduler.evolver import KnowledgeEvolver
 from sirchmunk.schema.knowledge import (
     AbstractionLevel,
     EvidenceUnit,
@@ -271,6 +272,7 @@ class AgenticSearch(BaseSearch):
         verbose: bool = True,
         log_callback: LogCallback = None,
         reuse_knowledge: bool = True,
+        enable_knowledge_evolution: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -390,6 +392,24 @@ class AgenticSearch(BaseSearch):
         # response.  None means the LLM block was missing/unparseable
         # and callers should fall back to the heuristic.
         self._multi_source_intent: Optional[float] = None
+
+        self._background_tasks = set()  # For scheduler tasks
+        # ---- Knowledge evolution ----
+        self.knowledge_evolver: Optional[KnowledgeEvolver] = None
+        # Since knowledge evolution relies on the embedding client,
+        # we only enable it when enable_knowledge_evolution=True and
+        # self.embedding_client is not None.
+        if enable_knowledge_evolution and self.embedding_client is not None:
+            self.knowledge_evolver = KnowledgeEvolver(
+                llm=self.llm,
+                embedding=self.embedding_client,
+                knowledge_storage=self.knowledge_storage,
+                work_path=self.work_path,
+                log_callback=log_callback
+            )
+            _loguru_logger.info("Knowledge evolution enabled (knowledge_evolver initialized)")
+        else:
+            _loguru_logger.info("Knowledge evolution disabled")
 
     def update_log_callback(self, log_callback: LogCallback = None) -> None:
         """Replace the per-request log callback on all sub-components.
@@ -1961,6 +1981,15 @@ class AgenticSearch(BaseSearch):
                 spec_stale_hours=spec_stale_hours,
                 llm_fallback=llm_fallback,
             )
+
+        # ---- Knowledge evolution ----
+        if cluster and self.knowledge_evolver:
+            # To avoid blocking the return of search results
+            # `evolver.step` is invoked in a fire-and-forget manner.
+            # In the `evolver.step`, there is a lock to ensure safety
+            task = asyncio.create_task(self.knowledge_evolver.step(cluster=cluster))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
         # ---- Unified return wrapping ----
         if return_context:

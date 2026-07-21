@@ -13,6 +13,7 @@ class Lifecycle(Enum):
     EMERGING = "emerging"
     CONTESTED = "contested"
     DEPRECATED = "deprecated"
+    META = "meta"  # for meta clusters
 
 
 class AbstractionLevel(Enum):
@@ -390,7 +391,7 @@ class KnowledgeCluster:
             "resources": self.resources,
             "patterns": self.patterns,
             "constraints": [c.to_dict() for c in self.constraints],
-            "evidences": [er.to_dict() for er in self.evidences],
+            "evidences": [er.to_dict() for er in self.evidences] if self.evidences else [],
             "confidence": self.confidence,
             "abstraction_level": self.abstraction_level.name if self.abstraction_level else None,
             "landmark_potential": self.landmark_potential,
