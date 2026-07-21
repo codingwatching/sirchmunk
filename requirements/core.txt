@@ -21,3 +21,5 @@ python-docx
 openpyxl
 python-pptx
 charset-normalizer
+leidenalg
+igraph

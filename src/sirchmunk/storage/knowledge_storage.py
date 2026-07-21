@@ -15,9 +15,9 @@ import os
 import json
 import atexit
 import threading
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from loguru import logger
 
 from .duckdb import DuckDBManager
@@ -609,6 +609,33 @@ class KnowledgeStorage:
             logger.error(f"Failed to get cluster {cluster_id}: {e}")
             return None
 
+    async def get_with_embedding(self, cluster_id: str) -> Optional[Tuple[KnowledgeCluster, List[float]]]:
+        """
+        Get a knowledge cluster by ID (exact match) along with its embedding vector
+
+        Args:
+            cluster_id: Unique cluster ID
+
+        Returns:
+            Tuple of (KnowledgeCluster, embedding_vector) if found, None otherwise
+        """
+        try:
+            self._check_and_reload()
+            row = self.db.fetch_one(
+                f"SELECT *, embedding_vector FROM {self.table_name} WHERE id = ?",
+                [cluster_id]
+            )
+
+            if row:
+                cluster = self._row_to_cluster(row[:-1])  # Exclude embedding_vector from cluster
+                embedding_vector = row[-1]  # Last column is embedding_vector
+                return cluster, embedding_vector
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to get cluster with embedding {cluster_id}: {e}")
+            return None
+
     async def insert(self, cluster: KnowledgeCluster) -> bool:
         """
         Insert a new knowledge cluster
@@ -628,9 +655,9 @@ class KnowledgeStorage:
 
             # Set creation and modification times if not set
             if not cluster.create_time:
-                cluster.create_time = datetime.now()
+                cluster.create_time = datetime.now(timezone.utc)
             if not cluster.last_modified:
-                cluster.last_modified = datetime.now()
+                cluster.last_modified = datetime.now(timezone.utc)
             if cluster.version is None:
                 cluster.version = 1
 
@@ -666,7 +693,7 @@ class KnowledgeStorage:
                 return False
 
             # Update modification time and version
-            cluster.last_modified = datetime.now()
+            cluster.last_modified = datetime.now(timezone.utc)
             cluster.version = (cluster.version or 0) + 1
 
             # Prepare update data
@@ -707,6 +734,20 @@ class KnowledgeStorage:
             if not existing:
                 logger.warning(f"Cluster {cluster_id} does not exist")
                 return False
+
+            # Remove the edges from other clusters that point to this cluster
+            if existing.related_clusters:
+                for edge in existing.related_clusters:
+                    target_cluster = await self.get(edge.target_cluster_id)
+
+                    if target_cluster and target_cluster.related_clusters:
+                        # Remove the edge pointing to the cluster being deleted
+                        target_cluster.related_clusters = [
+                            e for e in target_cluster.related_clusters
+                            if e.target_cluster_id != cluster_id
+                        ]
+                        # Update the target cluster in the database
+                        await self.update(target_cluster)
 
             # Delete from database
             self.db.delete_data(self.table_name, "id = ?", [cluster_id])
@@ -766,11 +807,12 @@ class KnowledgeStorage:
             sql = f"""
             SELECT * FROM {self.table_name}
             WHERE
-                id LIKE ? OR
-                name LIKE ? OR
-                description LIKE ? OR
-                content LIKE ? OR
-                patterns LIKE ?
+                (id LIKE ? OR
+                 name LIKE ? OR
+                 description LIKE ? OR
+                 content LIKE ? OR
+                 patterns LIKE ?)
+                AND lifecycle != ?
             ORDER BY
                 CASE
                     WHEN id = ? THEN 1
@@ -782,14 +824,15 @@ class KnowledgeStorage:
             """
 
             params = [
-                search_pattern,  # id LIKE
-                search_pattern,  # name LIKE
-                search_pattern,  # description LIKE
-                search_pattern,  # content LIKE
-                search_pattern,  # patterns LIKE
-                query,           # exact id match
-                f"{query}%",     # name starts with
-                f"%{query}%",    # description contains
+                search_pattern,       # id LIKE
+                search_pattern,       # name LIKE
+                search_pattern,       # description LIKE
+                search_pattern,       # content LIKE
+                search_pattern,       # patterns LIKE
+                Lifecycle.META.name,  # META lifecycle exclusion
+                query,                # exact id match
+                f"{query}%",          # name starts with
+                f"%{query}%",         # description contains
                 limit
             ]
 
@@ -810,9 +853,11 @@ class KnowledgeStorage:
 
         Strategy:
         - Use first cluster as base
-        - Merge evidences, patterns, constraints from all clusters
+        - Merge information from all clusters
+            - descriptions, contents, evidences, patterns, constraints
+            - search_results, queries, related_clusters
         - Average numeric scores (confidence, hotness, etc.)
-        - Update version and timestamps
+        - Update merge_count, version, and timestamps
 
         Args:
             clusters: List of KnowledgeCluster objects to merge
@@ -835,6 +880,8 @@ class KnowledgeStorage:
             # Merge content and descriptions
             all_descriptions = []
             all_contents = []
+            all_search_results = []
+            all_queries = []
 
             for cluster in clusters:
                 # Handle descriptions
@@ -849,8 +896,18 @@ class KnowledgeStorage:
                 else:
                     all_contents.append(cluster.content)
 
+                # Handle search results
+                if cluster.search_results:
+                    all_search_results.extend(cluster.search_results)
+
+                # Handle queries
+                if cluster.queries:
+                    all_queries.extend(cluster.queries)
+
             merged.description = list(set(all_descriptions))  # Deduplicate
             merged.content = list(set(all_contents))  # Deduplicate
+            merged.search_results = list(set(all_search_results))  # Deduplicate
+            merged.queries = list(set(all_queries))  # Deduplicate
 
             # Merge evidences (deduplicate by doc_id)
             evidences_map = {}
@@ -900,9 +957,11 @@ class KnowledgeStorage:
                 merged.landmark_potential = sum(valid_landmark) / len(valid_landmark)
 
             # Update metadata
-            merged.name = f"{merged.name} (merged)"
-            merged.last_modified = datetime.now()
+            if not merged.name.endswith("(merged)"):
+                merged.name = f"{merged.name} (merged)"
+            merged.last_modified = datetime.now(timezone.utc)
             merged.version = (merged.version or 0) + 1
+            merged.merge_count = (merged.merge_count or 0) + len(clusters) - 1
 
             # Update the merged cluster in database
             await self.update(merged)
@@ -971,8 +1030,8 @@ class KnowledgeStorage:
                     landmark_potential=cluster.landmark_potential,
                     hotness=cluster.hotness,
                     lifecycle=Lifecycle.EMERGING,  # New clusters are emerging
-                    create_time=datetime.now(),
-                    last_modified=datetime.now(),
+                    create_time=datetime.now(timezone.utc),
+                    last_modified=datetime.now(timezone.utc),
                     version=1,
                     related_clusters=cluster.related_clusters,
                 )
@@ -1202,20 +1261,80 @@ class KnowledgeStorage:
             # DuckDB cosine similarity query
             # Explicit cast on both sides ensures type parity regardless of
             # how the table was created (fresh schema vs parquet import).
-            query = f"""
-            SELECT
-                id, name, description, confidence, hotness, search_results,
-                list_cosine_similarity(
-                    embedding_vector::FLOAT[384],
-                    ?::FLOAT[384]
-                ) AS similarity
-            FROM {self.table_name}
-            WHERE embedding_vector IS NOT NULL
+            # Use meta cluster (community) to avoid computing similarity for all rows unnecessarily.
+            community_query = f"""
+            WITH topk_meta AS (
+              SELECT id AS meta_id, related_clusters,
+                     list_cosine_similarity(embedding_vector::FLOAT[384], ?::FLOAT[384]) AS meta_sim
+              FROM {self.table_name}
+              WHERE lifecycle = ?
+                AND embedding_vector IS NOT NULL
+              ORDER BY meta_sim DESC
+              LIMIT ?
+            ),
+            community_ids AS (
+              SELECT DISTINCT json_extract_string(edge, '$.target_cluster_id') AS cluster_id
+              FROM topk_meta,
+                   unnest(CAST(related_clusters::JSON AS JSON[])) AS t(edge)
+              WHERE json_extract_string(edge, '$.target_cluster_id') IS NOT NULL
+            )
+            SELECT kc.id, kc.name, kc.description, kc.confidence, kc.hotness, kc.search_results,
+                   list_cosine_similarity(kc.embedding_vector::FLOAT[384], ?::FLOAT[384]) AS similarity
+            FROM {self.table_name} kc
+            WHERE kc.lifecycle != ?
+              AND kc.embedding_vector IS NOT NULL
+              AND kc.id IN (SELECT cluster_id FROM community_ids)
             ORDER BY similarity DESC
             LIMIT ?
             """
+            community_parameters = [
+                query_embedding,      # query embedding for meta similarity
+                Lifecycle.META.name,  # filter for meta clusters
+                top_k,                # limit for meta clusters
+                query_embedding,      # query embedding for community similarity
+                Lifecycle.META.name,  # filter for meta clusters
+                top_k                 # limit for community clusters
+            ]
 
-            results = self.db.fetch_all(query, [query_embedding, top_k])
+            community_results = self.db.fetch_all(community_query, community_parameters)
+
+            # Compute similarity for isolated clusters (non-community) if needed
+            isolated_query = f"""
+            WITH all_community_ids AS (
+              SELECT DISTINCT json_extract_string(edge, '$.target_cluster_id') AS cluster_id
+              FROM {self.table_name},
+                   unnest(CAST(related_clusters::JSON AS JSON[])) AS t(edge)
+              WHERE lifecycle = ?
+                AND embedding_vector IS NOT NULL
+                AND related_clusters IS NOT NULL
+                AND related_clusters != '[]'
+                AND related_clusters != ''
+                AND json_extract_string(edge, '$.target_cluster_id') IS NOT NULL
+            )
+            SELECT kc.id, kc.name, kc.description, kc.confidence, kc.hotness, kc.search_results,
+                   list_cosine_similarity(kc.embedding_vector::FLOAT[384], ?::FLOAT[384]) AS similarity
+            FROM {self.table_name} kc
+            WHERE kc.lifecycle != ?
+              AND kc.embedding_vector IS NOT NULL
+              AND kc.id NOT IN (SELECT cluster_id FROM all_community_ids)
+            ORDER BY similarity DESC
+            LIMIT ?
+            """
+            isolated_parameters = [
+                Lifecycle.META.name,  # filter for meta clusters
+                query_embedding,      # query embedding for isolated similarity
+                Lifecycle.META.name,  # filter for meta clusters
+                top_k                 # limit for isolated clusters
+            ]
+
+            isolated_results = self.db.fetch_all(isolated_query, isolated_parameters)
+
+            # Merge community and isolated results (sort + topk)
+            results = sorted(
+                community_results + isolated_results,
+                key=lambda x: x[6] or 0.0,
+                reverse=True
+            )[:top_k]
 
             # Filter by similarity threshold
             filtered_results = []

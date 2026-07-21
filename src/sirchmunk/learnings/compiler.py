@@ -44,7 +44,10 @@ from sirchmunk.utils.file_utils import get_fast_hash
 _DEFAULT_CONCURRENCY = 3
 
 # Similarity threshold for merging into existing clusters during compile
-_MERGE_SIMILARITY_THRESHOLD = 0.75
+_MERGE_SIMILARITY_THRESHOLD = 0.80
+
+# Similarity threshold for creating a new cluster during compile
+_CREATE_SIMILARITY_THRESHOLD = 0.50
 
 # Max chars for manifest-persisted document summary (used in Phase 2 & catalog)
 _MANIFEST_SUMMARY_MAX_LEN = 500
