@@ -156,6 +156,11 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 ## 🎉 News
 
+* 🚀 **Jul 21, 2026**: Sirchmunk v0.0.9
+  - **Knowledge self-evolving engine**: New runtime knowledge evolver (`KnowledgeEvolver`) with a four-phase cycle — connect & merge, edge refresh, meta-cluster detection, and global update; the knowledge graph evolves automatically with search usage.
+  - **Meta-cluster discovery**: Leiden community detection algorithm partitions the knowledge graph into communities; LLM synthesizes shared queries into meta-clusters (`META` lifecycle) as higher-level abstractions to reduce search complexity.
+  - **Background async evolution**: Evolution steps triggered fire-and-forget after search completes without blocking returns; locks and semaphores ensure concurrency safety; manifest persistence enables incremental recovery.
+  - **Knowledge graph visualization**: New knowledge cluster graph in the Web UI, intuitively presenting semantic relationships and lifecycle states between clusters, with interactive exploration and filtering.
 * 🚀 **Jun 18, 2026**: Sirchmunk v0.0.8
   - **Knowledge Compile (Beta)**: New `sirchmunk compile` command for offline document pre-processing — builds hierarchical tree indices and knowledge clusters to boost retrieval precision in both FAST and DEEP modes.
   - **Search pipeline integration**: Compile artifacts (tree indices, document catalog, summary index) are automatically detected and used by the search pipeline when available; graceful fallback to standard retrieval when absent.
@@ -249,8 +254,9 @@ from sirchmunk.llm import OpenAIChat
 
 llm = OpenAIChat(
         api_key="your-api-key",
-        base_url="your-base-url",   # e.g., https://api.openai.com/v1
-        model="your-model-name"     # e.g., gpt-5.2
+        base_url="your-base-url",         # e.g., https://api.openai.com/v1
+        model="your-model-name",          # e.g., gpt-5.2
+        enable_knowledge_evolution=False  # whether to enable runtime knowledge evolution, defaults to False
     )
 
 async def main():
@@ -686,6 +692,12 @@ A KnowledgeCluster is a richly annotated object that captures the full cognitive
    - Increases hotness (`+0.1`, capped at 1.0)
    - Recomputes the embedding from the updated query set — broadening the cluster's semantic catchment area
    - Updates version and timestamp
+
+5. **Runtime Periodic Evolution:** As retrieval continues, the system periodically reshapes the cluster topology — evolving scattered, isolated points into a locally connected semantic graph.
+   - New-cluster assimilation. The system locates the existing cluster most similar to each recently created one. If embedding similarity exceeds a threshold, the two merge and the embedding is recomputed over the combined query set; otherwise, a semantic edge links them.
+   - Semantic-edge refresh. Clusters whose embeddings were recently recomputed have their neighbor connections re-evaluated — edges are added or strengthened, never removed.
+   - Meta-cluster discovery. Meta-clusters are detected on the cluster graph via the `Leiden` algorithm; the LLM then synthesizes a meta-cluster-level query from each group's child query sets, and its embedding serves as a coarse first-pass index for subsequent similar-cluster retrieval.
+   - Global recalibration. The system recomputes embedding similarity across every semantic edge and updates weights accordingly — pruning any edge that has fallen below the validity threshold. This step also encompasses the three operations above, serving as a single complete periodic sync.
 
 #### Key Properties
 

@@ -14,6 +14,7 @@ import {
   Monitor,
   Globe,
   Github,
+  Share2,
 } from "lucide-react";
 import { useGlobal } from "@/context/GlobalContext";
 import { getTranslation, type Language } from "@/lib/i18n";
@@ -41,6 +42,7 @@ export default function Sidebar() {
         { name: t("Home"), href: "/", icon: Home },
         { name: t("History"), href: "/history", icon: History },
         { name: t("Knowledge"), href: "/knowledge", icon: BookOpen },
+        { name: t("Graph"), href: "/graph", icon: Share2 },
       ],
     },
     {
