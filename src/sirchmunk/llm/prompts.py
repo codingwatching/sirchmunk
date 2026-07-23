@@ -1031,3 +1031,30 @@ Produce a clear and concise query and content that:
 ### Output
 Return ONLY a JSON object, no extra text:
 {{"query": "...", "content": "..."}}"""
+
+
+# ---------------------------------------------------------------------------
+# Listwise Ranking prompt (LENS BatchRankingEvaluator)
+# ---------------------------------------------------------------------------
+
+LISTWISE_RANKING_PROMPT = """Rank the following {num_candidates} candidate text snippets by relevance to the query.
+
+### Query
+{query}
+
+### Candidates
+{candidates}
+
+### Instructions
+Rank ALL candidates from most to least relevant. Consider:
+1. Direct answer capability — does it contain the specific information asked?
+2. Information completeness — how much of the query does it address?
+3. Query relevance — semantic and topical alignment with the query.
+
+### Output
+Return ONLY a JSON object:
+{{"ranking": [0, 2, 1, ...], "reasons": ["reason for 1st place", "reason for 2nd place", ...]}}
+
+- "ranking": 0-indexed original candidate indices ordered best-to-worst.
+- "reasons": one short reason per candidate in rank order.
+"""
