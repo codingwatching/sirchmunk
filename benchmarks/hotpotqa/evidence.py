@@ -1,0 +1,235 @@
+"""HotpotQA evidence utilities."""
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Set
+
+
+def evaluate_supporting_facts(
+    supporting_facts: Any,
+    read_file_ids: Iterable[str] | None = None,
+    prediction: str = "",
+    retrieval_logs: Iterable[Dict[str, Any]] | None = None,
+    evidence_sources: Iterable[str] | None = None,
+    evidence_texts: Iterable[str] | None = None,
+    context: Any = None,
+) -> Dict[str, Any]:
+    """Compute lightweight supporting-fact recall from retrieved file paths.
+
+    P0 does not yet inspect sentence-level snippets from the search pipeline, so
+    this evaluator measures title-level supporting fact coverage. It is still
+    valuable for fullwiki runs because failures can be separated into answer
+    synthesis errors vs. evidence discovery misses.
+    """
+    gold_facts = _attach_supporting_sentences(_extract_facts(supporting_facts), context)
+    gold_titles = {fact["title"] for fact in gold_facts}
+    retrieved_titles = _titles_from_paths(read_file_ids or [])
+    retrieved_titles.update(_titles_from_paths(evidence_sources or []))
+    retrieved_titles.update(_titles_from_retrieval_logs(retrieval_logs or []))
+
+    if not gold_titles:
+        return {
+            "supporting_facts": [],
+            "supporting_fact_titles": [],
+            "retrieved_titles": sorted(retrieved_titles),
+            "supporting_fact_hit": False,
+            "evidence_recall": 0.0,
+            "answer_source_grounded": False,
+        }
+
+    title_hits = {
+        title for title in gold_titles
+        if any(_title_matches(title, retrieved) for retrieved in retrieved_titles)
+    }
+    fact_hits = [fact for fact in gold_facts if fact["title"] in title_hits]
+    sentence_facts = [fact for fact in gold_facts if fact.get("sentence")]
+    sentence_hits = [
+        fact for fact in sentence_facts
+        if any(_sentence_matches(fact["sentence"], text) for text in (evidence_texts or []))
+    ]
+    title_recall = len(title_hits) / max(len(gold_titles), 1)
+    fact_recall = len(fact_hits) / max(len(gold_facts), 1)
+    sentence_recall = len(sentence_hits) / max(len(sentence_facts), 1) if sentence_facts else None
+    effective_recall = sentence_recall if sentence_recall is not None and evidence_texts else fact_recall
+    answer_source_grounded = (bool(title_hits) or bool(sentence_hits)) and bool((prediction or "").strip())
+
+    return {
+        "supporting_facts": gold_facts,
+        "supporting_fact_titles": sorted(gold_titles),
+        "retrieved_titles": sorted(retrieved_titles),
+        "matched_supporting_fact_titles": sorted(title_hits),
+        "matched_supporting_facts": fact_hits,
+        "matched_supporting_sentences": sentence_hits,
+        "supporting_fact_hit": bool(title_hits) or bool(sentence_hits),
+        "supporting_fact_title_recall": round(title_recall, 4),
+        "supporting_sentence_recall": round(sentence_recall, 4) if sentence_recall is not None else None,
+        "evidence_recall": round(effective_recall, 4),
+        "answer_source_grounded": answer_source_grounded,
+    }
+
+
+def _extract_facts(supporting_facts: Any) -> List[Dict[str, Any]]:
+    """Normalize HotpotQA supporting_facts structures into title/sent_id facts."""
+    facts: List[Dict[str, Any]] = []
+    if supporting_facts is None:
+        return facts
+
+    if isinstance(supporting_facts, dict):
+        titles = supporting_facts.get("title") or supporting_facts.get("titles") or []
+        sent_ids = supporting_facts.get("sent_id") or supporting_facts.get("sent_ids") or []
+        if isinstance(titles, str):
+            titles = [titles]
+        if not isinstance(sent_ids, list):
+            sent_ids = [sent_ids] * len(titles)
+        for idx, title in enumerate(titles):
+            normalized = _normalize_title(str(title))
+            if normalized:
+                facts.append({"title": normalized, "sent_id": _safe_sent_id(sent_ids, idx)})
+        return facts
+
+    if hasattr(supporting_facts, "tolist"):
+        try:
+            supporting_facts = supporting_facts.tolist()
+        except Exception:
+            supporting_facts = list(supporting_facts)
+
+    if isinstance(supporting_facts, (list, tuple, set)):
+        for item in supporting_facts:
+            title = None
+            sent_id = None
+            if isinstance(item, dict):
+                title = item.get("title") or item.get("doc_title") or item.get("page")
+                sent_id = item.get("sent_id") or item.get("sentence_id")
+            elif isinstance(item, (list, tuple)) and item:
+                title = item[0]
+                sent_id = item[1] if len(item) > 1 else None
+            else:
+                title = item
+            normalized = _normalize_title(str(title)) if title is not None else ""
+            if normalized:
+                facts.append({"title": normalized, "sent_id": sent_id})
+    return facts
+
+
+def _extract_titles(supporting_facts: Any) -> Set[str]:
+    return {fact["title"] for fact in _extract_facts(supporting_facts)}
+
+
+def _titles_from_paths(paths: Iterable[str]) -> Set[str]:
+    titles: Set[str] = set()
+    for raw in paths:
+        if not raw:
+            continue
+        path = Path(str(raw))
+        candidates = [path.stem, path.name]
+        # Some wiki corpora store article titles in parent dirs.
+        candidates.extend(part for part in path.parts[-3:] if part)
+        for candidate in candidates:
+            normalized = _normalize_title(candidate)
+            if normalized:
+                titles.add(normalized)
+    return titles
+
+
+def _attach_supporting_sentences(facts: List[Dict[str, Any]], context: Any) -> List[Dict[str, Any]]:
+    if not facts or context is None:
+        return facts
+    context_map = _context_sentence_map(context)
+    enriched: List[Dict[str, Any]] = []
+    for fact in facts:
+        item = dict(fact)
+        sentence = context_map.get((fact.get("title"), fact.get("sent_id")))
+        if sentence:
+            item["sentence"] = sentence
+        enriched.append(item)
+    return enriched
+
+
+def _context_sentence_map(context: Any) -> Dict[tuple[str, Any], str]:
+    mapping: Dict[tuple[str, Any], str] = {}
+    if hasattr(context, "tolist"):
+        try:
+            context = context.tolist()
+        except Exception:
+            pass
+    if isinstance(context, dict):
+        titles = context.get("title") or context.get("titles") or []
+        sentences = context.get("sentences") or context.get("sentence") or []
+        if isinstance(titles, str):
+            titles = [titles]
+        for title, sent_list in zip(titles, sentences):
+            norm_title = _normalize_title(str(title))
+            if hasattr(sent_list, "tolist"):
+                sent_list = sent_list.tolist()
+            if isinstance(sent_list, (list, tuple)):
+                for idx, sentence in enumerate(sent_list):
+                    mapping[(norm_title, idx)] = str(sentence)
+        return mapping
+    if isinstance(context, (list, tuple)):
+        for item in context:
+            if isinstance(item, dict):
+                title = item.get("title")
+                sentences = item.get("sentences") or item.get("sentence") or []
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                title, sentences = item[0], item[1]
+            else:
+                continue
+            norm_title = _normalize_title(str(title))
+            if hasattr(sentences, "tolist"):
+                sentences = sentences.tolist()
+            if isinstance(sentences, (list, tuple)):
+                for idx, sentence in enumerate(sentences):
+                    mapping[(norm_title, idx)] = str(sentence)
+    return mapping
+
+
+def _sentence_matches(gold_sentence: str, evidence_text: str) -> bool:
+    gold_tokens = set(_normalize_title(gold_sentence).split())
+    evidence_tokens = set(_normalize_title(evidence_text).split())
+    if not gold_tokens or not evidence_tokens:
+        return False
+    overlap = len(gold_tokens & evidence_tokens) / max(len(gold_tokens), 1)
+    return overlap >= 0.6
+
+
+def _titles_from_retrieval_logs(logs: Iterable[Dict[str, Any]]) -> Set[str]:
+    titles: Set[str] = set()
+    for log in logs:
+        metadata = log.get("metadata", {}) if isinstance(log, dict) else {}
+        candidates: List[Any] = []
+        for key in ("path", "file", "file_path", "files", "file_paths", "results", "candidates"):
+            value = metadata.get(key)
+            if isinstance(value, list):
+                candidates.extend(value)
+            elif value:
+                candidates.append(value)
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                candidate = candidate.get("path") or candidate.get("file") or candidate.get("title")
+            normalized = _normalize_title(str(candidate)) if candidate is not None else ""
+            if normalized:
+                titles.add(normalized)
+    return titles
+
+
+def _safe_sent_id(values: Any, idx: int) -> Any:
+    try:
+        return values[idx]
+    except Exception:
+        return None
+
+
+def _title_matches(gold: str, retrieved: str) -> bool:
+    if not gold or not retrieved:
+        return False
+    if gold == retrieved:
+        return True
+    return gold in retrieved or retrieved in gold
+
+
+def _normalize_title(title: str) -> str:
+    title = title.replace("_", " ")
+    title = re.sub(r"\.[A-Za-z0-9]+$", "", title)
+    title = re.sub(r"[^a-zA-Z0-9]+", " ", title).strip().lower()
+    return " ".join(title.split())

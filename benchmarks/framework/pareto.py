@@ -1,0 +1,330 @@
+"""framework/pareto.py — ParetoTracker
+
+多 benchmark 联合优化的 Pareto 追踪器。
+
+核心概念：
+  metrics_vector = {benchmark_name: {accuracy, coverage, avg_latency}}
+  A 支配 B（A dominates B）:= A 在所有 benchmark 的 accuracy 上均 >= B，
+                              且至少在一个 benchmark 上 > B。
+
+持久化：multi_experiments.jsonl（与单 benchmark 的 experiments.jsonl 分开）
+
+使用场景：
+  - MultiAdapterOrchestrator 记录每次联合实验的指标向量
+  - 在提交任何 Layer 0/1 变更前，检查是否 Pareto dominant
+  - 追踪 Pareto frontier 是否停止扩张（收敛判断）
+"""
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# accuracy 降幅超过此值（百分点）视为回退
+_REGRESSION_THRESHOLD = 2.0
+
+
+@dataclass
+class MultiMetricsPoint:
+    """一次联合实验的多维度指标快照。"""
+    run_id: str
+    timestamp: str                                    # ISO 8601
+    git_commit: str
+    config_hash: str                                  # 全局 config hash
+    metrics_vector: Dict[str, Dict[str, float]]       # {bm: {accuracy, coverage, avg_latency}}
+    is_pareto_optimal: bool = True                    # 是否在当前 Pareto frontier 上
+    notes: str = ""
+
+
+@dataclass
+class MultiDelta:
+    """两次联合实验之间的差异。"""
+    run_id_a: str
+    run_id_b: str
+    # {bm_name: {accuracy_delta, coverage_delta, latency_delta}}
+    per_bm_delta: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    pareto_status: str = ""   # "dominant" | "trade_off" | "harmful" | "neutral"
+
+    def print_summary(self) -> None:
+        status_icon = {
+            "dominant":  "✅",
+            "trade_off": "⚖️ ",
+            "harmful":   "❌",
+            "neutral":   "➖",
+        }.get(self.pareto_status, "❓")
+        print(f"\n── Multi-Benchmark Delta: {self.run_id_a} → {self.run_id_b} ──")
+        print(f"  Pareto Status: {status_icon}  {self.pareto_status.upper()}")
+        print(f"  {'Benchmark':<25} {'Δacc%':>7} {'Δcov%':>7} {'Δlat':>7}")
+        print("  " + "─" * 50)
+        for bm, d in sorted(self.per_bm_delta.items()):
+            s = lambda v: f"+{v:.2f}" if v >= 0 else f"{v:.2f}"
+            print(f"  {bm:<25} {s(d.get('accuracy_delta', 0)):>7} "
+                  f"{s(d.get('coverage_delta', 0)):>7} "
+                  f"{s(d.get('latency_delta', 0)):>7}")
+        print()
+
+
+class ParetoTracker:
+    """联合实验的 Pareto 追踪器。
+
+    Usage::
+
+        tracker = ParetoTracker("benchmarks/multi_experiments.jsonl")
+        pt = tracker.record_multi(run_id, metrics_vector, git_commit, config_hash)
+        delta = tracker.compare_runs("run_001", "run_002")
+        delta.print_summary()
+        converged, msg = tracker.convergence_check(window=3)
+    """
+
+    def __init__(self, path: str = "benchmarks/multi_experiments.jsonl") -> None:
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def record_multi(
+        self,
+        run_id: str,
+        metrics_vector: Dict[str, Dict[str, float]],
+        git_commit: str = "unknown",
+        config_hash: str = "unknown",
+        notes: str = "",
+    ) -> MultiMetricsPoint:
+        """记录一次联合实验，自动计算 Pareto 最优性并标记回退。
+
+        先追加，再重算全局 Pareto 排名（O(N²) 但 N 通常很小）。
+        """
+        point = MultiMetricsPoint(
+            run_id=run_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            git_commit=git_commit,
+            config_hash=config_hash,
+            metrics_vector=metrics_vector,
+            is_pareto_optimal=True,
+            notes=notes,
+        )
+        self._append(point)
+        self._recompute_pareto_flags()
+
+        # 回退检测：与前一条记录比较
+        history = self._load_all()
+        if len(history) >= 2:
+            prev = history[-2]
+            for bm, vec in metrics_vector.items():
+                prev_acc = prev.metrics_vector.get(bm, {}).get("accuracy", 0)
+                curr_acc = vec.get("accuracy", 0)
+                if curr_acc < prev_acc - _REGRESSION_THRESHOLD:
+                    logger.warning(
+                        "[ParetoTracker] ⚠️  REGRESSION on %s: %.1f%% → %.1f%%  (run=%s)",
+                        bm, prev_acc, curr_acc, run_id
+                    )
+
+        return point
+
+    def compare_runs(self, run_id_a: str, run_id_b: str) -> Optional[MultiDelta]:
+        """比较两次联合实验，返回 per-benchmark delta 和 Pareto 状态。"""
+        all_pts = {p.run_id: p for p in self._load_all()}
+        a, b = all_pts.get(run_id_a), all_pts.get(run_id_b)
+        if not a or not b:
+            logger.warning("[ParetoTracker] compare: run not found (%s, %s)", run_id_a, run_id_b)
+            return None
+
+        per_bm: Dict[str, Dict[str, float]] = {}
+        benchmarks = set(a.metrics_vector) | set(b.metrics_vector)
+
+        for bm in benchmarks:
+            va = a.metrics_vector.get(bm, {})
+            vb = b.metrics_vector.get(bm, {})
+            per_bm[bm] = {
+                "accuracy_delta":  vb.get("accuracy", 0)  - va.get("accuracy", 0),
+                "coverage_delta":  vb.get("coverage", 0)  - va.get("coverage", 0),
+                "latency_delta":   vb.get("avg_latency", 0) - va.get("avg_latency", 0),
+            }
+
+        # Pareto 状态分类
+        acc_deltas = [v["accuracy_delta"] for v in per_bm.values()]
+        if all(d >= 0 for d in acc_deltas) and any(d > 0 for d in acc_deltas):
+            status = "dominant"
+        elif all(d < -_REGRESSION_THRESHOLD for d in acc_deltas):
+            status = "harmful"
+        elif any(d > 0 for d in acc_deltas) and any(d < -_REGRESSION_THRESHOLD for d in acc_deltas):
+            status = "trade_off"
+        else:
+            status = "neutral"
+
+        return MultiDelta(
+            run_id_a=run_id_a,
+            run_id_b=run_id_b,
+            per_bm_delta=per_bm,
+            pareto_status=status,
+        )
+
+    def latest_n(self, n: int = 5) -> List[MultiMetricsPoint]:
+        """返回最近 N 条联合实验记录。"""
+        return self._load_all()[-n:]
+
+    def pareto_frontier(self) -> List[MultiMetricsPoint]:
+        """返回当前 Pareto 最优点集合。"""
+        return [p for p in self._load_all() if p.is_pareto_optimal]
+
+    def convergence_check(
+        self, window: int = 3, threshold: float = 1.0
+    ) -> Tuple[bool, str]:
+        """检查最近 window 次联合实验中 Pareto frontier 是否停止扩张。
+
+        判断依据：连续 window 次，每次 avg accuracy delta（跨所有 benchmark）< threshold。
+        """
+        history = self._load_all()
+        if len(history) < window + 1:
+            return False, f"Not enough records ({len(history)}) for convergence check"
+
+        recent = history[-(window + 1):]
+        deltas = []
+        for i in range(1, len(recent)):
+            prev, curr = recent[i - 1], recent[i]
+            bms = set(prev.metrics_vector) & set(curr.metrics_vector)
+            if not bms:
+                continue
+            avg_delta = sum(
+                abs(curr.metrics_vector[bm].get("accuracy", 0)
+                    - prev.metrics_vector[bm].get("accuracy", 0))
+                for bm in bms
+            ) / len(bms)
+            deltas.append(avg_delta)
+
+        if all(d < threshold for d in deltas[-window:]):
+            return True, (
+                f"Pareto frontier converged: avg accuracy deltas "
+                f"{[f'{d:.2f}%' for d in deltas[-window:]]} all < {threshold}%"
+            )
+        return False, f"Not converged: recent avg deltas = {[f'{d:.2f}%' for d in deltas]}"
+
+    def print_history(self, n: int = 8) -> None:
+        """打印联合实验历史表格。"""
+        points = self.latest_n(n)
+        if not points:
+            print("  (no multi-benchmark experiments recorded yet)")
+            return
+
+        # 收集所有 benchmark 名称
+        all_bms = sorted({bm for p in points for bm in p.metrics_vector})
+        header_bms = "  ".join(f"{bm[:12]:>12}" for bm in all_bms)
+        print(f"\n{'Run ID':<35}  {header_bms}  {'Pareto':>6}")
+        print("─" * (35 + 15 * len(all_bms) + 10))
+
+        for p in points:
+            bm_cols = "  ".join(
+                f"{p.metrics_vector.get(bm, {}).get('accuracy', 0):>11.1f}%"
+                for bm in all_bms
+            )
+            pareto_tag = " ✅" if p.is_pareto_optimal else " ──"
+            print(f"  {p.run_id:<33}  {bm_cols}{pareto_tag}")
+        print()
+
+    # ------------------------------------------------------------------
+    # Static helpers — Pareto dominance
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def dominates(
+        vec_a: Dict[str, Dict],
+        vec_b: Dict[str, Dict],
+        metric: str = "accuracy",
+    ) -> bool:
+        """Return True if vec_a Pareto-dominates vec_b on `metric`.
+
+        Dominance rule:
+          - For ALL shared benchmarks: a[bm][metric] >= b[bm][metric]
+          - For AT LEAST ONE benchmark: a[bm][metric] > b[bm][metric]
+        """
+        shared = set(vec_a) & set(vec_b)
+        if not shared:
+            return False
+        all_ge = all(
+            vec_a[bm].get(metric, 0) >= vec_b[bm].get(metric, 0)
+            for bm in shared
+        )
+        any_gt = any(
+            vec_a[bm].get(metric, 0) > vec_b[bm].get(metric, 0)
+            for bm in shared
+        )
+        return all_ge and any_gt
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _append(self, point: MultiMetricsPoint) -> None:
+        row = {
+            "run_id":          point.run_id,
+            "timestamp":       point.timestamp,
+            "git_commit":      point.git_commit,
+            "config_hash":     point.config_hash,
+            "metrics_vector":  point.metrics_vector,
+            "is_pareto_optimal": point.is_pareto_optimal,
+            "notes":           point.notes,
+        }
+        with open(self._path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def _load_all(self) -> List[MultiMetricsPoint]:
+        if not self._path.exists():
+            return []
+        points: List[MultiMetricsPoint] = []
+        with open(self._path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                    points.append(MultiMetricsPoint(
+                        run_id=d["run_id"],
+                        timestamp=d.get("timestamp", ""),
+                        git_commit=d.get("git_commit", "unknown"),
+                        config_hash=d.get("config_hash", "unknown"),
+                        metrics_vector=d.get("metrics_vector", {}),
+                        is_pareto_optimal=d.get("is_pareto_optimal", True),
+                        notes=d.get("notes", ""),
+                    ))
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        return points
+
+    def _recompute_pareto_flags(self) -> None:
+        """重计算所有已记录点的 Pareto 最优性，并更新文件。"""
+        points = self._load_all()
+        if not points:
+            return
+
+        # 使用 accuracy 作为主要优化维度
+        dominated = set()
+        for i, a in enumerate(points):
+            for j, b in enumerate(points):
+                if i != j and j not in dominated:
+                    if self.dominates(a.metrics_vector, b.metrics_vector):
+                        dominated.add(j)
+
+        for i, p in enumerate(points):
+            p.is_pareto_optimal = (i not in dominated)
+
+        # 覆写文件
+        with open(self._path, "w", encoding="utf-8") as f:
+            for p in points:
+                row = {
+                    "run_id":          p.run_id,
+                    "timestamp":       p.timestamp,
+                    "git_commit":      p.git_commit,
+                    "config_hash":     p.config_hash,
+                    "metrics_vector":  p.metrics_vector,
+                    "is_pareto_optimal": p.is_pareto_optimal,
+                    "notes":           p.notes,
+                }
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
