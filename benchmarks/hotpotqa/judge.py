@@ -78,6 +78,10 @@ class HotpotQAJudge:
         base = {
             "em": em,
             "f1": f1,
+            "official_em": em,
+            "official_f1": f1,
+            "official_exact_match": em >= 1.0,
+            "official_f1_correct": f1 >= self._equivalence_f1_threshold,
             "normalized_prediction": normalize_answer(short_prediction),
             "normalized_gold": normalize_answer(gold_answer),
             "short_prediction": short_prediction,
@@ -92,6 +96,8 @@ class HotpotQAJudge:
                 "equivalent": False,
                 "confidence": 1.0,
                 "reasoning": "Prediction is a refusal or empty answer.",
+                "llm_judge_used": False,
+                "llm_equivalent": None,
             }
 
         if em >= 1.0:
@@ -100,6 +106,8 @@ class HotpotQAJudge:
                 "equivalent": True,
                 "confidence": 1.0,
                 "reasoning": "Normalized exact match.",
+                "llm_judge_used": False,
+                "llm_equivalent": None,
             }
 
         if f1 >= self._equivalence_f1_threshold:
@@ -108,6 +116,8 @@ class HotpotQAJudge:
                 "equivalent": True,
                 "confidence": min(0.99, max(0.8, f1)),
                 "reasoning": "Token F1 exceeds equivalence threshold.",
+                "llm_judge_used": False,
+                "llm_equivalent": None,
             }
 
         should_call_llm = (
@@ -122,6 +132,7 @@ class HotpotQAJudge:
                 "confidence": 1.0 - f1,
                 "reasoning": "Lexical metrics below equivalence threshold; LLM fallback not available or disabled.",
                 "llm_judge_used": False,
+                "llm_equivalent": None,
             }
 
         cache_key = (
@@ -164,6 +175,7 @@ class HotpotQAJudge:
                 "reasoning": reasoning or "LLM semantic judge.",
                 "tokens_used": tokens_used,
                 "llm_judge_used": True,
+                "llm_equivalent": equivalent,
             }
             self._cache[cache_key] = {
                 k: v for k, v in result.items() if k not in ("cached", "tokens_used")
@@ -178,6 +190,7 @@ class HotpotQAJudge:
                 "reasoning": f"LLM judge failed: {exc}",
                 "tokens_used": tokens_used,
                 "llm_judge_used": True,
+                "llm_equivalent": False,
                 "error": str(exc),
             }
 

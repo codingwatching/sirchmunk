@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import platform
-import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -12,6 +11,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .protocol import protocol_to_text
+
+
+_SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH")
 
 
 class RunArtifactManager:
@@ -42,6 +44,10 @@ class RunArtifactManager:
     @property
     def predictions_path(self) -> Path:
         return self.results_dir / "predictions.jsonl"
+
+    @property
+    def per_sample_eval_path(self) -> Path:
+        return self.results_dir / "per_sample_eval.jsonl"
 
     @property
     def metrics_path(self) -> Path:
@@ -83,6 +89,7 @@ class RunArtifactManager:
             "dataset_manifest": dataset_manifest or {},
             "env_file": env_file,
             "env_snapshot": self._safe_env_snapshot(),
+            "env_snapshot_version": 2,
         }
         path = self.run_dir / "manifest.json"
         path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -100,7 +107,7 @@ class RunArtifactManager:
                 json.dumps(dataset_manifest, indent=2, ensure_ascii=False), encoding="utf-8"
             )
         if env_file and Path(env_file).exists():
-            shutil.copyfile(env_file, self.run_dir / "env_snapshot.txt")
+            self._write_sanitized_env_snapshot(Path(env_file), self.run_dir / "env_snapshot.txt")
         return str(path)
 
     def save_metrics(self, metrics: Dict[str, Any]) -> str:
@@ -119,6 +126,11 @@ class RunArtifactManager:
         with self.predictions_path.open("a", encoding="utf-8") as fp:
             fp.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+    def append_per_sample_eval(self, row: Dict[str, Any]) -> None:
+        self.create()
+        with self.per_sample_eval_path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+
     @staticmethod
     def _safe_env_snapshot() -> Dict[str, str]:
         allow_prefixes = (
@@ -129,16 +141,30 @@ class RunArtifactManager:
             "LLM_BASE_URL",
             "EMBEDDING_MODEL",
         )
-        redacted_keys = ("KEY", "TOKEN", "SECRET", "PASSWORD")
         snapshot: Dict[str, str] = {}
         for key, value in os.environ.items():
             if not key.startswith(allow_prefixes):
                 continue
-            if any(marker in key.upper() for marker in redacted_keys):
+            if _is_sensitive_env_key(key):
                 snapshot[key] = "<redacted>"
             else:
                 snapshot[key] = value
         return snapshot
+
+    @staticmethod
+    def _write_sanitized_env_snapshot(source: Path, target: Path) -> None:
+        sanitized = []
+        for raw_line in source.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in raw_line:
+                sanitized.append(raw_line)
+                continue
+            key, _, value = raw_line.partition("=")
+            if _is_sensitive_env_key(key.strip()):
+                sanitized.append(f"{key}=<redacted>")
+            else:
+                sanitized.append(f"{key}={value}")
+        target.write_text("\n".join(sanitized) + "\n", encoding="utf-8")
 
     @staticmethod
     def _git_snapshot() -> Dict[str, Any]:
@@ -175,3 +201,8 @@ class RunArtifactManager:
             "machine": platform.machine(),
             "processor": platform.processor(),
         }
+
+
+def _is_sensitive_env_key(key: str) -> bool:
+    upper = (key or "").upper()
+    return any(marker in upper for marker in _SENSITIVE_ENV_MARKERS)

@@ -187,6 +187,22 @@ async def _main() -> int:
     except Exception:
         pass
 
+    golden_set = None
+    if args.sirchmunk_results or (args.baselines and not args.table_only) or (args.import_baseline and not args.table_only):
+        from evaluation.golden_set import GoldenSetManager
+        manager = GoldenSetManager(str(_SCRIPT_DIR / args.benchmark))
+        golden_set = manager.get_or_create(
+            adapter=bm_adapter,
+            seed=args.golden_seed,
+            n=args.golden_n,
+        )
+        logger.info(
+            "GoldenSet: %d questions seed=%d checksum=%s",
+            golden_set.n_questions,
+            args.golden_seed,
+            golden_set.sample_id_checksum(),
+        )
+
     # ── 加载本文结果 ─────────────────────────────────────────────────
     if args.sirchmunk_results:
         results_path = str(Path(args.sirchmunk_results).resolve())
@@ -195,6 +211,8 @@ async def _main() -> int:
             return 1
         logger.info("加载本文结果: %s", results_path)
         sirchmunk_results = UnifiedExperimentRunner.load_results_from_jsonl(results_path)
+        if golden_set is not None:
+            golden_set.verify_results_sample_ids(sirchmunk_results, system_name=ours_name)
         gen.add_system_results(
             system_name=ours_name,
             results=sirchmunk_results,
@@ -205,7 +223,6 @@ async def _main() -> int:
 
     # ── 运行 Mock / SDK 竞品 ─────────────────────────────────────────
     if args.baselines and not args.table_only:
-        from evaluation.golden_set import GoldenSetManager
         from evaluation.suite import BaselineEvaluationSuite
         from baselines import (
             ConstantMockBaseline,
@@ -218,14 +235,14 @@ async def _main() -> int:
             RandomAnswerMockBaseline,
         )
 
-        manager = GoldenSetManager(str(_SCRIPT_DIR / args.benchmark))
-        golden_set = manager.get_or_create(
-            adapter=bm_adapter,
-            seed=args.golden_seed,
-            n=args.golden_n,
-        )
-        logger.info("GoldenSet: %d 题 (seed=%d)", golden_set.n_questions, golden_set.golden_seed
-                    if hasattr(golden_set, "golden_seed") else args.golden_seed)
+        if golden_set is None:
+            from evaluation.golden_set import GoldenSetManager
+            manager = GoldenSetManager(str(_SCRIPT_DIR / args.benchmark))
+            golden_set = manager.get_or_create(
+                adapter=bm_adapter,
+                seed=args.golden_seed,
+                n=args.golden_n,
+            )
 
         gold_map = golden_set.to_gold_map()
         baseline_list = []
@@ -281,14 +298,15 @@ async def _main() -> int:
 
     # ── 导入预计算 JSONL 竞品（重新 Judge）────────────────────────────
     if args.import_baseline and not args.table_only:
-        from evaluation.golden_set import GoldenSetManager
         from evaluation.suite import BaselineEvaluationSuite
         from baselines import ManualImportAdapter
 
-        manager = GoldenSetManager(str(_SCRIPT_DIR / args.benchmark))
-        golden_set = manager.get_or_create(
-            adapter=bm_adapter, seed=args.golden_seed, n=args.golden_n
-        )
+        if golden_set is None:
+            from evaluation.golden_set import GoldenSetManager
+            manager = GoldenSetManager(str(_SCRIPT_DIR / args.benchmark))
+            golden_set = manager.get_or_create(
+                adapter=bm_adapter, seed=args.golden_seed, n=args.golden_n
+            )
 
         import_adapters = []
         for spec in args.import_baseline:

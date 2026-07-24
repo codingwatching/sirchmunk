@@ -27,7 +27,8 @@ def load_hotpotqa_samples(
 
     try:
         import pandas as pd
-        df = pd.read_parquet(parquet_files[0])
+        frames = [pd.read_parquet(path) for path in parquet_files]
+        df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
     except ImportError as exc:
         raise ImportError("HotpotQAAdapter requires 'pyarrow' and 'pandas'.") from exc
 
@@ -71,8 +72,12 @@ def build_dataset_manifest(dataset_dir: Path, wiki_dir: Path, *, setting: str, s
         "setting": setting,
         "split": split,
         "parquet_files": [str(p) for p in parquet_files],
+        "parquet_file_count": len(parquet_files),
+        "parquet_checksums": {str(p): _hash_file(p) for p in parquet_files},
+        "parquet_total_bytes": sum(_file_size(p) for p in parquet_files),
         "wiki_exists": wiki_dir.exists(),
         "parquet_checksum": _hash_file(parquet_files[0]) if parquet_files else "",
+        "manifest_version": 2,
     }
     if wiki_dir.exists():
         count, size = _summarize_dir(wiki_dir, max_files=5000)
@@ -80,6 +85,8 @@ def build_dataset_manifest(dataset_dir: Path, wiki_dir: Path, *, setting: str, s
             "wiki_file_count_sampled": count,
             "wiki_size_bytes_sampled": size,
             "wiki_scan_truncated": count >= 5000,
+            "wiki_summary_sample_max_files": 5000,
+            "corpus_validation_level": "directory_exists_with_sampled_stats",
         })
     return manifest
 
@@ -112,6 +119,13 @@ def _hash_file(path: Path) -> str:
         return h.hexdigest()
     except OSError:
         return ""
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def _summarize_dir(path: Path, max_files: int = 5000) -> tuple[int, int]:

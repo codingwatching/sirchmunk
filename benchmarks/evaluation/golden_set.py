@@ -55,6 +55,27 @@ class GoldenSet:
         """返回 {sample_id: question} 映射。"""
         return {s["sample_id"]: s["question"] for s in self.samples}
 
+    def sample_ids(self) -> List[str]:
+        """Return sample ids in GoldenSet order."""
+        return [str(s["sample_id"]) for s in self.samples]
+
+    def sample_id_checksum(self) -> str:
+        """Return order-insensitive checksum of sample ids."""
+        return compute_sample_id_checksum(self.sample_ids())
+
+    def verify_results_sample_ids(self, results: List[Any], *, system_name: str = "system") -> None:
+        """Ensure result sample ids match this GoldenSet exactly."""
+        expected = set(self.sample_ids())
+        observed = {str(getattr(r, "sample_id", "")) for r in results}
+        missing = sorted(expected - observed)
+        extra = sorted(observed - expected)
+        if missing or extra:
+            raise ValueError(
+                f"Sample id mismatch for {system_name}: "
+                f"missing={missing[:10]} extra={extra[:10]} "
+                f"expected_n={len(expected)} observed_n={len(observed)}"
+            )
+
     def to_benchmark_samples(self):
         """转换为 framework/schema.py 的 BenchmarkSample 列表（按需 import）。"""
         try:
@@ -203,6 +224,12 @@ class GoldenSetManager:
         )
         gs.save(path)
         return gs
+
+
+def compute_sample_id_checksum(sample_ids: List[str]) -> str:
+    canonical = sorted(str(sample_id) for sample_id in sample_ids)
+    raw = json.dumps(canonical, ensure_ascii=False)
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
 # ---------------------------------------------------------------------------

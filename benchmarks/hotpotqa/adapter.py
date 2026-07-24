@@ -39,6 +39,7 @@ from hotpotqa.loader import (  # noqa: E402
     load_hotpotqa_samples,
     validate_hotpotqa_corpus,
 )
+from hotpotqa.metrics import compute_hotpotqa_metrics  # noqa: E402
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -103,7 +104,10 @@ class HotpotQAAdapter(BenchmarkAdapter):
     # ------------------------------------------------------------------
 
     def _get(self, key: str, default: str = "") -> str:
-        return self._env.get(key, os.environ.get(key, default))
+        value = self._env.get(key)
+        if value is not None and value != "":
+            return value
+        return os.environ.get(key, default)
 
     def _get_int(self, key: str, default: int = 0) -> int:
         try:
@@ -153,7 +157,10 @@ class HotpotQAAdapter(BenchmarkAdapter):
             "top_k_files":      self._get_int("HOTPOT_TOP_K_FILES", 10),
             "max_token_budget": self._get_int("HOTPOT_MAX_TOKEN_BUDGET", 128000),
             "enable_dir_scan":  self._get_bool("HOTPOT_ENABLE_DIR_SCAN", True),
+            "enable_memory":    self._get_bool("SIRCHMUNK_ENABLE_MEMORY", False),
+            "enable_eval_feedback": self._get_bool("HOTPOT_ENABLE_EVAL_FEEDBACK", False),
             "enable_llm_judge": self._get_bool("HOTPOT_ENABLE_LLM_JUDGE", True),
+            "enable_gpt_eval":  self._get_bool("HOTPOT_ENABLE_GPT_EVAL", False),
             "llm_model":        self._get("LLM_MODEL_NAME", ""),
             "llm_base_url":     self._get("LLM_BASE_URL", ""),
             "max_concurrent":   self._get_int("HOTPOT_MAX_CONCURRENT", 3),
@@ -248,7 +255,12 @@ class HotpotQAAdapter(BenchmarkAdapter):
             seed=seed,
         ).to_dict()
         protocol["suite"] = [f"hotpotqa_{self._get('HOTPOT_SETTING', 'fullwiki')}"]
-        protocol["metrics"]["answer_quality"] = ["em", "f1", "judge_accuracy", "coverage"]
+        protocol["metrics"]["answer_quality"] = [
+            "official_exact_match",
+            "official_f1",
+            "llm_assisted_accuracy",
+            "coverage",
+        ]
         protocol["metrics"]["retrieval"] = ["evidence_recall", "supporting_fact_hit_rate", "source_grounding_accuracy"]
         protocol["limit"] = limit
         return protocol
@@ -298,6 +310,9 @@ class HotpotQAAdapter(BenchmarkAdapter):
             "mode_env_key": "HOTPOT_MODE",
             "judge_threshold_env_key": "HOTPOT_JUDGE_F1_THRESHOLD",
         }
+
+    def get_metric_aggregator(self):
+        return compute_hotpotqa_metrics
 
     def _wiki_dir(self) -> str:
         dataset_dir = Path(self._get("HOTPOT_DATASET_DIR", ""))

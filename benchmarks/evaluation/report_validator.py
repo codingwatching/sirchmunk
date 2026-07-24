@@ -54,6 +54,7 @@ class AcademicReportValidator:
         "dataset_manifest.json",
         "results/metrics.json",
         "results/predictions.jsonl",
+        "results/per_sample_eval.jsonl",
     ]
 
     def validate(
@@ -119,6 +120,17 @@ class AcademicReportValidator:
             issues.append(ValidationIssue("warning", "stage", "run stage is not explicitly recorded as frozen/exploration."))
         if config.get("stage") == "exploration":
             issues.append(ValidationIssue("warning", "stage", "Exploration runs should not be used as final frozen-evaluation claims."))
+        if config.get("stage") == "frozen" and config.get("enable_eval_feedback"):
+            issues.append(ValidationIssue("error", "eval_feedback", "Frozen evaluation must disable eval feedback to avoid test-set tuning."))
+        if config.get("stage") == "frozen" and config.get("enable_memory"):
+            issues.append(ValidationIssue("error", "memory_state", "Frozen evaluation must disable adaptive memory unless a fixed pre-trained memory state is explicitly versioned."))
+        if config.get("stage") == "frozen" and config.get("enable_llm_judge"):
+            issues.append(ValidationIssue("warning", "llm_judge", "LLM judge is enabled in frozen evaluation; official EM/F1 must remain the primary paper metric."))
+        if int(manifest.get("env_snapshot_version", 0) or 0) < 2:
+            issues.append(ValidationIssue("warning", "env_snapshot", "Env snapshot predates sanitized snapshot format v2."))
+        env_snapshot_path = run_path / "env_snapshot.txt"
+        if env_snapshot_path.exists() and _env_snapshot_has_unredacted_secret(env_snapshot_path):
+            issues.append(ValidationIssue("error", "env_snapshot_secret", "env_snapshot.txt contains an unredacted secret-like key.", str(env_snapshot_path)))
         cache_report = _read_json(run_path / "cache_report.json")
         if not cache_report:
             issues.append(ValidationIssue("warning", "cache_report", "cache_report.json is missing or invalid."))
@@ -150,6 +162,8 @@ class AcademicReportValidator:
             issues.append(ValidationIssue("warning", "metrics", "Latency distribution is missing from metrics."))
         if "token_usage" not in metrics:
             issues.append(ValidationIssue("warning", "metrics", "Token usage is missing from metrics."))
+        if "official_exact_match" not in metrics or "official_f1_correct" not in metrics:
+            issues.append(ValidationIssue("warning", "official_metrics", "Official EM/F1-derived metrics are missing from metrics.json."))
         failure_info = metrics.get("failure_classification", {}) or {}
         system_failures = int(failure_info.get("system_failures", 0) or 0)
         total = int(metrics.get("n", 0) or 0)
@@ -197,6 +211,13 @@ class AcademicReportValidator:
         sample_sizes = {int(s.get("n", 0) or 0) for s in systems if not s.get("is_published_only")}
         if len(sample_sizes) > 1:
             issues.append(ValidationIssue("error", "paired_samples", f"Non-published systems have different sample sizes: {sorted(sample_sizes)}", str(table_path)))
+        non_published = [s for s in systems if not s.get("is_published_only")]
+        missing_checksums = [s.get("system_name") for s in non_published if not s.get("sample_id_checksum")]
+        if missing_checksums:
+            issues.append(ValidationIssue("error", "sample_id_checksum", f"Systems lack sample_id_checksum: {missing_checksums}", str(table_path)))
+        checksums = {s.get("sample_id_checksum") for s in non_published if s.get("sample_id_checksum")}
+        if len(checksums) > 1:
+            issues.append(ValidationIssue("error", "paired_sample_ids", "Non-published systems do not share the same sample_id set.", str(table_path)))
         for system in systems:
             if system.get("is_ours") or system.get("is_published_only"):
                 continue
@@ -214,3 +235,18 @@ def _read_json(path: Path) -> Dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
+
+
+def _env_snapshot_has_unredacted_secret(path: Path) -> bool:
+    markers = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH")
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, value = stripped.partition("=")
+            if any(marker in key.upper() for marker in markers) and value and value != "<redacted>":
+                return True
+    except OSError:
+        return False
+    return False

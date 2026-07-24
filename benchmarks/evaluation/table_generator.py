@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from framework.metric_engine import collect_setup_metrics
 
+from .golden_set import compute_sample_id_checksum
 from .statistics import (
     bonferroni_correction,
     bootstrap_ci,
@@ -45,6 +46,9 @@ class SystemEntry:
     system_name: str          # 表格展示名（citation_name）
     n: int = 0
     accuracy: float = 0.0
+    official_em: float = 0.0
+    official_f1: float = 0.0
+    llm_assisted_accuracy: float = 0.0
     ci_lower: float = 0.0     # Bootstrap 95% CI lower
     ci_upper: float = 0.0     # Bootstrap 95% CI upper
     coverage: float = 0.0
@@ -54,6 +58,8 @@ class SystemEntry:
     is_ours: bool = False
     is_published_only: bool = False   # True = 只有发表数字，无 CI
     correct_list: List[bool] = field(default_factory=list)  # 用于 McNemar
+    sample_ids: List[str] = field(default_factory=list)
+    sample_id_checksum: str = ""
     setup_metrics: Dict[str, Any] = field(default_factory=dict)
     # 显著性（由 finalize() 填入）
     p_value: Optional[float] = None
@@ -124,12 +130,14 @@ class PaperTableGenerator:
             logger.warning("[TableGen] '%s': empty results, skipping.", system_name)
             return
 
-        n = len(results)
-        correct_list = [bool(getattr(r, "judge_correct", False)) for r in results]
-        coverage_list = [bool(getattr(r, "coverage", False)) for r in results]
-        latencies = [float(getattr(r, "elapsed", 0)) for r in results]
+        ordered_results = sorted(results, key=lambda r: str(getattr(r, "sample_id", "")))
+        n = len(ordered_results)
+        sample_ids = [str(getattr(r, "sample_id", "")) for r in ordered_results]
+        correct_list = [bool(getattr(r, "judge_correct", False)) for r in ordered_results]
+        coverage_list = [bool(getattr(r, "coverage", False)) for r in ordered_results]
+        latencies = [float(getattr(r, "elapsed", 0)) for r in ordered_results]
         tokens = []
-        for r in results:
+        for r in ordered_results:
             telemetry = getattr(r, "telemetry", {}) or {}
             if telemetry:
                 tokens.append(int(telemetry.get("total_tokens", 0)) + int(telemetry.get("judge_tokens", 0)))
@@ -137,10 +145,12 @@ class PaperTableGenerator:
                 tokens.append(int(getattr(r, "tokens_used", 0)) + int(getattr(r, "judge_tokens", 0)))
 
         accuracy, ci_lower, ci_upper = bootstrap_ci(correct_list)
+        metric_payloads = [_metric_payload_of(r) for r in ordered_results]
+        official_em_values = [float(p.get("official_em", p.get("em", 0.0)) or 0.0) for p in metric_payloads]
+        official_f1_values = [float(p.get("official_f1", p.get("f1", 0.0)) or 0.0) for p in metric_payloads]
 
-        # by_question_type 分层统计
         by_qt: Dict[str, Dict] = defaultdict(lambda: {"n": 0, "correct": 0, "coverage": 0})
-        for r in results:
+        for r in ordered_results:
             metadata = _metadata_of(r)
             qt = (
                 getattr(r, "question_type", "")
@@ -166,6 +176,9 @@ class PaperTableGenerator:
             system_name=system_name,
             n=n,
             accuracy=round(accuracy * 100, 1),
+            official_em=round(sum(official_em_values) / n * 100, 1) if n else 0.0,
+            official_f1=round(sum(official_f1_values) / n * 100, 1) if n else 0.0,
+            llm_assisted_accuracy=round(accuracy * 100, 1),
             ci_lower=round(ci_lower * 100, 1),
             ci_upper=round(ci_upper * 100, 1),
             coverage=round(sum(coverage_list) / n * 100, 1),
@@ -175,7 +188,9 @@ class PaperTableGenerator:
             is_ours=is_ours or (self._our_name and system_name == self._our_name),
             is_published_only=False,
             correct_list=correct_list,
-            setup_metrics=collect_setup_metrics(results),
+            sample_ids=sample_ids,
+            sample_id_checksum=compute_sample_id_checksum(sample_ids),
+            setup_metrics=collect_setup_metrics(ordered_results),
         )
         self._entries.append(entry)
 
@@ -507,6 +522,9 @@ class PaperTableGenerator:
                     "system_name":       e.system_name,
                     "n":                 e.n,
                     "accuracy":          e.accuracy,
+                    "official_em":       e.official_em,
+                    "official_f1":       e.official_f1,
+                    "llm_assisted_accuracy": e.llm_assisted_accuracy,
                     "ci_lower":          e.ci_lower,
                     "ci_upper":          e.ci_upper,
                     "coverage":          e.coverage,
@@ -517,6 +535,8 @@ class PaperTableGenerator:
                     "p_value":           e.p_value,
                     "is_significant":    e.is_significant,
                     "sig_marker":        e.sig_marker,
+                    "sample_id_checksum": e.sample_id_checksum,
+                    "sample_ids":         e.sample_ids,
                     "setup_metrics":      e.setup_metrics,
                     "by_question_type":  e.by_question_type,
                 }
@@ -536,6 +556,23 @@ def _metadata_of(result: Any) -> Dict[str, Any]:
         if isinstance(nested, dict):
             return nested
         return raw
+    return {}
+
+
+def _metric_payload_of(result: Any) -> Dict[str, Any]:
+    telemetry = getattr(result, "telemetry", None)
+    if isinstance(telemetry, dict) and telemetry:
+        return telemetry
+    metadata = getattr(result, "metadata", None)
+    if isinstance(metadata, dict):
+        judge_result = metadata.get("judge_result")
+        if isinstance(judge_result, dict):
+            return judge_result
+    raw = getattr(result, "raw", None)
+    if isinstance(raw, dict):
+        per_sample = raw.get("per_sample_eval")
+        if isinstance(per_sample, dict):
+            return per_sample
     return {}
 
 

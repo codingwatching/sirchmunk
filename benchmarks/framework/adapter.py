@@ -144,3 +144,7 @@ class BenchmarkAdapter(ABC):
             "cache_paths": [".cache/rga", ".cache/knowledge", ".cache/compile"],
             "compiled_markers": ["compile", "compiled"],
         }
+
+    def get_metric_aggregator(self):
+        """Return optional benchmark-specific metrics aggregator callable."""
+        return None

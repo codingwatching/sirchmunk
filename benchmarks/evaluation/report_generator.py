@@ -103,7 +103,14 @@ class ReportGenerator:
         lines.append(f"- Config hash: `{manifest.get('config_hash')}`")
         lines.append(f"- Samples: `{metrics.get('n', 'unknown')}`")
         if metrics:
-            lines.append(f"- Accuracy: `{metrics.get('accuracy', 'n/a')}`")
+            if "official_exact_match" in metrics:
+                lines.append(f"- Official exact match: `{metrics.get('official_exact_match')}`")
+            if "f1" in metrics:
+                lines.append(f"- Official token F1: `{metrics.get('f1')}`")
+            if "llm_assisted_accuracy" in metrics:
+                lines.append(f"- LLM-assisted accuracy: `{metrics.get('llm_assisted_accuracy')}`")
+            else:
+                lines.append(f"- Accuracy: `{metrics.get('accuracy', 'n/a')}`")
             lines.append(f"- Coverage: `{metrics.get('coverage', 'n/a')}`")
             if "evidence_recall" in metrics:
                 lines.append(f"- Evidence recall: `{metrics.get('evidence_recall')}`")
@@ -114,7 +121,7 @@ class ReportGenerator:
         if table.get("systems"):
             lines.append("## Main Result Table")
             lines.append("")
-            headers = ["System", "N", "Accuracy", "Coverage", "Latency", "Setup(s)", "p-value"]
+            headers = ["System", "N", "Official EM", "Official F1", "LLM Acc", "Coverage", "Latency", "Setup(s)", "p-value"]
             lines.append("| " + " | ".join(headers) + " |")
             lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
             for system in table["systems"]:
@@ -122,7 +129,9 @@ class ReportGenerator:
                 row = [
                     str(system.get("system_name", "")),
                     str(system.get("n", "")),
-                    str(system.get("accuracy", "")),
+                    str(system.get("official_em", system.get("accuracy", ""))),
+                    str(system.get("official_f1", "")),
+                    str(system.get("llm_assisted_accuracy", system.get("accuracy", ""))),
                     str(system.get("coverage", "")),
                     str(system.get("avg_latency", "")),
                     f"{float(setup.get('setup_seconds', 0) or 0):.3f}",

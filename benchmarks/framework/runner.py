@@ -60,6 +60,14 @@ def _config_hash(config: dict) -> str:
         return "unknown"
 
 
+def _sample_id_checksum(sample_ids: List[str]) -> str:
+    try:
+        serialized = json.dumps(sorted(str(sample_id) for sample_id in sample_ids), ensure_ascii=False)
+        return hashlib.sha256(serialized.encode()).hexdigest()[:32]
+    except Exception:
+        return "unknown"
+
+
 class UnifiedExperimentRunner:
     """统一实验执行器。
 
@@ -112,17 +120,19 @@ class UnifiedExperimentRunner:
             config.update(config_overrides)
         config["stage"] = stage
         config["system_name"] = system_name
+
+        # 加载样本
+        samples = adapter.load_samples(limit=limit, seed=seed)
+        sample_ids = [sample.sample_id for sample in samples]
+        config["sample_count"] = len(samples)
+        config["sample_id_checksum"] = _sample_id_checksum(sample_ids)
         cfg_hash = _config_hash(config)
 
         logger.info("=" * 60)
         logger.info("[Runner] %s  run_id=%s", adapter.name.upper(), run_id)
         logger.info("[Runner] git=%s  config_hash=%s", git_commit, cfg_hash)
+        logger.info("[Runner] %d samples loaded  sample_id_checksum=%s", len(samples), config["sample_id_checksum"])
         logger.info("=" * 60)
-
-        # 加载样本
-        samples = adapter.load_samples(limit=limit, seed=seed)
-        sample_ids = [sample.sample_id for sample in samples]
-        logger.info("[Runner] %d samples loaded", len(samples))
 
         # 验证语料库
         found, missing = adapter.validate_corpus()
@@ -179,6 +189,7 @@ class UnifiedExperimentRunner:
                     "total_samples": len(completed_rows),
                     "checkpoint_summary": checkpoint.summary(sample_ids),
                     "seed": seed,
+                    "sample_id_checksum": config.get("sample_id_checksum", ""),
                     "cache_mode": str(config.get("cache_mode", "")),
                     "cache_report": _read_json_file(artifact.run_dir / "cache_report.json"),
                 }
@@ -286,10 +297,13 @@ class UnifiedExperimentRunner:
                     result = self._error_result(sample, exc, retry_attempts=1, retried=False)
                 # 实时写入（append mode，防崩溃）
                 raw_row = self._result_to_row(result, sample, adapter)
+                per_sample_eval = self._result_to_per_sample_eval(result, sample)
+                raw_row["per_sample_eval"] = per_sample_eval
                 result.raw = raw_row
                 with open(results_path, "a", encoding="utf-8") as fp:
                     fp.write(json.dumps(raw_row, ensure_ascii=False) + "\n")
                 artifact.append_prediction(raw_row)
+                artifact.append_per_sample_eval(per_sample_eval)
                 attempts = max(_safe_int((result.telemetry or {}).get("retry_attempts"), default=1), 0)
                 if result.error:
                     checkpoint.mark_failed(sample.sample_id, result.error, attempts=attempts, row=raw_row)
@@ -330,10 +344,13 @@ class UnifiedExperimentRunner:
                         continue
                     result = self._error_result(sample, exc, retry_attempts=0, retried=False)
                     raw_row = self._result_to_row(result, sample, adapter)
+                    per_sample_eval = self._result_to_per_sample_eval(result, sample)
+                    raw_row["per_sample_eval"] = per_sample_eval
                     result.raw = raw_row
                     with open(results_path, "a", encoding="utf-8") as fp:
                         fp.write(json.dumps(raw_row, ensure_ascii=False) + "\n")
                     artifact.append_prediction(raw_row)
+                    artifact.append_per_sample_eval(per_sample_eval)
                     checkpoint.mark_failed(sample.sample_id, result.error or str(exc), attempts=0, row=raw_row)
                     results.append(result)
                     seen_ids.add(sample.sample_id)
@@ -341,6 +358,20 @@ class UnifiedExperimentRunner:
 
         checkpoint_summary = checkpoint.summary(sample_ids)
         metrics = _aggregate_runner_metrics(results)
+        benchmark_metrics = _adapter_metrics(adapter, results)
+        if benchmark_metrics:
+            metrics["benchmark_specific"] = benchmark_metrics
+            for key in (
+                "official_exact_match",
+                "official_f1_correct",
+                "llm_assisted_accuracy",
+                "llm_judge_usage_rate",
+                "source_grounding_accuracy",
+                "by_type",
+                "by_level",
+            ):
+                if key in benchmark_metrics:
+                    metrics[key] = benchmark_metrics[key]
         metrics["checkpoint"] = checkpoint_summary
         metrics["cache"] = cache_report
         artifact.save_metrics(metrics)
@@ -378,6 +409,7 @@ class UnifiedExperimentRunner:
             "state_path": str(state_store.path),
             "total_samples": len(results),
             "checkpoint_summary": checkpoint_summary,
+            "sample_id_checksum": config.get("sample_id_checksum", ""),
             "cache_report": cache_report,
         }
         logger.info("[Runner] Done. results_path=%s", results_path)
@@ -470,12 +502,17 @@ class UnifiedExperimentRunner:
                 for key in (
                     "em",
                     "f1",
+                    "official_em",
+                    "official_f1",
+                    "official_exact_match",
+                    "official_f1_correct",
                     "confidence",
                     "reasoning",
                     "short_prediction",
                     "normalized_prediction",
                     "normalized_gold",
                     "llm_judge_used",
+                    "llm_equivalent",
                 ):
                     if key in judge_result:
                         telemetry[key] = judge_result[key]
@@ -541,6 +578,37 @@ class UnifiedExperimentRunner:
         }
         row.update(adapter.extra_result_fields(sample))
         return row
+
+    @staticmethod
+    def _result_to_per_sample_eval(result: PredictionResult, sample) -> dict:
+        telemetry = result.telemetry or {}
+        return {
+            "sample_id": result.sample_id,
+            "question": sample.question,
+            "gold_answer": sample.gold_answer,
+            "prediction": result.prediction,
+            "error": result.error,
+            "official_em": telemetry.get("official_em", telemetry.get("em", 0.0)),
+            "official_f1": telemetry.get("official_f1", telemetry.get("f1", 0.0)),
+            "official_exact_match": bool(telemetry.get("official_exact_match", False)),
+            "official_f1_correct": bool(telemetry.get("official_f1_correct", False)),
+            "llm_judge_used": bool(telemetry.get("llm_judge_used", False)),
+            "llm_equivalent": telemetry.get("llm_equivalent"),
+            "llm_confidence": telemetry.get("confidence"),
+            "llm_reasoning": telemetry.get("reasoning", ""),
+            "coverage": result.coverage,
+            "evidence_recall": telemetry.get("evidence_recall", 0.0),
+            "supporting_fact_hit": telemetry.get("supporting_fact_hit", False),
+            "supporting_fact_title_recall": telemetry.get("supporting_fact_title_recall"),
+            "supporting_sentence_recall": telemetry.get("supporting_sentence_recall"),
+            "answer_source_grounded": telemetry.get("answer_source_grounded", False),
+            "search_mode": telemetry.get("search_mode", ""),
+            "num_files_read": telemetry.get("num_files_read", 0),
+            "loop_count": telemetry.get("loop_count", 0),
+            "total_tokens": telemetry.get("total_tokens", 0),
+            "judge_tokens": telemetry.get("judge_tokens", 0),
+            "error_type": telemetry.get("error_type", ""),
+        }
 
     @staticmethod
     def _error_result(sample, exc: Exception, **telemetry: Any) -> PredictionResult:
@@ -630,6 +698,8 @@ def _normalize_protocol(
     normalized = dict(protocol)
     normalized["run_id"] = run_id
     normalized["benchmark"] = adapter.name
+    normalized["protocol_schema_version"] = 2
+    normalized.setdefault("protocol_version", f"{adapter.name}-v2")
     normalized["systems"] = [str(config.get("system_name") or "sirchmunk")]
     normalized["seeds"] = [seed]
     normalized["limit"] = limit
@@ -653,6 +723,18 @@ def _safe_adapter_call(adapter: BenchmarkAdapter, method_name: str, default=None
     except Exception as exc:
         logger.warning("[Runner] adapter.%s failed: %s", method_name, exc)
         return default
+
+
+def _adapter_metrics(adapter: BenchmarkAdapter, results: List[PredictionResult]) -> Dict[str, Any]:
+    aggregator = _safe_adapter_call(adapter, "get_metric_aggregator", default=None)
+    if not callable(aggregator):
+        return {}
+    try:
+        metrics = aggregator(results)
+        return metrics if isinstance(metrics, dict) else {}
+    except Exception as exc:
+        logger.warning("[Runner] adapter metric aggregator failed: %s", exc)
+        return {}
 
 
 def _read_json_file(path: str | Path) -> Dict[str, Any]:
