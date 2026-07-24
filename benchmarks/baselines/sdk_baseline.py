@@ -166,6 +166,7 @@ class ManualImportAdapter(BaselineAdapter):
         citation_name: str,
         predictions_path: str,
         default_elapsed: float = 0.0,
+        setup_metrics_path: str = "",
     ) -> None:
         """
         Args:
@@ -173,10 +174,14 @@ class ManualImportAdapter(BaselineAdapter):
             citation_name:     论文表格展示名称。
             predictions_path:  JSONL 文件路径，每行含 sample_id + prediction。
             default_elapsed:   若 JSONL 中无 elapsed 字段，使用此默认值。
+            setup_metrics_path: 可选 setup metrics JSON，用于公平报告预处理/索引成本。
         """
         self._name = name
         self._citation = citation_name
         self._default_elapsed = default_elapsed
+        self._predictions_path = str(Path(predictions_path).resolve())
+        self._setup_metrics_path = str(Path(setup_metrics_path).resolve()) if setup_metrics_path else ""
+        self._setup_metrics = _load_setup_metrics(self._setup_metrics_path)
         self._predictions: Dict[str, Dict[str, Any]] = {}
         self._load(predictions_path)
 
@@ -200,7 +205,7 @@ class ManualImportAdapter(BaselineAdapter):
                         or ""
                     )
                     if sid:
-                        self._predictions[sid] = row
+                        self._predictions[str(sid)] = row
                 except (json.JSONDecodeError, KeyError):
                     pass
 
@@ -218,7 +223,12 @@ class ManualImportAdapter(BaselineAdapter):
         return BaselinePrediction(
             answer="",
             elapsed=self._default_elapsed,
-            metadata={"import_adapter": True},
+            metadata={
+                "import_adapter": True,
+                "imported_baseline": True,
+                "import_status": "lookup_required",
+                "import_source_path": self._predictions_path,
+            },
         )
 
     def predict_by_id(self, sample_id: str) -> Optional[BaselinePrediction]:
@@ -227,14 +237,19 @@ class ManualImportAdapter(BaselineAdapter):
         Returns:
             BaselinePrediction，若 sample_id 不存在则返回 None。
         """
-        row = self._predictions.get(sample_id)
+        row = self._predictions.get(str(sample_id))
         if row is None:
             return None
         return BaselinePrediction(
             answer=str(row.get("prediction") or row.get("raw_prediction") or ""),
             elapsed=float(row.get("elapsed", self._default_elapsed)),
             tokens_used=int(row.get("tokens_used", 0)),
-            metadata={"imported_from": "jsonl"},
+            metadata={
+                "imported_baseline": True,
+                "imported_from": "jsonl",
+                "import_status": "imported",
+                "import_source_path": self._predictions_path,
+            },
         )
 
     @property
@@ -242,5 +257,44 @@ class ManualImportAdapter(BaselineAdapter):
         """已成功加载的预测条数。"""
         return len(self._predictions)
 
+    def requires_import_coverage(self) -> bool:
+        return True
+
+    def extra_metadata(self) -> Dict[str, Any]:
+        return {
+            "import_adapter": True,
+            "imported_baseline": True,
+            "import_source_path": self._predictions_path,
+            "setup_metrics_path": self._setup_metrics_path,
+            "loaded_count": self.loaded_count,
+        }
+
+    def collect_setup_metrics(self) -> Dict[str, Any]:
+        return dict(self._setup_metrics)
+
     def get_request_delay(self) -> float:
         return 0.0   # 纯内存查询，无需延迟
+
+
+def _load_setup_metrics(path: str) -> Dict[str, Any]:
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {"metadata": {"setup_metrics_missing": True, "path": str(p)}}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"metadata": {"setup_metrics_parse_error": True, "path": str(p)}}
+    return {
+        "setup_seconds": float(data.get("setup_seconds", data.get("total_setup_seconds", 0.0)) or 0.0),
+        "preprocessing_seconds": float(data.get("preprocessing_seconds", 0.0) or 0.0),
+        "index_build_seconds": float(data.get("index_build_seconds", 0.0) or 0.0),
+        "storage_bytes": int(data.get("storage_bytes", 0) or 0),
+        "indexed_documents": int(data.get("indexed_documents", 0) or 0),
+        "metadata": {
+            k: v
+            for k, v in data.items()
+            if k not in {"setup_seconds", "total_setup_seconds", "preprocessing_seconds", "index_build_seconds", "storage_bytes", "indexed_documents"}
+        },
+    }

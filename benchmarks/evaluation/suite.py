@@ -40,6 +40,7 @@ if str(_BENCHMARKS) not in _sys.path:
     _sys.path.insert(0, str(_BENCHMARKS))
 
 from baselines.base_adapter import BaselineAdapter, BaselineResult
+from framework.guards import BudgetExceeded, BudgetGuard, GuardConfig, SampleTimeout, TimeoutGuard
 
 
 class BaselineEvaluationSuite:
@@ -77,6 +78,7 @@ class BaselineEvaluationSuite:
         baselines: List[BaselineAdapter],
         output_dir: str,
         max_concurrent: int = 3,             # 系统级并发（同时评估几个竞品）
+        guard_config: Optional[GuardConfig | Dict[str, Any]] = None,
     ) -> None:
         """
         Args:
@@ -84,12 +86,14 @@ class BaselineEvaluationSuite:
             baselines:      BaselineAdapter 列表。
             output_dir:     竞品结果 JSONL 的输出目录。
             max_concurrent: 同时运行的竞品系统数（一般保持默认，避免 API 限流）。
+            guard_config:   可选预算/超时守卫配置，用于将 baseline 失败精确分类。
         """
         self._bm_adapter = bm_adapter
         self._baselines = baselines
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._max_concurrent = max_concurrent
+        self._guard_config = _coerce_guard_config(guard_config)
 
     async def run(
         self,
@@ -168,11 +172,25 @@ class BaselineEvaluationSuite:
         judge: Any,
         out_path: str,
     ) -> List[BaselineResult]:
-        """评估单个竞品系统的所有样本。"""
+        """评估单个竞品系统的所有样本，并分类预算/超时/导入缺失失败。"""
         results: List[BaselineResult] = []
+        results_lock = asyncio.Lock()
         request_delay = baseline.get_request_delay()
         max_conc = baseline.get_max_concurrent()
         sample_semaphore = asyncio.Semaphore(max_conc)
+        budget_guard = BudgetGuard(self._guard_config, output_dir=self._output_dir)
+        timeout_guard = TimeoutGuard(self._guard_config.sample_timeout_seconds)
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_text("", encoding="utf-8")
+
+        async def _finalize(result: BaselineResult) -> BaselineResult:
+            with open(out_path, "a", encoding="utf-8") as fp:
+                fp.write(json.dumps(self._result_to_dict(result), ensure_ascii=False) + "\n")
+            async with results_lock:
+                results.append(result)
+            if request_delay > 0 and result.failure_reason not in {"budget_exceeded", "import_missing"}:
+                await asyncio.sleep(request_delay)
+            return result
 
         async def _eval_one(sample_dict: dict) -> BaselineResult:
             async with sample_semaphore:
@@ -186,7 +204,6 @@ class BaselineEvaluationSuite:
                     pass
                 qt = sample_dict.get("metadata", {}).get(qt_key, "")
 
-                # 获取 search_paths（与 Sirchmunk 使用相同路径，保证公平）
                 try:
                     from framework.schema import BenchmarkSample
                     sample_obj = BenchmarkSample(
@@ -199,45 +216,116 @@ class BaselineEvaluationSuite:
                 except Exception:
                     context_paths = []
 
-                # 调用竞品预测（支持 predict_by_id 的系统优先使用）
+                setup_metrics = baseline.collect_setup_metrics()
+                base_metadata: Dict[str, Any] = {
+                    **baseline.extra_metadata(),
+                    "setup_metrics": setup_metrics,
+                }
+                telemetry: Dict[str, Any] = {
+                    "baseline_name": baseline.name,
+                    "system_name": baseline.citation_name,
+                }
                 prediction_obj = None
-                error: Optional[str] = None
-                try:
-                    if hasattr(baseline, "predict_by_id"):
-                        prediction_obj = baseline.predict_by_id(sid)
-                    if prediction_obj is None:
-                        prediction_obj = await baseline.run(question, context_paths)
-                except Exception as exc:
-                    error = str(exc)
-                    logger.warning("[Suite] %s predict failed on %s: %s",
-                                   baseline.name, sid, exc)
-
-                prediction_text = prediction_obj.answer if prediction_obj else ""
-                pred_elapsed = prediction_obj.elapsed if prediction_obj else 0.0
-                pred_tokens = prediction_obj.tokens_used if prediction_obj else 0
-
-                # Judge 评分（与 Sirchmunk 完全相同的 judge 实例）
+                prediction_text = ""
+                pred_elapsed = 0.0
+                pred_tokens = 0
                 judge_correct = False
                 coverage = False
                 judge_tokens = 0
                 judge_payload: Dict[str, Any] = {}
+                error: Optional[str] = None
+                failure_reason = ""
+                error_type = ""
+                failure_phase = ""
+
                 try:
-                    eval_result = await baseline.evaluate(
-                        prediction=prediction_text,
-                        gold_answer=gold,
-                        question=question,
-                        judge=judge,
-                    )
-                    judge_correct = bool(eval_result.get("judge_correct", False))
-                    coverage = bool(eval_result.get("coverage", False))
-                    judge_tokens = int(eval_result.get("judge_tokens", 0) or 0)
-                    judge_payload = {
-                        "judge_result": eval_result.get("judge_result", {}),
-                        "coverage_result": eval_result.get("coverage_result", {}),
-                    }
-                except Exception as exc:
-                    logger.warning("[Suite] evaluate failed on %s/%s: %s",
-                                   baseline.name, sid, exc)
+                    async with results_lock:
+                        telemetry["budget_before_sample"] = budget_guard.check_before_sample(results)
+                except BudgetExceeded as exc:
+                    error = str(exc)
+                    failure_reason = "budget_exceeded"
+                    error_type = exc.__class__.__name__
+                    failure_phase = "budget"
+
+                import_required = bool(getattr(baseline, "requires_import_coverage", lambda: False)())
+                has_predict_by_id = hasattr(baseline, "predict_by_id")
+                if not error:
+                    try:
+                        if has_predict_by_id:
+                            prediction_obj = baseline.predict_by_id(sid)
+                        if prediction_obj is None and import_required:
+                            error = f"Imported prediction missing for sample_id={sid}"
+                            failure_reason = "import_missing"
+                            error_type = "ImportMissing"
+                            failure_phase = "import"
+                        elif prediction_obj is None:
+                            prediction_obj = await timeout_guard.run_sample(baseline.run(question, context_paths))
+                    except SampleTimeout as exc:
+                        error = str(exc)
+                        failure_reason = "timeout"
+                        error_type = exc.__class__.__name__
+                        failure_phase = "prediction"
+                    except Exception as exc:
+                        error = str(exc)
+                        failure_reason = "prediction_error"
+                        error_type = exc.__class__.__name__
+                        failure_phase = "prediction"
+
+                if prediction_obj is not None:
+                    prediction_text = prediction_obj.answer
+                    pred_elapsed = prediction_obj.elapsed
+                    pred_tokens = prediction_obj.tokens_used
+                    if isinstance(prediction_obj.metadata, dict):
+                        base_metadata.update(prediction_obj.metadata)
+                elif not error:
+                    error = "Baseline returned no prediction."
+                    failure_reason = "prediction_error"
+                    error_type = "NoPrediction"
+                    failure_phase = "prediction"
+
+                if import_required:
+                    base_metadata["imported_baseline"] = True
+                    base_metadata.setdefault("import_status", "missing" if failure_reason == "import_missing" else "imported")
+                    if failure_reason == "import_missing":
+                        base_metadata["missing_sample_id"] = sid
+
+                if prediction_obj is not None and not error:
+                    try:
+                        eval_result = await timeout_guard.run_sample(baseline.evaluate(
+                            prediction=prediction_text,
+                            gold_answer=gold,
+                            question=question,
+                            judge=judge,
+                        ))
+                        judge_correct = bool(eval_result.get("judge_correct", False))
+                        coverage = bool(eval_result.get("coverage", False))
+                        judge_tokens = int(eval_result.get("judge_tokens", 0) or 0)
+                        judge_payload = {
+                            "judge_result": eval_result.get("judge_result", {}),
+                            "coverage_result": eval_result.get("coverage_result", {}),
+                        }
+                    except SampleTimeout as exc:
+                        error = str(exc)
+                        failure_reason = "timeout"
+                        error_type = exc.__class__.__name__
+                        failure_phase = "judge"
+                    except Exception as exc:
+                        error = str(exc)
+                        failure_reason = "judge_error"
+                        error_type = exc.__class__.__name__
+                        failure_phase = "judge"
+
+                telemetry.update({
+                    "total_tokens": pred_tokens,
+                    "judge_tokens": judge_tokens,
+                    "failure_reason": failure_reason,
+                    "error_type": error_type,
+                    "failure_phase": failure_phase,
+                })
+                base_metadata.update(judge_payload)
+                if failure_reason:
+                    base_metadata["failure_reason"] = failure_reason
+                    base_metadata["failure_phase"] = failure_phase
 
                 result = BaselineResult(
                     sample_id=sid,
@@ -252,26 +340,14 @@ class BaselineEvaluationSuite:
                     judge_tokens=judge_tokens,
                     question_type=qt,
                     error=error,
-                    metadata={
-                        **baseline.extra_metadata(),
-                        **(prediction_obj.metadata if prediction_obj else {}),
-                        "setup_metrics": baseline.collect_setup_metrics(),
-                        **judge_payload,
-                    },
+                    failure_reason=failure_reason,
+                    telemetry=telemetry,
+                    metadata=base_metadata,
                 )
-
-                # 实时写入（防崩溃）
-                with open(out_path, "a", encoding="utf-8") as fp:
-                    fp.write(json.dumps(self._result_to_dict(result), ensure_ascii=False) + "\n")
-
-                if request_delay > 0:
-                    await asyncio.sleep(request_delay)
-
-                return result
+                return await _finalize(result)
 
         tasks = [asyncio.create_task(_eval_one(s)) for s in golden_set.samples]
-        results = list(await asyncio.gather(*tasks))
-        return results
+        return list(await asyncio.gather(*tasks))
 
     @staticmethod
     def _result_to_dict(r: BaselineResult) -> dict:
@@ -288,6 +364,8 @@ class BaselineEvaluationSuite:
             "judge_tokens":  r.judge_tokens,
             "question_type": r.question_type,
             "error":         r.error,
+            "failure_reason": r.failure_reason,
+            "telemetry":     r.telemetry,
             "metadata":      r.metadata,
             "setup_metrics": r.metadata.get("setup_metrics", {}) if isinstance(r.metadata, dict) else {},
         }
@@ -303,6 +381,10 @@ class BaselineEvaluationSuite:
                     continue
                 try:
                     d = json.loads(line)
+                    metadata = d.get("metadata", {}) if isinstance(d.get("metadata", {}), dict) else {}
+                    telemetry = d.get("telemetry", {}) if isinstance(d.get("telemetry", {}), dict) else {}
+                    setup_metrics = d.get("setup_metrics", metadata.get("setup_metrics", {}))
+                    failure_reason = d.get("failure_reason") or metadata.get("failure_reason") or telemetry.get("failure_reason") or ""
                     results.append(BaselineResult(
                         sample_id=d.get("sample_id", ""),
                         system_name=d.get("system_name", ""),
@@ -316,11 +398,21 @@ class BaselineEvaluationSuite:
                         judge_tokens=int(d.get("judge_tokens", 0)),
                         question_type=d.get("question_type", ""),
                         error=d.get("error"),
+                        failure_reason=str(failure_reason),
+                        telemetry=telemetry,
                         metadata={
-                            **(d.get("metadata", {}) if isinstance(d.get("metadata", {}), dict) else {}),
-                            "setup_metrics": d.get("setup_metrics", d.get("metadata", {}).get("setup_metrics", {}) if isinstance(d.get("metadata", {}), dict) else {}),
+                            **metadata,
+                            "setup_metrics": setup_metrics,
                         },
                     ))
                 except (json.JSONDecodeError, KeyError, TypeError):
                     pass
         return results
+
+
+def _coerce_guard_config(value: Optional[GuardConfig | Dict[str, Any]]) -> GuardConfig:
+    if value is None:
+        return GuardConfig()
+    if isinstance(value, GuardConfig):
+        return value
+    return GuardConfig.from_run_config(dict(value))

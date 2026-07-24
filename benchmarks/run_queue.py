@@ -5,7 +5,11 @@ Examples::
 
     python benchmarks/run_queue.py add-matrix \
       --add-bm setup_cost=benchmarks/setup_cost/.env.setup_cost \
-      --systems sirchmunk --seeds 42,43 --cache-modes cold,warm --limit 1
+      --systems sirchmunk --seeds 42,43 --cache-modes cold,compiled --stage frozen --limit 1
+
+    python benchmarks/run_queue.py add-matrix \
+      --add-bm setup_cost=benchmarks/setup_cost/.env.setup_cost \
+      --systems sirchmunk --seeds 42 --cache-modes warm --stage exploration --limit 1
 
     python benchmarks/run_queue.py run --max-concurrent 2 --max-tasks 4
 
@@ -46,7 +50,7 @@ def _parse_args() -> argparse.Namespace:
     add.add_argument("--add-bm", action="append", required=True, metavar="NAME=ENV", help="benchmark/env pair; repeatable")
     add.add_argument("--systems", default="sirchmunk", help="comma-separated systems, default sirchmunk")
     add.add_argument("--seeds", default="42", help="comma-separated seeds")
-    add.add_argument("--cache-modes", default="cold", help="comma-separated cache modes: cold,warm,compiled,none")
+    add.add_argument("--cache-modes", default="cold", help="comma-separated cache modes: frozen supports cold,compiled; exploration also supports warm,none")
     add.add_argument("--stage", choices=["exploration", "frozen"], default="frozen", help="experiment stage")
     add.add_argument("--limit", type=int, default=0, help="sample limit per run")
     add.add_argument("--priority", type=int, default=100, help="lower value runs earlier")

@@ -66,6 +66,8 @@ class BaselineResult:
     judge_tokens: int = 0
     question_type: str = ""             # 从 sample metadata 提取，用于分类统计
     error: Optional[str] = None
+    failure_reason: str = ""
+    telemetry: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -177,6 +179,10 @@ class BaselineAdapter(ABC):
         默认返回 True（乐观假设）。
         """
         return True
+
+    def requires_import_coverage(self) -> bool:
+        """Return True for baselines whose predictions must be fully pre-imported."""
+        return False
 
     def get_max_concurrent(self) -> int:
         """最大并发请求数。默认 1（串行），避免 API 限流。"""

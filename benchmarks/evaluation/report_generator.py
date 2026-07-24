@@ -121,10 +121,18 @@ class ReportGenerator:
         if table.get("systems"):
             lines.append("## Main Result Table")
             lines.append("")
-            headers = ["System", "N", "Official EM", "Official F1", "LLM Acc", "Coverage", "Latency", "Setup(s)", "p-value"]
+            systems = table["systems"]
+            include_import = any(system.get("imported_baseline") for system in systems)
+            include_failures = any(system.get("failure_counts") for system in systems)
+            headers = ["System", "N", "Official EM", "Official F1", "LLM Acc", "Coverage"]
+            if include_import:
+                headers.append("Import Cov")
+            if include_failures:
+                headers.append("Failures")
+            headers.extend(["Latency", "Setup(s)", "p-value"])
             lines.append("| " + " | ".join(headers) + " |")
             lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
-            for system in table["systems"]:
+            for system in systems:
                 setup = system.get("setup_metrics") or {}
                 row = [
                     str(system.get("system_name", "")),
@@ -133,10 +141,16 @@ class ReportGenerator:
                     str(system.get("official_f1", "")),
                     str(system.get("llm_assisted_accuracy", system.get("accuracy", ""))),
                     str(system.get("coverage", "")),
+                ]
+                if include_import:
+                    row.append(_format_import_coverage(system))
+                if include_failures:
+                    row.append(_format_failure_counts(system))
+                row.extend([
                     str(system.get("avg_latency", "")),
                     f"{float(setup.get('setup_seconds', 0) or 0):.3f}",
                     str(system.get("p_value")),
-                ]
+                ])
                 lines.append("| " + " | ".join(row) + " |")
             lines.append("")
 
@@ -167,6 +181,22 @@ class ReportGenerator:
             "\\end{verbatim}",
             "",
         ])
+
+
+def _format_import_coverage(system: Dict[str, Any]) -> str:
+    if not system.get("imported_baseline") or system.get("import_coverage") is None:
+        return "-"
+    try:
+        return f"{float(system.get('import_coverage')):.1f}"
+    except (TypeError, ValueError):
+        return str(system.get("import_coverage"))
+
+
+def _format_failure_counts(system: Dict[str, Any]) -> str:
+    counts = system.get("failure_counts") or {}
+    if not isinstance(counts, dict) or not counts:
+        return "0"
+    return ", ".join(f"{name}={count}" for name, count in counts.items())
 
 
 def _read_json(path: Optional[Path]) -> Dict[str, Any]:

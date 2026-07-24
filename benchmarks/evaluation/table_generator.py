@@ -61,6 +61,14 @@ class SystemEntry:
     sample_ids: List[str] = field(default_factory=list)
     sample_id_checksum: str = ""
     setup_metrics: Dict[str, Any] = field(default_factory=dict)
+    failure_counts: Dict[str, int] = field(default_factory=dict)
+    failure_rate: float = 0.0
+    imported_baseline: bool = False
+    import_coverage: Optional[float] = None
+    imported_samples: int = 0
+    covered_samples: int = 0
+    missing_samples: int = 0
+    missing_sample_ids: List[str] = field(default_factory=list)
     # 显著性（由 finalize() 填入）
     p_value: Optional[float] = None
     is_significant: bool = False
@@ -148,7 +156,24 @@ class PaperTableGenerator:
         metric_payloads = [_metric_payload_of(r) for r in ordered_results]
         official_em_values = [float(p.get("official_em", p.get("em", 0.0)) or 0.0) for p in metric_payloads]
         official_f1_values = [float(p.get("official_f1", p.get("f1", 0.0)) or 0.0) for p in metric_payloads]
-
+        failure_counts: Dict[str, int] = defaultdict(int)
+        imported_baseline = False
+        missing_sample_ids: List[str] = []
+        for r in ordered_results:
+            reason = _failure_reason_of(r)
+            if reason:
+                failure_counts[reason] += 1
+            if _is_imported_baseline_result(r):
+                imported_baseline = True
+                metadata = _metadata_of(r)
+                import_status = str(metadata.get("import_status") or _telemetry_of(r).get("import_status") or "")
+                if reason == "import_missing" or import_status == "missing":
+                    missing_sample_ids.append(str(getattr(r, "sample_id", "")))
+        total_failures = sum(failure_counts.values())
+        missing_samples = len(missing_sample_ids)
+        covered_samples = n - missing_samples if imported_baseline else 0
+        imported_samples = covered_samples if imported_baseline else 0
+        import_coverage = round(covered_samples / n * 100, 1) if imported_baseline and n else None
         by_qt: Dict[str, Dict] = defaultdict(lambda: {"n": 0, "correct": 0, "coverage": 0})
         for r in ordered_results:
             metadata = _metadata_of(r)
@@ -185,12 +210,20 @@ class PaperTableGenerator:
             avg_latency=round(sum(latencies) / n, 1) if latencies else 0.0,
             avg_tokens=round(sum(tokens) / n, 1) if tokens else 0.0,
             by_question_type=by_qt_final,
-            is_ours=is_ours or (self._our_name and system_name == self._our_name),
+            is_ours=bool(is_ours or (self._our_name and system_name == self._our_name)),
             is_published_only=False,
             correct_list=correct_list,
             sample_ids=sample_ids,
             sample_id_checksum=compute_sample_id_checksum(sample_ids),
             setup_metrics=collect_setup_metrics(ordered_results),
+            failure_counts=dict(sorted(failure_counts.items())),
+            failure_rate=round(total_failures / n * 100, 1) if n else 0.0,
+            imported_baseline=imported_baseline,
+            import_coverage=import_coverage,
+            imported_samples=imported_samples,
+            covered_samples=covered_samples,
+            missing_samples=missing_samples,
+            missing_sample_ids=missing_sample_ids[:50],
         )
         self._entries.append(entry)
 
@@ -324,8 +357,16 @@ class PaperTableGenerator:
 
         # 列定义
         include_setup = any(e.setup_metrics for e in entries)
+        include_import = any(e.imported_baseline for e in entries)
+        include_failures = any(e.failure_counts for e in entries)
         cols = ["l", "r", "r"]
         headers = ["System", "Accuracy (\\%)", "Coverage (\\%)"]
+        if include_import:
+            cols.append("r")
+            headers.append("Import Cov. (\\%)")
+        if include_failures:
+            cols.append("l")
+            headers.append("Failures")
         if include_latency:
             cols.append("r")
             headers.append("Latency (s)")
@@ -373,6 +414,10 @@ class PaperTableGenerator:
 
         for e in non_ours:
             row = [e.system_name, _fmt_acc(e), _fmt_cov(e)]
+            if include_import:
+                row.append(_format_import_coverage(e))
+            if include_failures:
+                row.append(_format_failure_counts(e, latex=True))
             if include_latency:
                 row.append(f"{e.avg_latency:.1f}")
             if include_tokens:
@@ -387,6 +432,10 @@ class PaperTableGenerator:
 
         for e in ours_entries:
             row = [f"\\textbf{{{e.system_name}}}", _fmt_acc(e), _fmt_cov(e)]
+            if include_import:
+                row.append(_format_import_coverage(e))
+            if include_failures:
+                row.append(_format_failure_counts(e, latex=True))
             if include_latency:
                 row.append(f"{e.avg_latency:.1f}")
             if include_tokens:
@@ -451,6 +500,12 @@ class PaperTableGenerator:
 
         headers = ["System", "Accuracy (%)", "Coverage (%)"]
         include_setup = any(e.setup_metrics for e in entries)
+        include_import = any(e.imported_baseline for e in entries)
+        include_failures = any(e.failure_counts for e in entries)
+        if include_import:
+            headers.append("Import Cov (%)")
+        if include_failures:
+            headers.append("Failures")
         if include_latency:
             headers.append("Latency (s)")
         if include_tokens:
@@ -479,6 +534,10 @@ class PaperTableGenerator:
                 acc_str,
                 f"{e.coverage:.1f}",
             ]
+            if include_import:
+                row.append(_format_import_coverage(e))
+            if include_failures:
+                row.append(_format_failure_counts(e))
             if include_latency:
                 row.append(f"{e.avg_latency:.1f}")
             if include_tokens:
@@ -538,6 +597,14 @@ class PaperTableGenerator:
                     "sample_id_checksum": e.sample_id_checksum,
                     "sample_ids":         e.sample_ids,
                     "setup_metrics":      e.setup_metrics,
+                    "failure_counts":     e.failure_counts,
+                    "failure_rate":       e.failure_rate,
+                    "imported_baseline":  e.imported_baseline,
+                    "import_coverage":    e.import_coverage,
+                    "imported_samples":   e.imported_samples,
+                    "covered_samples":    e.covered_samples,
+                    "missing_samples":    e.missing_samples,
+                    "missing_sample_ids": e.missing_sample_ids,
                     "by_question_type":  e.by_question_type,
                 }
                 for e in self._entries
@@ -557,6 +624,53 @@ def _metadata_of(result: Any) -> Dict[str, Any]:
             return nested
         return raw
     return {}
+
+
+def _telemetry_of(result: Any) -> Dict[str, Any]:
+    telemetry = getattr(result, "telemetry", None)
+    if isinstance(telemetry, dict):
+        return telemetry
+    raw = getattr(result, "raw", None)
+    if isinstance(raw, dict) and isinstance(raw.get("telemetry"), dict):
+        return raw["telemetry"]
+    return {}
+
+
+def _failure_reason_of(result: Any) -> str:
+    reason = getattr(result, "failure_reason", "") or _metadata_of(result).get("failure_reason") or _telemetry_of(result).get("failure_reason")
+    if reason:
+        return str(reason)
+    if getattr(result, "error", None):
+        return "system_error"
+    raw = getattr(result, "raw", None)
+    if isinstance(raw, dict) and raw.get("error"):
+        return "system_error"
+    return ""
+
+
+def _is_imported_baseline_result(result: Any) -> bool:
+    metadata = _metadata_of(result)
+    telemetry = _telemetry_of(result)
+    return bool(
+        metadata.get("imported_baseline")
+        or metadata.get("import_adapter")
+        or metadata.get("external_prediction_required")
+        or metadata.get("imported_from")
+        or telemetry.get("imported_baseline")
+    )
+
+
+def _format_import_coverage(entry: SystemEntry) -> str:
+    if not entry.imported_baseline or entry.import_coverage is None:
+        return "-"
+    return f"{entry.import_coverage:.1f}"
+
+
+def _format_failure_counts(entry: SystemEntry, *, latex: bool = False) -> str:
+    if not entry.failure_counts:
+        return "0"
+    text = ", ".join(f"{name}={count}" for name, count in entry.failure_counts.items())
+    return text.replace("_", "\\_") if latex else text
 
 
 def _metric_payload_of(result: Any) -> Dict[str, Any]:

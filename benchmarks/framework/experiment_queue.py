@@ -113,6 +113,13 @@ class ExperimentQueue:
         replace: bool = False,
     ) -> List[QueueTask]:
         created: List[QueueTask] = []
+        if stage == "frozen":
+            invalid_cache_modes = [str(mode) for mode in cache_modes if str(mode).lower() not in {"cold", "compiled"}]
+            if invalid_cache_modes:
+                raise ValueError(
+                    "Frozen queue tasks must use cache_modes cold or compiled; "
+                    f"invalid={invalid_cache_modes}"
+                )
         command_map = commands_by_system or {}
         for benchmark, env_file in benchmarks.items():
             for system in systems:

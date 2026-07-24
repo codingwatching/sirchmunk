@@ -28,7 +28,7 @@ from .guards import (
     SampleTimeout,
     TimeoutGuard,
 )
-from .protocol import default_protocol
+from .protocol import ProtocolValidator, default_protocol
 from .retry import RetryConfig, RetryExhausted, RetryPolicy
 from .run_state import RunState, RunStateStore, RunStatus
 from .schema import PredictionResult
@@ -66,6 +66,46 @@ def _sample_id_checksum(sample_ids: List[str]) -> str:
         return hashlib.sha256(serialized.encode()).hexdigest()[:32]
     except Exception:
         return "unknown"
+
+
+def _validate_stage_config(config: Dict[str, Any]) -> None:
+    stage = str(config.get("stage") or "")
+    if stage not in ("exploration", "frozen"):
+        raise ValueError(f"Invalid experiment stage: {stage}. Expected exploration or frozen.")
+    if stage != "frozen":
+        return
+
+    cache_mode = str(config.get("cache_mode") or config.get("CACHE_MODE") or "none").lower()
+    if cache_mode not in {"cold", "compiled"}:
+        raise ValueError("Frozen evaluation must use cache_mode='cold' or cache_mode='compiled'.")
+    if _config_bool(config, "cache_dry_run", "CACHE_DRY_RUN", default=False):
+        raise ValueError("Frozen evaluation cannot use cache dry-run mode.")
+    if _config_bool(config, "enable_eval_feedback", "HOTPOT_ENABLE_EVAL_FEEDBACK", default=False):
+        raise ValueError("Frozen evaluation must disable eval feedback to avoid test-set tuning.")
+
+    memory_enabled = _config_bool(config, "enable_memory", "SIRCHMUNK_ENABLE_MEMORY", default=False)
+    if memory_enabled:
+        memory_state = _config_value(
+            config,
+            "memory_state_version",
+            "fixed_memory_state_version",
+            "SIRCHMUNK_MEMORY_STATE_VERSION",
+            default="",
+        )
+        if not str(memory_state).strip():
+            raise ValueError("Frozen evaluation with memory enabled must record a fixed memory_state_version.")
+        if not _config_bool(config, "memory_read_only", "frozen_memory_read_only", "SIRCHMUNK_MEMORY_READ_ONLY", default=False):
+            raise ValueError("Frozen evaluation with memory enabled must mark memory as read-only.")
+        if _config_bool(config, "enable_memory_updates", "memory_write_enabled", "SIRCHMUNK_ENABLE_MEMORY_UPDATES", default=False):
+            raise ValueError("Frozen evaluation cannot enable adaptive memory updates.")
+
+    if _config_bool(config, "enable_llm_judge", "HOTPOT_ENABLE_LLM_JUDGE", default=False) and not _config_bool(
+        config,
+        "allow_frozen_llm_judge_auxiliary",
+        "ALLOW_FROZEN_LLM_JUDGE_AUXILIARY",
+        default=False,
+    ):
+        raise ValueError("Frozen evaluation cannot enable LLM judge unless allow_frozen_llm_judge_auxiliary=true.")
 
 
 class UnifiedExperimentRunner:
@@ -120,6 +160,8 @@ class UnifiedExperimentRunner:
             config.update(config_overrides)
         config["stage"] = stage
         config["system_name"] = system_name
+        config.setdefault("frozen_evaluation", stage == "frozen")
+        _validate_stage_config(config)
 
         # 加载样本
         samples = adapter.load_samples(limit=limit, seed=seed)
@@ -227,6 +269,9 @@ class UnifiedExperimentRunner:
         config["cache_report"] = cache_report
 
         protocol = _build_protocol(adapter, run_id=run_id, seed=seed, limit=limit, config=config)
+        protocol_ok, protocol_errors = ProtocolValidator.validate(protocol)
+        if not protocol_ok:
+            raise ValueError("Invalid experiment protocol: " + "; ".join(protocol_errors))
         protocol_path = artifact.save_protocol(protocol)
         dataset_manifest = _safe_adapter_call(adapter, "get_dataset_manifest", default={})
         manifest_path = artifact.save_manifest(
@@ -704,11 +749,34 @@ def _normalize_protocol(
     normalized["seeds"] = [seed]
     normalized["limit"] = limit
     normalized["stage"] = config.get("stage", "")
+    normalized["sample_count"] = config.get("sample_count", 0)
+    normalized["sample_id_checksum"] = config.get("sample_id_checksum", "")
     normalized["cache_policy"] = {
         **(normalized.get("cache_policy", {}) if isinstance(normalized.get("cache_policy"), dict) else {}),
         "mode": config.get("cache_mode", config.get("CACHE_MODE", "declared_by_adapter")),
         "allow_clear": _config_bool(config, "cache_allow_clear", "CACHE_ALLOW_CLEAR", default=False),
         "dry_run": _config_bool(config, "cache_dry_run", "CACHE_DRY_RUN", default=False),
+    }
+    normalized["frozen_constraints"] = {
+        "frozen_evaluation": config.get("stage") == "frozen",
+        "eval_feedback_disabled": not _config_bool(config, "enable_eval_feedback", "HOTPOT_ENABLE_EVAL_FEEDBACK", default=False),
+        "memory_read_only": _config_bool(config, "memory_read_only", "frozen_memory_read_only", "SIRCHMUNK_MEMORY_READ_ONLY", default=False),
+        "llm_judge_auxiliary_only": _config_bool(config, "allow_frozen_llm_judge_auxiliary", "ALLOW_FROZEN_LLM_JUDGE_AUXILIARY", default=False),
+    }
+    normalized["resource_limits"] = {
+        key: config.get(key)
+        for key in (
+            "max_runtime_seconds",
+            "max_total_tokens",
+            "max_api_cost_usd",
+            "max_disk_usage_bytes",
+            "min_free_disk_bytes",
+            "sample_timeout_seconds",
+            "system_timeout_seconds",
+            "benchmark_timeout_seconds",
+            "global_timeout_seconds",
+        )
+        if config.get(key) not in (None, "", 0, 0.0)
     }
     normalized["config"] = config
     return normalized

@@ -42,9 +42,10 @@ class ProtocolLoader:
 
 
 class ProtocolValidator:
-    """Minimal P0 protocol validator."""
+    """Protocol validator with frozen-evaluation publication gates."""
 
     REQUIRED_KEYS = {"run_id", "benchmark", "systems", "metrics", "seeds"}
+    FROZEN_CACHE_MODES = {"cold", "compiled"}
 
     @classmethod
     def validate(cls, protocol: Dict[str, Any]) -> tuple[bool, List[str]]:
@@ -58,7 +59,87 @@ class ProtocolValidator:
             errors.append("metrics must be a mapping")
         if not isinstance(protocol.get("seeds", []), list):
             errors.append("seeds must be a list")
+
+        config = protocol.get("config", {}) if isinstance(protocol.get("config", {}), dict) else {}
+        cache_policy = protocol.get("cache_policy", {}) if isinstance(protocol.get("cache_policy", {}), dict) else {}
+        stage = str(protocol.get("stage") or config.get("stage") or "").lower()
+        if stage and stage not in {"exploration", "frozen"}:
+            errors.append(f"invalid stage: {stage}")
+        if stage == "frozen":
+            errors.extend(cls._validate_frozen(protocol, config, cache_policy))
         return not errors, errors
+
+    @classmethod
+    def _validate_frozen(
+        cls,
+        protocol: Dict[str, Any],
+        config: Dict[str, Any],
+        cache_policy: Dict[str, Any],
+    ) -> List[str]:
+        errors: List[str] = []
+        if int(protocol.get("protocol_schema_version", 0) or 0) < 2:
+            errors.append("frozen protocol requires protocol_schema_version >= 2")
+        if not protocol.get("systems"):
+            errors.append("frozen protocol must declare at least one fixed system")
+        if not protocol.get("seeds"):
+            errors.append("frozen protocol must declare fixed seeds")
+        if not (protocol.get("sample_id_checksum") or config.get("sample_id_checksum")):
+            errors.append("frozen protocol must record sample_id_checksum")
+
+        cache_mode = str(
+            cache_policy.get("mode")
+            or config.get("cache_mode")
+            or config.get("CACHE_MODE")
+            or ""
+        ).lower()
+        if cache_mode not in cls.FROZEN_CACHE_MODES:
+            errors.append("frozen protocol cache_policy.mode must be one of: cold, compiled")
+        if _as_bool(cache_policy.get("dry_run") or config.get("cache_dry_run") or config.get("CACHE_DRY_RUN")):
+            errors.append("frozen protocol cannot use cache dry-run mode")
+        if _as_bool(config.get("enable_eval_feedback") or config.get("HOTPOT_ENABLE_EVAL_FEEDBACK")):
+            errors.append("frozen protocol must disable eval feedback")
+
+        memory_enabled = _as_bool(config.get("enable_memory") or config.get("SIRCHMUNK_ENABLE_MEMORY"))
+        if memory_enabled:
+            memory_state = (
+                config.get("memory_state_version")
+                or config.get("fixed_memory_state_version")
+                or config.get("SIRCHMUNK_MEMORY_STATE_VERSION")
+            )
+            if not _has_value(memory_state):
+                errors.append("frozen protocol with memory enabled must record a fixed memory_state_version")
+            if not _as_bool(config.get("memory_read_only") or config.get("frozen_memory_read_only") or config.get("SIRCHMUNK_MEMORY_READ_ONLY")):
+                errors.append("frozen protocol with memory enabled must mark memory as read-only")
+            if _as_bool(config.get("enable_memory_updates") or config.get("memory_write_enabled") or config.get("SIRCHMUNK_ENABLE_MEMORY_UPDATES")):
+                errors.append("frozen protocol cannot enable memory updates")
+
+        llm_judge_enabled = _as_bool(config.get("enable_llm_judge") or config.get("HOTPOT_ENABLE_LLM_JUDGE"))
+        llm_judge_allowed = _as_bool(
+            config.get("allow_frozen_llm_judge_auxiliary")
+            or config.get("ALLOW_FROZEN_LLM_JUDGE_AUXILIARY")
+        )
+        if llm_judge_enabled and not llm_judge_allowed:
+            errors.append("frozen protocol cannot enable LLM judge unless it is explicitly auxiliary")
+        return errors
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off", ""):
+        return False
+    return default
+
+
+def _has_value(value: Any) -> bool:
+    return value is not None and str(value).strip() != ""
 
 
 def default_protocol(

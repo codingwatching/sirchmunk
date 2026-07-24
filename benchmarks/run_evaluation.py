@@ -21,6 +21,7 @@
       --benchmark hotpotqa \\
       --env benchmarks/hotpotqa/.env.hotpotqa \\
       --import-baseline "GPT-4o (zero-shot)=output/gpt4o_preds.jsonl" \\
+      --import-baseline-setup "GPT-4o (zero-shot)=output/gpt4o_setup_metrics.json" \\
       --sirchmunk-results benchmarks/hotpotqa/output/results_YYYYMMDD.jsonl \\
       --output-dir benchmarks/hotpotqa/output/paper_table/
 
@@ -108,6 +109,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--import-baseline", action="append", dest="import_baseline",
                    metavar="NAME=PATH",
                    help="导入预计算预测并重新 Judge（可多次）")
+    p.add_argument("--import-baseline-setup", action="append", dest="import_baseline_setup",
+                   metavar="NAME=PATH",
+                   help="导入预计算baseline的setup metrics JSON（与--import-baseline同名匹配，可多次）")
     p.add_argument("--import-published", action="append", dest="import_published",
                    metavar="'Name:acc=XX,cov=XX,lat=XX'",
                    help="直接导入已发表数字（无需 Judge，可多次）")
@@ -138,6 +142,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                    dest="log_level")
+    p.add_argument("--baseline-sample-timeout", type=float, default=0.0, dest="baseline_sample_timeout",
+                   help="单个 baseline 样本预测/Judge 的超时秒数，0=不限制")
+    p.add_argument("--baseline-max-runtime", type=float, default=0.0, dest="baseline_max_runtime",
+                   help="单个 baseline 总运行预算秒数，0=不限制")
+    p.add_argument("--baseline-max-total-tokens", type=int, default=0, dest="baseline_max_total_tokens",
+                   help="单个 baseline token 预算，0=不限制")
+    p.add_argument("--baseline-max-api-cost-usd", type=float, default=0.0, dest="baseline_max_api_cost_usd",
+                   help="单个 baseline API 成本预算（美元），0=不限制")
+    p.add_argument("--baseline-max-disk-bytes", type=int, default=0, dest="baseline_max_disk_bytes",
+                   help="baseline 输出目录最大磁盘用量，0=不限制")
+    p.add_argument("--baseline-min-free-disk-bytes", type=int, default=0, dest="baseline_min_free_disk_bytes",
+                   help="baseline 输出目录所在磁盘最小剩余字节数，0=不限制")
     p.add_argument("--generate-report", action="store_true", dest="generate_report",
                    help="生成metric-first学术报告与质量门控结果")
     p.add_argument("--run-artifact-dir", default="", dest="run_artifact_dir",
@@ -171,6 +187,7 @@ async def _main() -> int:
     baseline_dir = str(Path(out_dir) / "baselines")
 
     ours_name = args.ours_name or "LENS (ours)"
+    baseline_guard_config = _baseline_guard_config(args)
 
     # ── 初始化 PaperTableGenerator ──────────────────────────────────
     from evaluation.table_generator import PaperTableGenerator
@@ -285,6 +302,7 @@ async def _main() -> int:
                 bm_adapter=bm_adapter,
                 baselines=baseline_list,
                 output_dir=baseline_dir,
+                guard_config=baseline_guard_config,
             )
             baseline_results = await suite.run(golden_set)
             for bm, results in baseline_results.items():
@@ -309,6 +327,7 @@ async def _main() -> int:
             )
 
         import_adapters = []
+        import_setup_paths = _parse_named_paths(args.import_baseline_setup or [])
         for spec in args.import_baseline:
             if "=" not in spec:
                 logger.warning("无效 --import-baseline 格式: '%s'，期望 NAME=PATH", spec)
@@ -318,10 +337,12 @@ async def _main() -> int:
             if not Path(path).exists():
                 logger.warning("预测文件不存在: %s", path)
                 continue
+            display_name = name.strip()
             adapter = ManualImportAdapter(
-                name=name.strip().lower().replace(" ", "_"),
-                citation_name=name.strip(),
+                name=display_name.lower().replace(" ", "_"),
+                citation_name=display_name,
                 predictions_path=path,
+                setup_metrics_path=import_setup_paths.get(display_name, ""),
             )
             logger.info("导入竞品 '%s': %d 条预测", adapter.citation_name, adapter.loaded_count)
             import_adapters.append(adapter)
@@ -331,6 +352,7 @@ async def _main() -> int:
                 bm_adapter=bm_adapter,
                 baselines=import_adapters,
                 output_dir=baseline_dir,
+                guard_config=baseline_guard_config,
             )
             for res_map in [await suite.run(golden_set)]:
                 for bm, results in res_map.items():
@@ -379,6 +401,27 @@ async def _main() -> int:
     print()
 
     return 0
+
+
+def _baseline_guard_config(args: argparse.Namespace) -> dict:
+    return {
+        "sample_timeout_seconds": args.baseline_sample_timeout,
+        "max_runtime_seconds": args.baseline_max_runtime,
+        "max_total_tokens": args.baseline_max_total_tokens,
+        "max_api_cost_usd": args.baseline_max_api_cost_usd,
+        "max_disk_usage_bytes": args.baseline_max_disk_bytes,
+        "min_free_disk_bytes": args.baseline_min_free_disk_bytes,
+    }
+
+
+def _parse_named_paths(specs: list[str]) -> dict[str, str]:
+    out = {}
+    for spec in specs or []:
+        if "=" not in spec:
+            continue
+        name, _, path = spec.partition("=")
+        out[name.strip()] = str(Path(path.strip()).resolve())
+    return out
 
 
 def main() -> None:

@@ -52,10 +52,19 @@ class ExternalPredictionBaseline(BaselineAdapter):
         return self._setup
 
     async def predict(self, question: str, context_paths: List[str]) -> BaselinePrediction:
-        return BaselinePrediction(answer="", elapsed=0.0, metadata={"external_prediction_required": True})
+        return BaselinePrediction(
+            answer="",
+            elapsed=0.0,
+            metadata={
+                "external_prediction_required": True,
+                "imported_baseline": True,
+                "import_status": "lookup_required",
+                "import_source_path": self._predictions_path,
+            },
+        )
 
     def predict_by_id(self, sample_id: str) -> Optional[BaselinePrediction]:
-        row = self._predictions.get(sample_id)
+        row = self._predictions.get(str(sample_id))
         if not row:
             return None
         return BaselinePrediction(
@@ -64,6 +73,9 @@ class ExternalPredictionBaseline(BaselineAdapter):
             tokens_used=int(row.get("tokens_used", 0) or 0),
             metadata={
                 "external_system": self._name,
+                "imported_baseline": True,
+                "import_status": "imported",
+                "import_source_path": self._predictions_path,
                 "setup_metrics": self.collect_setup_metrics(),
                 **(row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}),
             },
@@ -77,6 +89,18 @@ class ExternalPredictionBaseline(BaselineAdapter):
             "storage_bytes": self._setup.storage_bytes,
             "indexed_documents": self._setup.indexed_documents,
             "metadata": self._setup.metadata,
+        }
+
+    def requires_import_coverage(self) -> bool:
+        return True
+
+    def extra_metadata(self) -> Dict[str, Any]:
+        return {
+            "external_system": self._name,
+            "imported_baseline": True,
+            "import_source_path": self._predictions_path,
+            "setup_metrics_path": self._setup_metrics_path,
+            "loaded_count": len(self._predictions),
         }
 
 
