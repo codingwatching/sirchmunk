@@ -19,6 +19,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+try:
+    from framework.lifecycle_schema import BaselineIndexValidation, FailureReason
+    _HAS_LIFECYCLE_SCHEMA = True
+except ImportError:  # pragma: no cover - allows direct module loading in isolation
+    BaselineIndexValidation = None  # type: ignore
+    FailureReason = None  # type: ignore
+    _HAS_LIFECYCLE_SCHEMA = False
+
 
 # ---------------------------------------------------------------------------
 # 核心数据结构
@@ -33,6 +41,15 @@ class BaselineSetupResult:
     index_build_seconds: float = 0.0
     storage_bytes: int = 0
     indexed_documents: int = 0
+    expected_documents: int = 0
+    build_completed: bool = True
+    index_ready: bool = True
+    failure_reason: str = "none"
+    failure_message: str = ""
+    peak_ram_bytes: int = 0
+    preprocess_llm_tokens: int = 0
+    api_cost_usd: float = 0.0
+    artifact_dir: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -168,9 +185,65 @@ class BaselineAdapter(ABC):
         """Release resources after evaluation."""
         return None
 
+    async def update_index(self, mutation: Any, bm_adapter: Any = None) -> Dict[str, Any]:
+        """Update an existing baseline index after corpus mutation.
+
+        The default implementation declares that incremental update is not
+        supported. Dynamic update studies will record this as requiring a full
+        rebuild rather than treating it as a runtime error.
+        """
+        return {
+            "update_supported": False,
+            "rebuild_required": True,
+            "failure_reason": "update_not_supported",
+        }
+
+    def estimate_update_cost(self, mutation: Any) -> Dict[str, Any]:
+        """Return optional update-cost estimate without mutating the baseline."""
+        return {"rebuild_required": True}
+
     def collect_setup_metrics(self) -> Dict[str, Any]:
         """Return setup metrics after prepare()."""
         return {}
+
+    def is_index_ready(self) -> bool:
+        """Return whether a full-corpus index is ready for query evaluation.
+
+        Index-free and manual-import baselines can keep the default ``True``.
+        Index-heavy baselines should override this to prevent partial indexes
+        from entering warm-query quality tables.
+        """
+        return True
+
+    def validate_index(self, corpus_manifest: Optional[Dict[str, Any]] = None) -> Any:
+        """Validate that the built index covers the declared corpus.
+
+        The default implementation is permissive for backwards compatibility.
+        Indexing baselines should return ``BaselineIndexValidation`` or a
+        compatible dict with ``index_ready`` and coverage metadata.
+        """
+        if not _HAS_LIFECYCLE_SCHEMA or BaselineIndexValidation is None:
+            return {"index_ready": True}
+        return BaselineIndexValidation(index_ready=True)
+
+    def get_lifecycle_metadata(self) -> Dict[str, Any]:
+        """Return baseline-specific lifecycle metadata for artifact records."""
+        return {}
+
+    def classify_failure(self, exc: Exception) -> str:
+        """Map an exception to a structured lifecycle failure reason."""
+        text = str(exc).lower()
+        if "timeout" in text or "timed out" in text:
+            return "timeout"
+        if "out of memory" in text or "oom" in text:
+            return "oom"
+        if "no space" in text or "disk" in text:
+            return "disk_exceeded"
+        if "api" in text and "budget" in text:
+            return "api_budget_exceeded"
+        if "import" in text or "dependency" in text or "module" in text:
+            return "dependency_missing"
+        return "unknown"
 
     def is_available(self) -> bool:
         """检查系统依赖是否满足（API key、SDK import 等）。

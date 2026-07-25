@@ -310,6 +310,31 @@ class PaperTableGenerator:
         logger.info("[TableGen] Generated: %s, %s, %s", latex_path, md_path, json_path)
         return {"latex": latex_path, "markdown": md_path, "json": json_path}
 
+    def generate_feasibility_table(
+        self,
+        lifecycle_records: List[Any],
+        output_dir: str,
+        *,
+        caption: str = "Full-corpus preprocessing feasibility.",
+        label: str = "tab:full_corpus_feasibility",
+    ) -> Dict[str, str]:
+        """Generate lifecycle feasibility table with N/A failure reasons.
+
+        Records can be ``BaselineLifecycleRecord`` instances or compatible dicts.
+        """
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        rows = [_lifecycle_row(r) for r in lifecycle_records]
+
+        latex_path = str(out / "feasibility_table.tex")
+        md_path = str(out / "feasibility_table.md")
+        json_path = str(out / "feasibility_table.json")
+
+        _write(latex_path, _feasibility_to_latex(rows, caption=caption, label=label))
+        _write(md_path, _feasibility_to_markdown(rows))
+        _write(json_path, json.dumps({"benchmark": self._benchmark, "systems": rows}, indent=2, ensure_ascii=False))
+        return {"latex": latex_path, "markdown": md_path, "json": json_path}
+
     # ------------------------------------------------------------------
     # 统计计算
     # ------------------------------------------------------------------
@@ -696,6 +721,90 @@ def _setup_seconds(entry: SystemEntry) -> float:
         return float(setup.get("setup_seconds", 0.0) or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _lifecycle_row(record: Any) -> Dict[str, Any]:
+    data = record.to_dict() if hasattr(record, "to_dict") else dict(record)
+    build_completed = bool(data.get("build_completed", False))
+    index_ready = bool(data.get("index_ready", False))
+    query_eligible = bool(data.get("query_eligible", index_ready))
+    failure_reason = str(data.get("failure_reason") or "none")
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    index_required = bool(data.get("index_required", metadata.get("index_required", True)))
+    return {
+        "system": data.get("citation_name") or data.get("baseline_name") or data.get("method") or "unknown",
+        "baseline_name": data.get("baseline_name", ""),
+        "index_required": "Yes" if index_required else "No",
+        "build_completed": "Yes" if build_completed else "No" if failure_reason != "none" else "N/A",
+        "index_ready": "Yes" if index_ready else "No" if failure_reason != "none" else "N/A",
+        "query_eligible": "Yes" if query_eligible else "N/A",
+        "build_time_seconds": float(data.get("build_time_seconds", 0.0) or 0.0),
+        "indexed_documents": int(data.get("indexed_documents", 0) or 0),
+        "peak_ram_bytes": int(data.get("peak_ram_bytes", 0) or 0),
+        "disk_bytes": int(data.get("disk_bytes", 0) or 0),
+        "preprocess_llm_tokens": int(data.get("preprocess_llm_tokens", 0) or 0),
+        "failure_reason": failure_reason if failure_reason != "none" else "-",
+    }
+
+
+def _feasibility_to_markdown(rows: List[Dict[str, Any]]) -> str:
+    headers = [
+        "System", "Index Req.", "Build", "Ready", "Query", "Build Time (s)",
+        "Disk", "LLM Tokens", "Failure Reason",
+    ]
+    out = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
+    for row in rows:
+        out.append("| " + " | ".join([
+            str(row["system"]),
+            str(row["index_required"]),
+            str(row["build_completed"]),
+            str(row["index_ready"]),
+            str(row["query_eligible"]),
+            f"{row['build_time_seconds']:.1f}",
+            _format_bytes(row["disk_bytes"]),
+            _format_int(row["preprocess_llm_tokens"]),
+            str(row["failure_reason"]),
+        ]) + " |")
+    return "\n".join(out) + "\n"
+
+
+def _feasibility_to_latex(rows: List[Dict[str, Any]], *, caption: str, label: str) -> str:
+    lines = [
+        "\\begin{table}[t]",
+        f"\\caption{{{caption}}}\\label{{{label}}}",
+        "\\centering",
+        "\\begin{tabular}{llllrrl}",
+        "\\hline",
+        "System & Build & Ready & Query & Build(s) & Storage & Failure " + "\\\\",
+        "\\hline",
+    ]
+    for row in rows:
+        failure = str(row["failure_reason"]).replace("_", "\\_")
+        system = str(row["system"]).replace("_", "\\_")
+        lines.append(
+            f"{system} & {row['build_completed']} & {row['index_ready']} & "
+            f"{row['query_eligible']} & {row['build_time_seconds']:.1f} & "
+            f"{_format_bytes(row['disk_bytes'])} & {failure} \\\\"
+        )
+    lines += ["\\hline", "\\end{tabular}", "\\end{table}"]
+    return "\n".join(lines) + "\n"
+
+
+def _format_bytes(value: int) -> str:
+    value = int(value or 0)
+    if value <= 0:
+        return "0"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(value)
+    idx = 0
+    while size >= 1024 and idx < len(units) - 1:
+        size /= 1024
+        idx += 1
+    return f"{size:.1f}{units[idx]}"
+
+
+def _format_int(value: int) -> str:
+    return f"{int(value):,}" if value else "0"
 
 
 def _write(path: str, content: str) -> None:

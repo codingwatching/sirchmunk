@@ -121,6 +121,38 @@ class RunArtifactManager:
         path.write_text(json.dumps(cache_report, indent=2, ensure_ascii=False), encoding="utf-8")
         return str(path)
 
+    def save_lifecycle_record(self, record: Dict[str, Any] | Any) -> str:
+        """Save one baseline lifecycle record under artifacts/lifecycle/."""
+        self.create()
+        lifecycle_dir = self.artifacts_dir / "lifecycle"
+        lifecycle_dir.mkdir(parents=True, exist_ok=True)
+        payload = record.to_dict() if hasattr(record, "to_dict") else dict(record)
+        baseline_name = str(payload.get("baseline_name") or payload.get("method") or "baseline")
+        path = lifecycle_dir / f"{baseline_name}_lifecycle.json"
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        jsonl_path = lifecycle_dir / "baseline_lifecycle.jsonl"
+        with jsonl_path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        return str(path)
+
+    def save_feasibility_table(self, rows: list[Dict[str, Any]]) -> str:
+        """Save full-corpus feasibility rows as machine-readable JSON."""
+        self.create()
+        lifecycle_dir = self.artifacts_dir / "lifecycle"
+        lifecycle_dir.mkdir(parents=True, exist_ok=True)
+        path = lifecycle_dir / "feasibility_table.json"
+        path.write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
+        return str(path)
+
+    def save_amortized_cost_curve(self, rows: list[Dict[str, Any]]) -> str:
+        """Save end-to-end amortized cost curve rows."""
+        self.create()
+        lifecycle_dir = self.artifacts_dir / "lifecycle"
+        lifecycle_dir.mkdir(parents=True, exist_ok=True)
+        path = lifecycle_dir / "amortized_cost_curve.json"
+        path.write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
+        return str(path)
+
     def append_prediction(self, row: Dict[str, Any]) -> None:
         self.create()
         with self.predictions_path.open("a", encoding="utf-8") as fp:

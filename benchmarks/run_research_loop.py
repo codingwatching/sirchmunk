@@ -6,13 +6,13 @@
     # 单 benchmark 循环（采样 50 题，最多 5 次迭代）
     python benchmarks/run_research_loop.py \\
       --benchmark hotpotqa \\
-      --env benchmarks/hotpotqa/.env.hotpotqa \\
+      --env benchmarks/hotpotqa/.env.hotpotqa.exploration \\
       --limit 50 --max-iter 5
 
     # 多 benchmark 联合优化（Pareto Gate / exploration only）
     python benchmarks/run_research_loop.py \\
       --multi \\
-      --add-bm hotpotqa=benchmarks/hotpotqa/.env.hotpotqa \\
+      --add-bm hotpotqa=benchmarks/hotpotqa/.env.hotpotqa.exploration \\
       --add-bm setup_cost=benchmarks/setup_cost/.env.setup_cost \\
       --limit 30 --shadow-fraction 0.10
 
@@ -25,7 +25,7 @@
     # 演练模式（不实际写 .env 文件）
     python benchmarks/run_research_loop.py \\
       --benchmark hotpotqa \\
-      --env benchmarks/hotpotqa/.env.hotpotqa \\
+      --env benchmarks/hotpotqa/.env.hotpotqa.exploration \\
       --dry-run --limit 10
 """
 from __future__ import annotations

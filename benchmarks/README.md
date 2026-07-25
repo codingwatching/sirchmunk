@@ -32,6 +32,8 @@ benchmarks/
   warm_reuse/             # Mechanism benchmark: warm cache / reuse behavior
   run_queue.py            # P3 queue and unattended execution CLI
   run_evaluation.py       # Baseline comparison and paper table CLI
+  run_lifecycle_eval.py   # Full-corpus baseline build/index feasibility CLI
+  run_scaling_study.py    # Multi-scale feasibility and amortized-cost CLI
   run_report.py           # Metric-first report generation CLI
   run_research_loop.py    # Exploration and research-loop CLI
 ```
@@ -44,15 +46,38 @@ The recommended workflow has four stages. The stages are intentionally separated
 
 ### Stage 0: Prepare Environment And Data
 
-Create a private runtime env from the provided example. Do not commit secrets.
+Create private runtime env files from the provided examples. Do not commit secrets.
 
 ```bash
+cp benchmarks/.env.global.example benchmarks/.env.global
+cp benchmarks/hotpotqa/env.hotpotqa.base.example benchmarks/hotpotqa/.env.hotpotqa.base
 cp benchmarks/hotpotqa/env.hotpotqa.exploration.example benchmarks/hotpotqa/.env.hotpotqa.exploration
 cp benchmarks/hotpotqa/env.hotpotqa.frozen.example benchmarks/hotpotqa/.env.hotpotqa.frozen
 export LLM_API_KEY="..."
 ```
 
-For HotpotQA fullwiki, the dataset directory should contain both the parquet split and the Wikipedia corpus directory referenced by the env file.
+HotpotQA uses layered configuration:
+
+```text
+benchmarks/.env.global
+  global LLM/provider defaults
+benchmarks/hotpotqa/.env.hotpotqa.base
+  shared HotpotQA dataset, corpus, search, and guard defaults
+--env benchmarks/hotpotqa/.env.hotpotqa.exploration
+  exploration-only differences
+--env benchmarks/hotpotqa/.env.hotpotqa.frozen
+  frozen-evaluation-only differences
+os.environ
+  highest-priority runtime overrides, such as LLM_API_KEY
+```
+
+Loading priority is:
+
+```text
+.env.global < .env.hotpotqa.base < profile env < os.environ
+```
+
+For HotpotQA fullwiki, configure the dataset and corpus paths in `.env.hotpotqa.base`. The dataset directory should contain both the parquet split and the Wikipedia corpus directory referenced by that base env file.
 
 ```text
 HOTPOT_DATASET_DIR/
@@ -62,7 +87,7 @@ HOTPOT_DATASET_DIR/
     ... raw wiki files ...
 ```
 
-Use the exploration env for smoke tests and development subsets. Use the frozen env for paper-grade evaluation only.
+Use the exploration profile for smoke tests and development subsets. Use the frozen profile for paper-grade evaluation only. The base env should contain shared settings; profile env files should only contain stage-specific overrides.
 
 ### Stage 1: Exploration Or Smoke Runs
 
@@ -87,7 +112,7 @@ python benchmarks/run_queue.py run \
   --max-tasks 1
 ```
 
-Exploration may use warm cache and auxiliary diagnostics, but it should keep eval feedback disabled unless the experiment is explicitly designed to study adaptive behavior. Exploration artifacts are useful for debugging and badcase analysis, not for final claims.
+Exploration may use warm cache and auxiliary diagnostics, but it should keep eval feedback disabled unless the experiment is explicitly designed to study adaptive behavior. Exploration artifacts are useful for debugging and badcase analysis, not for final claims. Shared dataset and search defaults should remain in `.env.hotpotqa.base`; profile files should only override the stage-dependent keys.
 
 ### Stage 2: Frozen Sirchmunk Evaluation
 
@@ -198,6 +223,78 @@ Publication-grade baseline comparison requires:
 - imported baseline prediction coverage of at least 95%;
 - classified baseline failures below the validator threshold;
 - paired statistical tests where raw per-sample predictions are available.
+
+### Stage 3.5: Full-Corpus Feasibility Evaluation
+
+For HotpotQA fullwiki and other large corpora, index-heavy baselines such as LightRAG, GraphRAG, or RAPTOR must be evaluated as lifecycle systems. A baseline that cannot finish preprocessing under the declared resource budget should remain in the feasibility table with a structured failure reason instead of being silently removed.
+
+```bash
+python benchmarks/run_lifecycle_eval.py \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --baselines bm25,naive_rag \
+  --corpus-scale fullwiki \
+  --build-timeout 86400 \
+  --max-disk-bytes 500000000000
+```
+
+The command writes lifecycle artifacts under `lifecycle_eval/`, including:
+
+```text
+baseline_lifecycle.jsonl
+<baseline>_latest.json
+tables/feasibility_table.{md,tex,json}
+lifecycle_summary.json
+```
+
+Use `module:factory` baseline specs to plug in real index-heavy competitors:
+
+```bash
+--baselines bm25,my_lightrag_adapter:create_lightrag_v1
+```
+
+The factory must return a `BaselineAdapter`, usually an `IndexingSdkBaseline`, whose `prepare_fn` builds the external index and whose `validate_fn` verifies full-corpus readiness.
+
+### Stage 3.6: Multi-Scale Scaling Study And Amortized Cost
+
+To diagnose whether a competitor fails because of corpus scale rather than implementation error, run the same lifecycle protocol over increasing corpus sizes.
+
+```bash
+python benchmarks/run_scaling_study.py \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --baselines bm25,naive_rag \
+  --scales 10k:10000,100k:100000,fullwiki:0 \
+  --materialize symlink \
+  --build-timeout 86400 \
+  --q-values 1,10,100,1000
+```
+
+Outputs are written under `scaling_study/`:
+
+```text
+corpus_subsets/                 # deterministic subset manifests / symlink dirs
+<scale>/lifecycle/              # per-scale lifecycle records
+scaling_lifecycle_records.jsonl
+scaling_metrics.json            # seconds_per_doc / bytes_per_doc / failure reason
+amortized_cost_curves.json      # C_avg(Q) curves
+scaling_study_summary.json
+```
+
+The amortized lifecycle cost is defined as:
+
+$$C_{\text{avg}}(Q) = \frac{C_{\text{build}} + C_{\text{update}}}{Q} + C_{\text{query}}$$
+
+Report full-corpus feasibility and warm-query quality separately. Warm-query metrics should only be reported for systems whose full-corpus index is `READY`.
+
+### Stage 3.7: Dynamic Update And Ablation Planning
+
+P2 utilities expose the raw building blocks for dynamic-document experiments and LENS mechanism ablations:
+
+- `framework.dynamic_update.DynamicUpdateManager`: creates mutated corpus versions and records update cost / rebuild-required outcomes.
+- `framework.ablation_matrix.default_lens_ablation_spec()`: generates conservative one-axis-at-a-time LENS ablation variants for search mode, knowledge reuse, position prior, intent modulation, and loop budget.
+
+These utilities are intended to feed future frozen runs and paper ablations. Dynamic update experiments should report update time, whether a full rebuild is required, freshness accuracy, and post-update query quality.
 
 ### Stage 4: Report Generation And Validation
 

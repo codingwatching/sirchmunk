@@ -23,6 +23,7 @@ from .mock import (
     RandomAnswerMockBaseline,
 )
 from .sdk_baseline import ManualImportAdapter, SdkBaseline
+from .indexing_sdk_baseline import IndexingSdkBaseline
 
 __all__ = [
     # ABC + 数据结构
@@ -43,5 +44,6 @@ __all__ = [
     "FixedAccuracyMockBaseline",
     # SDK + 导入
     "SdkBaseline",
+    "IndexingSdkBaseline",
     "ManualImportAdapter",
 ]

@@ -95,6 +95,86 @@ def collect_setup_metrics(results: Iterable[Any]) -> Dict[str, Any]:
     }
 
 
+def amortized_cost(build_cost: float, update_cost: float, query_cost: float, q: int) -> float:
+    """Compute lifecycle amortized cost per query.
+
+    Formula: C_avg(Q) = (C_build + C_update) / Q + C_query.
+    """
+    q = max(_int(q), 1)
+    return (_float(build_cost) + _float(update_cost)) / q + _float(query_cost)
+
+
+def amortized_cost_curve(
+    *,
+    build_cost: float,
+    query_cost: float,
+    update_cost: float = 0.0,
+    q_values: Iterable[int] = (1, 10, 100, 1000),
+) -> Dict[str, float]:
+    """Return {Q: C_avg(Q)} for standard query-volume points."""
+    return {
+        str(max(_int(q), 1)): round(
+            amortized_cost(build_cost, update_cost, query_cost, max(_int(q), 1)),
+            6,
+        )
+        for q in q_values
+    }
+
+
+def lifecycle_cost_curve(
+    record: Any,
+    *,
+    query_cost: float = 0.0,
+    update_cost: float = 0.0,
+    q_values: Iterable[int] = (1, 10, 100, 1000),
+) -> Dict[str, Any]:
+    """Build a machine-readable amortized cost curve from a lifecycle record."""
+    data = record.to_dict() if hasattr(record, "to_dict") else dict(record)
+    build_cost = (
+        _float(data.get("api_cost_usd", 0.0))
+        or _float(data.get("build_time_seconds", 0.0))
+    )
+    return {
+        "baseline_name": data.get("baseline_name", ""),
+        "citation_name": data.get("citation_name", ""),
+        "corpus_scale": data.get("corpus_scale", ""),
+        "build_cost": build_cost,
+        "update_cost": _float(update_cost),
+        "query_cost": _float(query_cost),
+        "curve": amortized_cost_curve(
+            build_cost=build_cost,
+            update_cost=update_cost,
+            query_cost=query_cost,
+            q_values=q_values,
+        ),
+    }
+
+
+def scaling_efficiency(records: Iterable[Any]) -> Dict[str, Any]:
+    """Aggregate lifecycle records into per-scale build/storage metrics."""
+    rows = []
+    for record in records:
+        data = record.to_dict() if hasattr(record, "to_dict") else dict(record)
+        docs = _int(data.get("corpus_size_docs", 0))
+        indexed_docs = _int(data.get("indexed_documents", 0))
+        build_seconds = _float(data.get("build_time_seconds", 0.0))
+        disk_bytes = _int(data.get("disk_bytes", 0))
+        rows.append({
+            "baseline_name": data.get("baseline_name", ""),
+            "corpus_scale": data.get("corpus_scale", ""),
+            "corpus_size_docs": docs,
+            "indexed_documents": indexed_docs,
+            "index_required": bool(data.get("index_required", True)),
+            "build_time_seconds": build_seconds,
+            "disk_bytes": disk_bytes,
+            "seconds_per_doc": round(build_seconds / docs, 8) if docs else 0.0,
+            "bytes_per_doc": round(disk_bytes / docs, 2) if docs else 0.0,
+            "failure_reason": data.get("failure_reason", "none"),
+            "query_eligible": bool(data.get("query_eligible", False)),
+        })
+    return {"scales": rows}
+
+
 def percentile(values: List[float], pct: int) -> float:
     if not values:
         return 0.0

@@ -10,7 +10,7 @@
     # 1. 用 Mock 竞品运行端到端集成测试（验证 pipeline 通畅）
     python benchmarks/run_evaluation.py \\
       --benchmark hotpotqa \\
-      --env benchmarks/hotpotqa/.env.hotpotqa \\
+      --env benchmarks/hotpotqa/.env.hotpotqa.frozen \\
       --baselines mock \\
       --golden-n 20 \\
       --sirchmunk-results benchmarks/hotpotqa/output/results_YYYYMMDD.jsonl \\
@@ -19,7 +19,7 @@
     # 2. 导入竞品预测 JSONL + 本文结果 → 生成完整比较表格
     python benchmarks/run_evaluation.py \\
       --benchmark hotpotqa \\
-      --env benchmarks/hotpotqa/.env.hotpotqa \\
+      --env benchmarks/hotpotqa/.env.hotpotqa.frozen \\
       --import-baseline "GPT-4o (zero-shot)=output/gpt4o_preds.jsonl" \\
       --import-baseline-setup "GPT-4o (zero-shot)=output/gpt4o_setup_metrics.json" \\
       --sirchmunk-results benchmarks/hotpotqa/output/results_YYYYMMDD.jsonl \\
@@ -28,7 +28,7 @@
     # 3. 只填写已发表数字（不重新 Judge，直接写入表格）
     python benchmarks/run_evaluation.py \\
       --benchmark hotpotqa \\
-      --env benchmarks/hotpotqa/.env.hotpotqa \\
+      --env benchmarks/hotpotqa/.env.hotpotqa.frozen \\
       --import-published "Reported System:acc=45.0,cov=80.0,lat=5.2" \\
       --sirchmunk-results benchmarks/hotpotqa/output/results_YYYYMMDD.jsonl \\
       --output-dir benchmarks/hotpotqa/output/paper_table/
@@ -36,7 +36,7 @@
     # 4. 仅生成表格（不运行任何 baseline，纯汇聚已有结果）
     python benchmarks/run_evaluation.py \\
       --benchmark hotpotqa \\
-      --env benchmarks/hotpotqa/.env.hotpotqa \\
+      --env benchmarks/hotpotqa/.env.hotpotqa.frozen \\
       --sirchmunk-results benchmarks/hotpotqa/output/results_YYYYMMDD.jsonl \\
       --table-only \\
       --output-dir benchmarks/hotpotqa/output/paper_table/

@@ -266,6 +266,7 @@ web/out/
 
 
 # benchmarks
+benchmarks/.env.global
 benchmarks/*/data/
 benchmarks/*/.env*
 benchmarks/*/logs/

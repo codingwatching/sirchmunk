@@ -21,6 +21,9 @@ _SRC = _PROJECT_ROOT / "src"
 # Layer 0 全局共享配置文件路径（可选）
 _GLOBAL_ENV = _BENCHMARKS_ROOT / ".env.global"
 
+# Layer 1 HotpotQA 共享配置文件路径（可选，profile 可覆盖）
+_HOTPOT_BASE_ENV = _HERE / ".env.hotpotqa.base"
+
 # HotpotQA 专属 work_path（固定，不受 CWD 影响）
 _HOTPOT_WORK_PATH = str(_HERE / ".work")
 
@@ -43,38 +46,36 @@ from hotpotqa.metrics import compute_hotpotqa_metrics  # noqa: E402
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _load_global_env_as_defaults() -> None:
-    """将 benchmarks/.env.global 中的键值注入 os.environ（最低优先级）。
-
-    只有 os.environ 中尚未设置的 key 才会被注入，确保:
-      benchmarks/.env.global  <  .env.hotpotqa  <  os.environ
-    """
-    if not _GLOBAL_ENV.exists():
-        return
-    for line in _GLOBAL_ENV.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        k = k.strip()
-        v = v.strip().strip('"').strip("'")
-        os.environ.setdefault(k, v)
-
-
-def _load_env(env_file: str) -> Dict[str, str]:
+def _load_env_file(path: str | Path) -> Dict[str, str]:
     """简单解析 .env 文件为 dict（不依赖 python-dotenv）。"""
     result: Dict[str, str] = {}
-    p = Path(env_file)
+    p = Path(path)
     if not p.exists():
         return result
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    for raw_line in p.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        k, _, v = line.partition("=")
-        v = v.strip().strip('"').strip("'")
-        result[k.strip()] = v
+        key, _, value = line.partition("=")
+        result[key.strip()] = value.strip().strip('"').strip("'")
     return result
+
+
+def _default_base_env_path() -> Path:
+    override = os.environ.get("HOTPOT_BASE_ENV_FILE", "").strip()
+    return Path(override).expanduser().resolve() if override else _HOTPOT_BASE_ENV
+
+
+def _load_env_layers(profile_env_file: str) -> tuple[Dict[str, str], List[str]]:
+    """加载 HotpotQA 多层 env，优先级为 global < base < profile < os.environ。"""
+    env: Dict[str, str] = {}
+    sources: List[str] = []
+    for path in (_GLOBAL_ENV, _default_base_env_path(), Path(profile_env_file)):
+        layer = _load_env_file(path)
+        if layer:
+            env.update(layer)
+            sources.append(str(Path(path).resolve()))
+    return env, sources
 
 
 class HotpotQAAdapter(BenchmarkAdapter):
@@ -87,15 +88,14 @@ class HotpotQAAdapter(BenchmarkAdapter):
     Usage::
 
         adapter = HotpotQAAdapter(
-            env_file="benchmarks/hotpotqa/.env.hotpotqa"
+            env_file="benchmarks/hotpotqa/.env.hotpotqa.frozen"
         )
     """
 
     def __init__(self, env_file: str) -> None:
         # HotpotQA keeps an isolated work_path to avoid cache pollution.
-        _load_global_env_as_defaults()
         self._env_file = str(Path(env_file).resolve())
-        self._env = _load_env(self._env_file)
+        self._env, self._env_sources = _load_env_layers(self._env_file)
         self._searcher = None
         self._judge = None
 
@@ -104,10 +104,13 @@ class HotpotQAAdapter(BenchmarkAdapter):
     # ------------------------------------------------------------------
 
     def _get(self, key: str, default: str = "") -> str:
+        value = os.environ.get(key)
+        if value is not None and value != "":
+            return value
         value = self._env.get(key)
         if value is not None and value != "":
             return value
-        return os.environ.get(key, default)
+        return default
 
     def _get_int(self, key: str, default: int = 0) -> int:
         try:
@@ -178,6 +181,7 @@ class HotpotQAAdapter(BenchmarkAdapter):
             "max_api_cost_usd": float(self._get("MAX_API_COST_USD", "0") or 0),
             "max_disk_usage_bytes": self._get_int("MAX_DISK_USAGE_BYTES", 0),
             "min_free_disk_bytes": self._get_int("MIN_FREE_DISK_BYTES", 0),
+            "env_sources": list(self._env_sources),
             "top_k_env_key":    "HOTPOT_TOP_K_FILES",
             "mode_env_key":     "HOTPOT_MODE",
             "judge_threshold_env_key": "HOTPOT_JUDGE_F1_THRESHOLD",
