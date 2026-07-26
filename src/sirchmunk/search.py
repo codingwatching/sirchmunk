@@ -2209,7 +2209,12 @@ class AgenticSearch(BaseSearch):
             dir_scan_files=dir_scan_files,
             knowledge_hits=extra_knowledge_files,
         )
-        target_files = self._select_target_files(merged_files, _scope, artifacts)
+        target_files = self._select_target_files(
+            merged_files,
+            _scope,
+            artifacts,
+            max_files=top_k_files,
+        )
 
         await self._logger.info(
             f"[Phase 3] Merged {len(merged_files)} files, "
@@ -6890,8 +6895,10 @@ class AgenticSearch(BaseSearch):
         merged_files: List[str],
         scope: "_PathScope",
         artifacts: Optional["CompileArtifacts"],
+        *,
+        max_files: Optional[int] = None,
     ) -> List[str]:
-        """Select top files for agentic retrieval, preferring tree-indexed ones."""
+        """Select top files for agentic retrieval, honoring requested top_k."""
         scoped = [fp for fp in merged_files if scope.contains(fp)]
         if not scoped:
             scoped = list(merged_files)
@@ -6902,7 +6909,8 @@ class AgenticSearch(BaseSearch):
         with_tree = [fp for fp in scoped if fp in tree_paths]
         without_tree = [fp for fp in scoped if fp not in tree_paths]
         ranked = with_tree + without_tree
-        return ranked[: self._AGENTIC_MAX_FILES]
+        limit = max_files if max_files and max_files > 0 else self._AGENTIC_MAX_FILES
+        return ranked[:limit]
 
     async def _select_pages_for_data(
         self,
@@ -7043,27 +7051,30 @@ class AgenticSearch(BaseSearch):
 
         Uses two strategies in order:
 
-        1. **Small file direct read** — for text-family files below
-           ``_FAST_SMALL_FILE_THRESHOLD``, reads the entire file.
-        2. **Kreuzberg extraction** — for any file type, delegates to
-           ``DocumentExtractor.extract`` which handles all formats via
-           kreuzberg (docx, html, xlsx, etc.).
+        1. **Text direct/window read** — for text-family files, including
+           extensionless files whose byte sample looks like plain text, reads
+           the full small file or query-matched context windows for large files.
+        2. **Kreuzberg extraction** — for typed binary/office files, delegates to
+           ``DocumentExtractor.extract`` which handles formats via kreuzberg
+           (docx, html, xlsx, etc.).
 
         Returns the extracted text (capped to *max_chars*), or ``None``
         on failure.
         """
         budget = max_chars or self._AGENTIC_EVIDENCE_MAX_CHARS
-        fname = Path(file_path).name
-        ext = Path(file_path).suffix.lower()
+        path = Path(file_path)
+        fname = path.name
+        ext = path.suffix.lower()
 
-        # Strategy 1: direct read for text-family files
-        if ext in self._FAST_TEXT_EXTENSIONS:
+        # Strategy 1: direct/window read for text-family files.  HotpotQA raw
+        # wiki shards are extensionless plain-text files (e.g. ``wiki_55``),
+        # so relying on extension-based MIME detection sends them to kreuzberg
+        # and causes "Could not determine MIME type" failures.
+        if self._is_plain_text_candidate(path, ext):
             try:
-                sz = Path(file_path).stat().st_size
-                if sz <= self._FAST_SMALL_FILE_THRESHOLD:
-                    text = Path(file_path).read_text(errors="replace")
-                    if text.strip():
-                        return f"[{fname}]\n{text}"[:budget]
+                content = self._read_text_evidence(path, query, budget)
+                if content and content.strip():
+                    return f"[{fname}]\n{content}"[:budget]
             except Exception:
                 pass
 
@@ -7078,6 +7089,150 @@ class AgenticSearch(BaseSearch):
             pass
 
         return None
+
+    @classmethod
+    def _is_plain_text_candidate(cls, path: Path, ext: str) -> bool:
+        """Return True for files safe to read as text.
+
+        Besides known text extensions, this accepts extensionless files when a
+        small byte probe has no NUL bytes and decodes cleanly enough as UTF-8.
+        This covers HotpotQA Wikipedia shards while avoiding binary formats that
+        should remain handled by kreuzberg.
+        """
+        if ext in cls._FAST_TEXT_EXTENSIONS:
+            return True
+        if ext:
+            return False
+        try:
+            with path.open("rb") as fh:
+                sample = fh.read(4096)
+        except Exception:
+            return False
+        if not sample or b"\x00" in sample:
+            return False
+        decoded = sample.decode("utf-8", errors="replace")
+        if not decoded.strip():
+            return False
+        replacement_ratio = decoded.count("\ufffd") / max(len(decoded), 1)
+        return replacement_ratio < 0.02
+
+    @classmethod
+    def _read_text_evidence(cls, path: Path, query: str, budget: int) -> str:
+        """Read text evidence from *path*, using keyword windows for large files."""
+        size = path.stat().st_size
+        if size <= cls._FAST_SMALL_FILE_THRESHOLD:
+            return path.read_text(encoding="utf-8", errors="replace")[:budget]
+
+        windowed = cls._read_query_windows(path, query, budget)
+        if windowed.strip():
+            return windowed[:budget]
+
+        # Last-resort fallback: keep the pipeline from returning zero evidence
+        # for plain-text files even when keyword matching fails.
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            return fh.read(budget)
+
+    @classmethod
+    def _read_query_windows(cls, path: Path, query: str, budget: int) -> str:
+        """Extract compact line windows around query terms from a large text file."""
+        terms = cls._query_terms_for_text_sampling(query)
+        if not terms:
+            return ""
+
+        context_radius = min(cls._FAST_CONTEXT_WINDOW, 8)
+        previous: List[Tuple[int, str]] = []
+        parts: List[str] = []
+        emitted: Set[int] = set()
+        pending_after = 0
+        chars = 0
+
+        def emit(line_no: int, text: str) -> None:
+            nonlocal chars
+            if line_no in emitted or chars >= budget:
+                return
+            snippet = f"L{line_no}: {text.rstrip()}\n"
+            parts.append(snippet)
+            emitted.add(line_no)
+            chars += len(snippet)
+
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line_no, line in enumerate(fh, start=1):
+                lower = line.lower()
+                hit = any(term in lower for term in terms)
+                if hit:
+                    if parts and chars < budget:
+                        parts.append("...\n")
+                        chars += 4
+                    for prev_no, prev_line in previous:
+                        emit(prev_no, prev_line)
+                    emit(line_no, line)
+                    pending_after = context_radius
+                elif pending_after > 0:
+                    emit(line_no, line)
+                    pending_after -= 1
+
+                previous.append((line_no, line))
+                if len(previous) > context_radius:
+                    previous.pop(0)
+                if chars >= budget:
+                    break
+        return "".join(parts)
+
+    @staticmethod
+    def _query_terms_for_text_sampling(query: str) -> List[str]:
+        tokens = re.findall(r"\b[a-z0-9]{3,}\b", query.lower())
+        terms = sorted({t for t in tokens if t not in _STOP_WORDS}, key=len, reverse=True)
+        return terms[:12]
+
+    async def _expand_sibling_text_evidence(
+        self,
+        seed_files: List[str],
+        evidence_parts: List[str],
+        pages_extracted: Dict[str, set],
+        query: str,
+    ) -> None:
+        """Add sibling text docs whose title is mentioned in already-read evidence.
+
+        This targets multi-hop collections such as HotpotQA sample contexts: the
+        first-hop document may say "professor at Moscow State University", while
+        the second-hop document is a sibling file named ``Moscow State University``.
+        """
+        evidence_lower = "\n".join(evidence_parts).lower()
+        seen = set(pages_extracted)
+        candidate_dirs = []
+        for fp in seed_files:
+            parent = Path(fp).parent
+            if parent not in candidate_dirs:
+                candidate_dirs.append(parent)
+
+        for parent in candidate_dirs:
+            try:
+                siblings = sorted(parent.glob("*.txt"))
+            except Exception:
+                continue
+            for sibling in siblings:
+                sibling_str = str(sibling)
+                if sibling_str in seen:
+                    continue
+                title = re.sub(r"^\d+_", "", sibling.stem).replace("_", " ").strip()
+                if not title or len(title.split()) < 2:
+                    continue
+                if title.lower() not in evidence_lower:
+                    continue
+                remaining = self._AGENTIC_EVIDENCE_MAX_CHARS - sum(
+                    len(p) for p in evidence_parts
+                )
+                if remaining <= 0:
+                    return
+                content = await self._extract_non_paginated_content(
+                    sibling_str,
+                    query,
+                    max_chars=remaining,
+                )
+                if content:
+                    evidence_parts.append(content)
+                    pages_extracted[sibling_str] = set()
+                    seen.add(sibling_str)
 
     async def _agentic_retrieve(
         self,
@@ -7152,6 +7307,14 @@ class AgenticSearch(BaseSearch):
             if content:
                 evidence_parts.append(content)
                 pages_extracted[fp] = set()
+
+        if evidence_parts and non_paginated_files:
+            await self._expand_sibling_text_evidence(
+                non_paginated_files,
+                evidence_parts,
+                pages_extracted,
+                query,
+            )
 
         for fp in outline_target_files:
             tp = file_total_pages.get(fp)

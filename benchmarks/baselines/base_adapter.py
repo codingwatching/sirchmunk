@@ -11,7 +11,6 @@
     有 Python SDK      → SdkBaseline (baselines/sdk_baseline.py)
     有 HTTP API        → 继承 BaselineAdapter，在 predict() 中发 HTTP 请求
     只有发表数字        → ManualImportAdapter (baselines/sdk_baseline.py)
-    Mock 测试          → MockBaseline (baselines/mock.py)
 """
 from __future__ import annotations
 

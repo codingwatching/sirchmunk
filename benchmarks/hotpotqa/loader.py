@@ -27,10 +27,22 @@ def load_hotpotqa_samples(
 
     try:
         import pandas as pd
-        frames = [pd.read_parquet(path) for path in parquet_files]
-        df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
     except ImportError as exc:
-        raise ImportError("HotpotQAAdapter requires 'pyarrow' and 'pandas'.") from exc
+        raise ImportError(
+            "HotpotQAAdapter requires pandas. Install project dependencies with: "
+            "pip install -r requirements/core.txt -r requirements/benchmarks.txt"
+        ) from exc
+
+    try:
+        import pyarrow  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "HotpotQAAdapter requires pyarrow for parquet support. Install benchmark "
+            "dependencies with: pip install -r requirements/benchmarks.txt"
+        ) from exc
+
+    frames = [pd.read_parquet(path, engine="pyarrow") for path in parquet_files]
+    df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
 
     samples: List[BenchmarkSample] = []
     for _, row in df.iterrows():

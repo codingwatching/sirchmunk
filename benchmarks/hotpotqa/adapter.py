@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -138,20 +139,36 @@ class HotpotQAAdapter(BenchmarkAdapter):
         dataset_dir = Path(self._get("HOTPOT_DATASET_DIR", ""))
         setting = self._get("HOTPOT_SETTING", "fullwiki")
         split = self._get("HOTPOT_SPLIT", "validation")
-        return load_hotpotqa_samples(
+        samples = load_hotpotqa_samples(
             dataset_dir,
             setting=setting,
             split=split,
-            limit=limit,
+            limit=0 if self._require_context_answerable() else limit,
             seed=seed,
         )
+        if self._require_context_answerable():
+            samples = [s for s in samples if self._is_context_answerable(s)]
+            if limit > 0 and limit < len(samples):
+                random.seed(seed)
+                samples = random.sample(samples, limit)
+        return samples
 
     def validate_corpus(self) -> Tuple[int, List[str]]:
         """Validate HotpotQA wiki corpus availability."""
         return validate_hotpotqa_corpus(Path(self._wiki_dir()))
 
     def get_search_paths(self, sample: BenchmarkSample) -> List[str]:
-        """Return the fullwiki corpus directory path."""
+        """Return search paths for this sample.
+
+        Exploration smoke runs may use the parquet-provided HotpotQA context as
+        a per-sample raw-text corpus.  Frozen/fullwiki runs should keep the
+        default ``wiki`` mode and search the configured Wikipedia corpus.
+        """
+        mode = self._context_corpus_mode()
+        if mode == "sample":
+            return [str(self._materialize_sample_context(sample))]
+        if mode == "hybrid":
+            return [str(self._materialize_sample_context(sample)), self._wiki_dir()]
         return [self._wiki_dir()]
 
     def get_run_config(self) -> Dict[str, Any]:
@@ -167,10 +184,11 @@ class HotpotQAAdapter(BenchmarkAdapter):
             "enable_gpt_eval":  self._get_bool("HOTPOT_ENABLE_GPT_EVAL", False),
             "llm_model":        self._get("LLM_MODEL_NAME", ""),
             "llm_base_url":     self._get("LLM_BASE_URL", ""),
-            "mock_llm":         self._get_bool("HOTPOT_MOCK_LLM", False),
             "max_concurrent":   self._get_int("HOTPOT_MAX_CONCURRENT", 3),
             "setting":          self._get("HOTPOT_SETTING", "fullwiki"),
             "split":            self._get("HOTPOT_SPLIT", "validation"),
+            "context_corpus_mode": self._context_corpus_mode(),
+            "require_context_answerable": self._require_context_answerable(),
             "reuse_knowledge":  self._get_bool("HOTPOT_REUSE_KNOWLEDGE", False),
             "cache_mode":       self._get("HOTPOT_CACHE_MODE", "cold"),
             "sample_timeout_seconds": self._get_int("SAMPLE_TIMEOUT_SECONDS", 0),
@@ -195,18 +213,14 @@ class HotpotQAAdapter(BenchmarkAdapter):
         与 FinanceBenchAdapter 的 .work 完全隔离。
         """
         if self._searcher is None:
+            from sirchmunk.llm.openai_chat import OpenAIChat
             from sirchmunk.search import AgenticSearch
 
-            if self._get_bool("HOTPOT_MOCK_LLM", False):
-                from hotpotqa.mock_llm import MockHotpotLLM
-                llm = MockHotpotLLM(model=self._get("LLM_MODEL_NAME", "mock-hotpot-llm"))
-            else:
-                from sirchmunk.llm.openai_chat import OpenAIChat
-                llm = OpenAIChat(
-                    api_key=self._get("LLM_API_KEY", ""),
-                    base_url=self._get("LLM_BASE_URL", "https://api.openai.com/v1"),
-                    model=self._get("LLM_MODEL_NAME", "gpt-4o-mini"),
-                )
+            llm = OpenAIChat(
+                api_key=self._get("LLM_API_KEY", ""),
+                base_url=self._get("LLM_BASE_URL", "https://api.openai.com/v1"),
+                model=self._get("LLM_MODEL_NAME", "gpt-4o-mini"),
+            )
             self._searcher = AgenticSearch(
                 llm=llm,
                 work_path=self.get_work_path(),  # 使用隔离后的绝对路径
@@ -348,3 +362,97 @@ class HotpotQAAdapter(BenchmarkAdapter):
         if dataset_dir.name == setting and (dataset_dir.parent / wiki_dirname).exists():
             return str(dataset_dir.parent / wiki_dirname)
         return str(dataset_dir / wiki_dirname)
+
+    def _context_corpus_mode(self) -> str:
+        raw = self._get("HOTPOT_CONTEXT_CORPUS_MODE", "wiki").strip().lower()
+        if raw in {"sample", "context", "sample_context"}:
+            return "sample"
+        if raw in {"hybrid", "sample_plus_wiki", "context_plus_wiki"}:
+            return "hybrid"
+        return "wiki"
+
+    def _require_context_answerable(self) -> bool:
+        return self._get_bool("HOTPOT_REQUIRE_CONTEXT_ANSWERABLE", False)
+
+    def _is_context_answerable(self, sample: BenchmarkSample) -> bool:
+        context = sample.metadata.get("context") or {}
+        if not isinstance(context, dict):
+            return False
+        titles = context.get("title") or context.get("titles") or []
+        sentences = context.get("sentences") or context.get("sentence") or []
+        if isinstance(titles, str):
+            titles = [titles]
+        title_set = {self._normalize_text(str(t)) for t in titles}
+        support = sample.metadata.get("supporting_facts") or {}
+        support_titles = support.get("title") or support.get("titles") or [] if isinstance(support, dict) else []
+        if isinstance(support_titles, str):
+            support_titles = [support_titles]
+        support_set = {self._normalize_text(str(t)) for t in support_titles if str(t).strip()}
+        if support_set and not support_set.issubset(title_set):
+            return False
+
+        if isinstance(sentences, list):
+            flat_sentences: List[str] = []
+            for item in sentences:
+                if isinstance(item, list):
+                    flat_sentences.extend(str(s) for s in item)
+                else:
+                    flat_sentences.append(str(item))
+            context_text = " ".join(flat_sentences)
+        else:
+            context_text = str(sentences)
+        answer = str(sample.gold_answer or "").strip().lower()
+        return bool(answer and answer in context_text.lower())
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return " ".join(re.sub(r"[^a-zA-Z0-9]+", " ", text).lower().split())
+
+    def _materialize_sample_context(self, sample: BenchmarkSample) -> Path:
+        """Materialize parquet context as per-sample raw text files."""
+        out_dir = Path(self.get_work_path()) / "context_corpus" / sample.sample_id
+        marker = out_dir / ".complete"
+        if marker.exists():
+            return out_dir
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for old in out_dir.glob("*.txt"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+        context = sample.metadata.get("context") or {}
+        titles = context.get("title") or context.get("titles") or [] if isinstance(context, dict) else []
+        sentences = context.get("sentences") or context.get("sentence") or [] if isinstance(context, dict) else []
+        if isinstance(titles, str):
+            titles = [titles]
+        if not isinstance(titles, list):
+            titles = list(titles) if titles is not None else []
+        if not isinstance(sentences, list):
+            sentences = list(sentences) if sentences is not None else []
+
+        for idx, title in enumerate(titles):
+            raw_sentences = sentences[idx] if idx < len(sentences) else []
+            if isinstance(raw_sentences, str):
+                raw_sentences = [raw_sentences]
+            elif not isinstance(raw_sentences, list):
+                try:
+                    raw_sentences = list(raw_sentences)
+                except TypeError:
+                    raw_sentences = [str(raw_sentences)]
+            text = "\n".join(str(s) for s in raw_sentences if str(s).strip())
+            safe_title = self._safe_context_filename(str(title), idx)
+            body = f"# {title}\n\n{text}\n" if text else f"# {title}\n"
+            (out_dir / f"{idx:02d}_{safe_title}.txt").write_text(
+                body,
+                encoding="utf-8",
+            )
+
+        marker.write_text("ok\n", encoding="utf-8")
+        return out_dir
+
+    @staticmethod
+    def _safe_context_filename(title: str, idx: int) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9]+", "_", title).strip("_")
+        return (normalized[:120] or f"doc_{idx}")

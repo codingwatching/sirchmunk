@@ -4,6 +4,57 @@ This module provides the experimental infrastructure used to evaluate Sirchmunk 
 
 The default reference workflow is HotpotQA fullwiki, but the framework is benchmark-agnostic. The same lifecycle also supports mechanism-oriented experiments such as setup cost, freshness, storage overhead, source fidelity, and warm reuse.
 
+## Quickstart: Run The Full Pipeline
+
+Use this path first. It validates the complete local pipeline — config loading, HotpotQA data loading, retrieval, real LLM calls, metrics, artifacts, and report generation.
+
+### Step 0: Install Dependencies
+
+```bash
+pip install -r requirements/core.txt -r requirements/benchmarks.txt
+```
+
+`requirements/benchmarks.txt` contains benchmark-only extras such as `pyarrow`, which HotpotQA needs to read fullwiki parquet files. Normal Sirchmunk usage does not require these extras.
+
+### Step 1: Create Private Env Files
+
+```bash
+cp benchmarks/.env.global.example benchmarks/.env.global
+cp benchmarks/hotpotqa/env.hotpotqa.base.example benchmarks/hotpotqa/.env.hotpotqa.base
+cp benchmarks/hotpotqa/env.hotpotqa.exploration.example benchmarks/hotpotqa/.env.hotpotqa.exploration
+# Then edit benchmarks/.env.global and set LLM_API_KEY=<your-api-key>.
+```
+
+The default local setup uses DashScope-compatible Qwen:
+
+```text
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_MODEL_NAME=qwen3.7-plus
+```
+
+`LLM_API_KEY` should live in the private ignored `benchmarks/.env.global` file. Shell environment variables still work as temporary highest-priority overrides, but the recommended persistent setup is the private env file.
+
+### Step 2: Run One Command
+
+```bash
+python benchmarks/run_quickstart.py
+```
+
+This command runs 10 HotpotQA fullwiki samples with the configured real LLM provider, automatically skips the interactive improvement step, locates the generated run artifact, and generates a report. By default it uses `--context-corpus-mode sample`, which materializes each sample's parquet context as temporary raw-text files and filters to context-answerable smoke samples so the quickstart has a closed retrieval corpus. Use `--context-corpus-mode wiki` when you want to exercise the configured raw fullwiki corpus instead.
+
+### Step 3: Read The Outputs
+
+The command prints the latest `run_dir`, `metrics.json`, and report paths. Typical outputs are:
+
+```text
+benchmarks/hotpotqa/output/exploration/runs/<run_id>/results/metrics.json
+benchmarks/hotpotqa/output/exploration/runs/<run_id>/results/predictions.jsonl
+benchmarks/hotpotqa/output/exploration/runs/<run_id>/reports/report.md
+benchmarks/hotpotqa/output/exploration/runs/<run_id>/reports/validation.json
+```
+
+Quickstart is an exploration smoke test. `quickstart_ok=True` means the end-to-end run completed without system failures and retrieved supporting evidence. `paper_ready=False` is expected for exploration runs because publication-grade reports require frozen stage settings and baseline comparison artifacts.
+
 ## Design Philosophy
 
 The benchmark stack follows a ResearchOps philosophy: every reported number should be reproducible, attributable, and falsifiable from structured artifacts rather than reconstructed from logs or narrative claims.
@@ -30,6 +81,7 @@ benchmarks/
   storage_overhead/       # Mechanism benchmark: storage overhead
   source_fidelity/        # Mechanism benchmark: raw-source traceability
   warm_reuse/             # Mechanism benchmark: warm cache / reuse behavior
+  run_quickstart.py       # One-command HotpotQA smoke + report CLI
   run_queue.py            # P3 queue and unattended execution CLI
   run_evaluation.py       # Baseline comparison and paper table CLI
   run_lifecycle_eval.py   # Full-corpus baseline build/index feasibility CLI
@@ -40,9 +92,9 @@ benchmarks/
 
 Supported benchmark names are resolved through `framework/registry.py`. Current names include `hotpotqa`, `setup_cost`, `freshness`, `storage_overhead`, `source_fidelity`, and `warm_reuse`.
 
-## End-to-End Workflow
+## Advanced Paper Workflow
 
-The recommended workflow has four stages. The stages are intentionally separated to prevent exploratory optimization from contaminating frozen paper evaluation.
+Use this workflow after the Quickstart passes. These stages are intentionally separated to prevent exploratory optimization from contaminating frozen paper evaluation.
 
 ### Stage 0: Prepare Environment And Data
 
@@ -53,8 +105,7 @@ cp benchmarks/.env.global.example benchmarks/.env.global
 cp benchmarks/hotpotqa/env.hotpotqa.base.example benchmarks/hotpotqa/.env.hotpotqa.base
 cp benchmarks/hotpotqa/env.hotpotqa.exploration.example benchmarks/hotpotqa/.env.hotpotqa.exploration
 cp benchmarks/hotpotqa/env.hotpotqa.frozen.example benchmarks/hotpotqa/.env.hotpotqa.frozen
-cp benchmarks/hotpotqa/env.hotpotqa.mock.example benchmarks/hotpotqa/.env.hotpotqa.mock
-export LLM_API_KEY="..."
+# Then edit benchmarks/.env.global and set LLM_API_KEY=<your-api-key>.
 ```
 
 HotpotQA uses layered configuration:
@@ -82,18 +133,18 @@ For HotpotQA fullwiki, configure the dataset and corpus paths in `.env.hotpotqa.
 
 ```text
 # Option A: dataset root
-HOTPOT_DATASET_DIR=/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset
+HOTPOT_DATASET_DIR=/path/to/hotpotqa_dataset
 HOTPOT_WIKI_CORPUS_DIRNAME=enwiki-20171001-pages-meta-current-withlinks-abstracts
 
-# Option B: direct fullwiki parquet directory (current local setup)
-HOTPOT_DATASET_DIR=/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset/fullwiki
-HOTPOT_WIKI_CORPUS_DIR=/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset/enwiki-20171001-pages-meta-current-withlinks-abstracts
+# Option B: direct fullwiki parquet directory
+HOTPOT_DATASET_DIR=/path/to/hotpotqa_dataset/fullwiki
+HOTPOT_WIKI_CORPUS_DIR=/path/to/hotpotqa_dataset/enwiki-20171001-pages-meta-current-withlinks-abstracts
 ```
 
-Expected local layout:
+Expected dataset layout:
 
 ```text
-/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset/
+/path/to/hotpotqa_dataset/
   fullwiki/
     validation-*.parquet
     test-*.parquet
@@ -104,32 +155,30 @@ Expected local layout:
 
 Use the exploration profile for smoke tests and development subsets. Use the frozen profile for paper-grade evaluation only. The base env should contain shared settings; profile env files should only contain stage-specific overrides.
 
-For a no-API smoke test, enable the deterministic mock LLM in a private env file:
+For real LLM runs, set the real `LLM_API_KEY` in the private ignored `benchmarks/.env.global` file. Shell environment variables still work as temporary highest-priority overrides, but the recommended persistent setup is the private env file. Never commit real secrets.
 
-```text
-HOTPOT_MOCK_LLM=true
-LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-LLM_API_KEY=<your-api-key>
-LLM_MODEL_NAME=qwen3.7-plus
-```
+### Optional: Manual Smoke Test
 
-For real LLM runs, keep `HOTPOT_MOCK_LLM=false` and set the real `LLM_API_KEY` via shell or a private ignored env file; never commit real secrets.
-
-### Mock Smoke Test (No External LLM Calls)
-
-Use the ignored private mock profile to verify the full runner/retrieval/judge/artifact chain on 10 samples:
+`run_quickstart.py` is the recommended entry point. If you need to debug the underlying commands manually, the equivalent smoke run is:
 
 ```bash
 printf 'skip\n' | python benchmarks/run_research_loop.py \
   --benchmark hotpotqa \
-  --env benchmarks/hotpotqa/.env.hotpotqa.mock \
+  --env benchmarks/hotpotqa/.env.hotpotqa.exploration \
   --limit 10 \
   --max-iter 1 \
   --dry-run \
   --log-level INFO
 ```
 
-The mock run is expected to have low or zero answer accuracy because the mock LLM is deterministic and not semantically correct. The success criterion is pipeline completion: 10/10 samples executed, corpus validation passed, predictions/metrics/artifacts written, and BadCase analysis generated.
+Then generate the report manually:
+
+```bash
+python benchmarks/run_report.py \
+  --run-dir benchmarks/hotpotqa/output/exploration/runs/<run_id> \
+  --output-dir benchmarks/hotpotqa/output/exploration/runs/<run_id>/reports \
+  --title "HotpotQA Quickstart Smoke Test Report"
+```
 
 ### Stage 1: Exploration Or Smoke Runs
 

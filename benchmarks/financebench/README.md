@@ -71,7 +71,7 @@ You **must** set valid LLM credentials here before proceeding.
 
 | Variable | Required | Description | Example                                             |
 |----------|----------|-------------|-----------------------------------------------------|
-| `LLM_API_KEY` | **Yes** | API key for the LLM provider | `sk-xxx`                                            |
+| `LLM_API_KEY` | **Yes** | API key for the LLM provider | `<your-api-key>`                                   |
 | `LLM_BASE_URL` | **Yes** | LLM API endpoint | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 | `LLM_MODEL_NAME` | **Yes** | Model name for search & QA | `qwen3.5-plus`                                      |
 | `LLM_TIMEOUT` | No | Request timeout in seconds | `120`                                               |

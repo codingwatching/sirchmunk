@@ -2,10 +2,6 @@
 
 接入方式速查：
 
-    # Mock 测试（无需任何外部依赖）
-    from baselines import ConstantMockBaseline, GoldCopyMockBaseline
-    from baselines import RandomAnswerMockBaseline, FixedAccuracyMockBaseline
-
     # 真实/外部竞品
     from baselines import SdkBaseline, LocalBM25Baseline, NaiveRAGBaseline
     from baselines import LightRAGV1Baseline, GraphRAGBaseline
@@ -16,12 +12,6 @@
 from .base_adapter import BaselineAdapter, BaselinePrediction, BaselineResult, BaselineSetupResult
 from .external import ExternalPredictionBaseline, GraphRAGBaseline, LightRAGV1Baseline
 from .lexical import LocalBM25Baseline, NaiveRAGBaseline
-from .mock import (
-    ConstantMockBaseline,
-    FixedAccuracyMockBaseline,
-    GoldCopyMockBaseline,
-    RandomAnswerMockBaseline,
-)
 from .sdk_baseline import ManualImportAdapter, SdkBaseline
 from .indexing_sdk_baseline import IndexingSdkBaseline
 
@@ -37,11 +27,6 @@ __all__ = [
     "ExternalPredictionBaseline",
     "LightRAGV1Baseline",
     "GraphRAGBaseline",
-    # Mock 实现
-    "ConstantMockBaseline",
-    "GoldCopyMockBaseline",
-    "RandomAnswerMockBaseline",
-    "FixedAccuracyMockBaseline",
     # SDK + 导入
     "SdkBaseline",
     "IndexingSdkBaseline",

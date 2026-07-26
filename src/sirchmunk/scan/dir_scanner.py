@@ -250,7 +250,7 @@ class DirectoryScanner:
     DEFAULT_EXCLUDE = {
         "__pycache__", ".git", ".svn", "node_modules", ".idea",
         ".vscode", ".cache", ".tox", ".eggs", "*.egg-info",
-        ".DS_Store", "Thumbs.db",
+        ".DS_Store", "._*", "Thumbs.db",
     }
 
     def __init__(

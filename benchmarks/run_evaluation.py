@@ -7,25 +7,16 @@
 
 使用方式::
 
-    # 1. 用 Mock 竞品运行端到端集成测试（验证 pipeline 通畅）
-    python benchmarks/run_evaluation.py \\
-      --benchmark hotpotqa \\
-      --env benchmarks/hotpotqa/.env.hotpotqa.frozen \\
-      --baselines mock \\
-      --golden-n 20 \\
-      --sirchmunk-results benchmarks/hotpotqa/output/results_YYYYMMDD.jsonl \\
+    # 1. 导入竞品预测 JSONL + 本文结果 → 生成完整比较表格
+    python benchmarks/run_evaluation.py \
+      --benchmark hotpotqa \
+      --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+      --import-baseline "GPT-4o (zero-shot)=output/gpt4o_preds.jsonl" \
+      --import-baseline-setup "GPT-4o (zero-shot)=output/gpt4o_setup_metrics.json" \
+      --sirchmunk-results benchmarks/hotpotqa/output/results_YYYYMMDD.jsonl \
       --output-dir benchmarks/hotpotqa/output/paper_table/
 
-    # 2. 导入竞品预测 JSONL + 本文结果 → 生成完整比较表格
-    python benchmarks/run_evaluation.py \\
-      --benchmark hotpotqa \\
-      --env benchmarks/hotpotqa/.env.hotpotqa.frozen \\
-      --import-baseline "GPT-4o (zero-shot)=output/gpt4o_preds.jsonl" \\
-      --import-baseline-setup "GPT-4o (zero-shot)=output/gpt4o_setup_metrics.json" \\
-      --sirchmunk-results benchmarks/hotpotqa/output/results_YYYYMMDD.jsonl \\
-      --output-dir benchmarks/hotpotqa/output/paper_table/
-
-    # 3. 只填写已发表数字（不重新 Judge，直接写入表格）
+    # 2. 只填写已发表数字（不重新 Judge，直接写入表格）
     python benchmarks/run_evaluation.py \\
       --benchmark hotpotqa \\
       --env benchmarks/hotpotqa/.env.hotpotqa.frozen \\
@@ -33,7 +24,7 @@
       --sirchmunk-results benchmarks/hotpotqa/output/results_YYYYMMDD.jsonl \\
       --output-dir benchmarks/hotpotqa/output/paper_table/
 
-    # 4. 仅生成表格（不运行任何 baseline，纯汇聚已有结果）
+    # 3. 仅生成表格（不运行任何 baseline，纯汇聚已有结果）
     python benchmarks/run_evaluation.py \\
       --benchmark hotpotqa \\
       --env benchmarks/hotpotqa/.env.hotpotqa.frozen \\
@@ -105,7 +96,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sirchmunk-results", default=None, dest="sirchmunk_results",
                    help="本文系统（LENS/Sirchmunk）的结果 JSONL 文件路径")
     p.add_argument("--baselines", default="",
-                   help="运行的竞品列表（逗号分隔）: mock, gold_copy, random, bm25, naive_rag, lightrag_v1, graphrag")
+                   help="运行的竞品列表（逗号分隔）: bm25, naive_rag, lightrag_v1, graphrag")
     p.add_argument("--import-baseline", action="append", dest="import_baseline",
                    metavar="NAME=PATH",
                    help="导入预计算预测并重新 Judge（可多次）")
@@ -238,18 +229,14 @@ async def _main() -> int:
         )
         logger.info("本文系统: %d 条结果", len(sirchmunk_results))
 
-    # ── 运行 Mock / SDK 竞品 ─────────────────────────────────────────
+    # ── 运行真实 / SDK 竞品 ─────────────────────────────────────────
     if args.baselines and not args.table_only:
         from evaluation.suite import BaselineEvaluationSuite
         from baselines import (
-            ConstantMockBaseline,
-            FixedAccuracyMockBaseline,
-            GoldCopyMockBaseline,
             GraphRAGBaseline,
             LightRAGV1Baseline,
             LocalBM25Baseline,
             NaiveRAGBaseline,
-            RandomAnswerMockBaseline,
         )
 
         if golden_set is None:
@@ -261,17 +248,10 @@ async def _main() -> int:
                 n=args.golden_n,
             )
 
-        gold_map = golden_set.to_gold_map()
         baseline_list = []
         for bname in args.baselines.split(","):
             bname = bname.strip().lower()
-            if bname == "mock" or bname == "constant":
-                baseline_list.append(ConstantMockBaseline())
-            elif bname == "random":
-                baseline_list.append(RandomAnswerMockBaseline(seed=args.golden_seed))
-            elif bname == "gold_copy":
-                baseline_list.append(GoldCopyMockBaseline(gold_map=gold_map))
-            elif bname in ("bm25", "bm25_local"):
+            if bname in ("bm25", "bm25_local"):
                 baseline_list.append(LocalBM25Baseline(max_files=args.bm25_max_files))
             elif bname in ("naive_rag", "naive_rag_local"):
                 baseline_list.append(NaiveRAGBaseline(max_files=args.naive_rag_max_files))
@@ -284,15 +264,6 @@ async def _main() -> int:
                 baseline_list.append(GraphRAGBaseline(
                     predictions_path=args.graphrag_predictions,
                     setup_metrics_path=args.graphrag_setup_metrics,
-                ))
-            elif bname.startswith("fixed_acc_"):
-                # e.g. fixed_acc_30 → 30%
-                try:
-                    pct = int(bname.split("_")[-1]) / 100
-                except ValueError:
-                    pct = 0.3
-                baseline_list.append(FixedAccuracyMockBaseline(
-                    gold_map=gold_map, target_accuracy=pct, seed=args.golden_seed
                 ))
             else:
                 logger.warning("未知竞品名称: '%s'，跳过", bname)

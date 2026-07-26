@@ -10,7 +10,7 @@
 
 支持三类竞品输入：
   a. 实时 predict   : BaselineAdapter.predict() 在线调用
-  b. predict_by_id  : GoldCopyMock / FixedAccuracyMock / ManualImportAdapter
+  b. predict_by_id  : ManualImportAdapter 等按样本 ID 返回预计算预测
   c. 已有 JSONL     : 通过 ManualImportAdapter 预加载后走路径 b
 
 评估流程（单个竞品系统）：
@@ -50,7 +50,7 @@ class BaselineEvaluationSuite:
 
         from evaluation.suite import BaselineEvaluationSuite
         from evaluation.golden_set import GoldenSetManager
-        from baselines import ConstantMockBaseline, RandomAnswerMockBaseline
+        from baselines import LocalBM25Baseline, NaiveRAGBaseline
 
         # 准备 golden set
         manager = GoldenSetManager("benchmarks/hotpotqa")
@@ -58,8 +58,8 @@ class BaselineEvaluationSuite:
 
         # 定义竞品
         baselines = [
-            ConstantMockBaseline(),
-            RandomAnswerMockBaseline(seed=42),
+            LocalBM25Baseline(max_files=20000),
+            NaiveRAGBaseline(max_files=5000),
         ]
 
         # 运行
@@ -69,7 +69,6 @@ class BaselineEvaluationSuite:
             output_dir="benchmarks/hotpotqa/output/baselines/",
         )
         results = await suite.run(gs)
-        # results: {"constant_mock": [...], "random_mock": [...]}
     """
 
     def __init__(

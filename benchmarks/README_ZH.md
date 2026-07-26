@@ -4,6 +4,57 @@
 
 默认参考流程是 HotpotQA fullwiki，但该框架本身并不绑定某一个 benchmark。同一套生命周期也支持面向机制的实验，例如启动/预处理成本（setup cost）、数据新鲜度（freshness）、存储开销（storage overhead）、源数据保真度（source fidelity）和缓存复用（warm reuse）。
 
+## 快速开始：一键跑通真实全链路
+
+请先走这条路径。它会使用配置好的真实 LLM provider，验证本地完整链路：配置加载、HotpotQA 数据加载、检索、LLM 调用、指标聚合、artifact 生成和报告生成。
+
+### 第 0 步：安装依赖
+
+```bash
+pip install -r requirements/core.txt -r requirements/benchmarks.txt
+```
+
+`requirements/benchmarks.txt` 只放 benchmark 专用额外依赖，例如 HotpotQA fullwiki parquet 读取所需的 `pyarrow`。正常使用 Sirchmunk 不需要安装这些额外依赖。
+
+### 第 1 步：创建私有环境文件
+
+```bash
+cp benchmarks/.env.global.example benchmarks/.env.global
+cp benchmarks/hotpotqa/env.hotpotqa.base.example benchmarks/hotpotqa/.env.hotpotqa.base
+cp benchmarks/hotpotqa/env.hotpotqa.exploration.example benchmarks/hotpotqa/.env.hotpotqa.exploration
+# 然后编辑 benchmarks/.env.global，填写 LLM_API_KEY=<your-api-key>。
+```
+
+默认本地配置使用 DashScope 兼容的 Qwen：
+
+```text
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_MODEL_NAME=qwen3.7-plus
+```
+
+`LLM_API_KEY` 应写入被 git 忽略的私有文件 `benchmarks/.env.global`。Shell 环境变量仍可作为临时最高优先级覆盖，但推荐的持久配置方式是私有 env 文件。
+
+### 第 2 步：执行一个命令
+
+```bash
+python benchmarks/run_quickstart.py
+```
+
+这个命令会自动在 10 条 HotpotQA fullwiki 样本上运行配置好的真实 LLM，自动跳过交互式改进确认，定位最新 run artifact，并生成报告。默认使用 `--context-corpus-mode sample`，即把每条样本 parquet 中自带的 context 物化为临时原始文本文件，并筛选 context-answerable 的 smoke 样本，使 quickstart 拥有闭合检索语料。若要测试配置的 raw fullwiki 语料，请显式使用 `--context-corpus-mode wiki`。
+
+### 第 3 步：查看输出
+
+命令会打印最新的 `run_dir`、`metrics.json` 和 report 路径。典型产物包括：
+
+```text
+benchmarks/hotpotqa/output/exploration/runs/<run_id>/results/metrics.json
+benchmarks/hotpotqa/output/exploration/runs/<run_id>/results/predictions.jsonl
+benchmarks/hotpotqa/output/exploration/runs/<run_id>/reports/report.md
+benchmarks/hotpotqa/output/exploration/runs/<run_id>/reports/validation.json
+```
+
+Quickstart 属于 exploration smoke test。`quickstart_ok=True` 表示端到端运行无系统失败且成功检索到 supporting evidence；`paper_ready=False` 对 exploration run 是预期现象，因为论文级 report 需要 frozen stage 设置和 baseline comparison artifacts。
+
 ## 设计哲学
 
 benchmark 实验栈遵循 ResearchOps 哲学：每一个被报告的数字都应当能够从结构化 artifact 中复现、归因和证伪，而不是依赖日志片段或叙事性解释来重建。
@@ -30,6 +81,7 @@ benchmarks/
   storage_overhead/       # 机制 benchmark：存储开销
   source_fidelity/        # 机制 benchmark：原始来源可追溯性
   warm_reuse/             # 机制 benchmark：warm cache / 复用行为
+  run_quickstart.py       # 一键 HotpotQA smoke + report CLI
   run_queue.py            # P3 queue 和无人值守执行 CLI
   run_evaluation.py       # baseline 对比和论文表格 CLI
   run_lifecycle_eval.py   # full-corpus baseline 构建/索引可行性 CLI
@@ -40,9 +92,9 @@ benchmarks/
 
 支持的 benchmark 名称由 `framework/registry.py` 解析。当前名称包括 `hotpotqa`、`setup_cost`、`freshness`、`storage_overhead`、`source_fidelity` 和 `warm_reuse`。
 
-## 端到端流程
+## 高级论文实验流程
 
-推荐流程包含四个阶段。这些阶段被有意隔离，以防止探索性优化污染冻结后的论文评估。
+Quickstart 通过后，再使用下面的高级流程。这些阶段被有意隔离，以防止探索性优化污染冻结后的论文评估。
 
 ### 阶段 0：准备环境与数据
 
@@ -53,8 +105,7 @@ cp benchmarks/.env.global.example benchmarks/.env.global
 cp benchmarks/hotpotqa/env.hotpotqa.base.example benchmarks/hotpotqa/.env.hotpotqa.base
 cp benchmarks/hotpotqa/env.hotpotqa.exploration.example benchmarks/hotpotqa/.env.hotpotqa.exploration
 cp benchmarks/hotpotqa/env.hotpotqa.frozen.example benchmarks/hotpotqa/.env.hotpotqa.frozen
-cp benchmarks/hotpotqa/env.hotpotqa.mock.example benchmarks/hotpotqa/.env.hotpotqa.mock
-export LLM_API_KEY="..."
+# 然后编辑 benchmarks/.env.global，填写 LLM_API_KEY=<your-api-key>。
 ```
 
 HotpotQA 使用分层配置：
@@ -82,18 +133,18 @@ os.environ
 
 ```text
 # 方式 A：dataset 根目录
-HOTPOT_DATASET_DIR=/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset
+HOTPOT_DATASET_DIR=/path/to/hotpotqa_dataset
 HOTPOT_WIKI_CORPUS_DIRNAME=enwiki-20171001-pages-meta-current-withlinks-abstracts
 
-# 方式 B：直接指向 fullwiki parquet 目录（当前本地配置）
-HOTPOT_DATASET_DIR=/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset/fullwiki
-HOTPOT_WIKI_CORPUS_DIR=/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset/enwiki-20171001-pages-meta-current-withlinks-abstracts
+# 方式 B：直接指向 fullwiki parquet 目录
+HOTPOT_DATASET_DIR=/path/to/hotpotqa_dataset/fullwiki
+HOTPOT_WIKI_CORPUS_DIR=/path/to/hotpotqa_dataset/enwiki-20171001-pages-meta-current-withlinks-abstracts
 ```
 
-当前本地期望目录结构：
+期望目录结构：
 
 ```text
-/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset/
+/path/to/hotpotqa_dataset/
   fullwiki/
     validation-*.parquet
     test-*.parquet
@@ -104,32 +155,30 @@ HOTPOT_WIKI_CORPUS_DIR=/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dat
 
 exploration profile 用于冒烟测试和开发子集。frozen profile 仅用于论文级评估。base env 应承载共享配置；profile env 文件只保留阶段相关的覆盖项。
 
-无需外部 API 的 smoke test 可使用私有 env 开启 deterministic mock LLM：
+真实 LLM 运行时，将真实 `LLM_API_KEY` 写入被 git 忽略的私有文件 `benchmarks/.env.global`。Shell 环境变量仍可作为临时最高优先级覆盖，但推荐的持久配置方式是私有 env 文件。不要提交真实密钥。
 
-```text
-HOTPOT_MOCK_LLM=true
-LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-LLM_API_KEY=<your-api-key>
-LLM_MODEL_NAME=qwen3.7-plus
-```
+### 可选：手动 Smoke Test
 
-真实 LLM 运行时保持 `HOTPOT_MOCK_LLM=false`，并通过 shell 或私有 ignored env 文件设置真实 `LLM_API_KEY`，不要提交真实密钥。
-
-### Mock Smoke Test（不调用外部 LLM）
-
-使用被 git 忽略的私有 mock profile，可在 10 条样本上验证 runner / retrieval / judge / artifact 全链路：
+推荐入口是 `run_quickstart.py`。如果需要调试底层命令，可以手动执行等价的 smoke run：
 
 ```bash
 printf 'skip\n' | python benchmarks/run_research_loop.py \
   --benchmark hotpotqa \
-  --env benchmarks/hotpotqa/.env.hotpotqa.mock \
+  --env benchmarks/hotpotqa/.env.hotpotqa.exploration \
   --limit 10 \
   --max-iter 1 \
   --dry-run \
   --log-level INFO
 ```
 
-Mock run 的目标不是答案正确率；mock LLM 是确定性占位模型，预期 accuracy 可能为 0。成功标准是链路完整跑通：10/10 样本完成、corpus validation 通过、predictions/metrics/artifacts 写出、BadCase 分析生成。
+然后手动生成报告：
+
+```bash
+python benchmarks/run_report.py \
+  --run-dir benchmarks/hotpotqa/output/exploration/runs/<run_id> \
+  --output-dir benchmarks/hotpotqa/output/exploration/runs/<run_id>/reports \
+  --title "HotpotQA Quickstart Smoke Test Report"
+```
 
 ### 阶段 1：探索或冒烟运行
 

@@ -132,7 +132,7 @@ class KeywordSearchTool(BaseTool):
     """
 
     # Default patterns that should always be excluded from keyword search
-    _DEFAULT_EXCLUDE: List[str] = ["*.pyc", "*.log", "__pycache__"]
+    _DEFAULT_EXCLUDE: List[str] = ["*.pyc", "*.log", "__pycache__", ".DS_Store", "._*"]
 
     def __init__(
         self,
