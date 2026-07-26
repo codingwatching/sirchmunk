@@ -53,6 +53,7 @@ cp benchmarks/.env.global.example benchmarks/.env.global
 cp benchmarks/hotpotqa/env.hotpotqa.base.example benchmarks/hotpotqa/.env.hotpotqa.base
 cp benchmarks/hotpotqa/env.hotpotqa.exploration.example benchmarks/hotpotqa/.env.hotpotqa.exploration
 cp benchmarks/hotpotqa/env.hotpotqa.frozen.example benchmarks/hotpotqa/.env.hotpotqa.frozen
+cp benchmarks/hotpotqa/env.hotpotqa.mock.example benchmarks/hotpotqa/.env.hotpotqa.mock
 export LLM_API_KEY="..."
 ```
 
@@ -77,17 +78,58 @@ Loading priority is:
 .env.global < .env.hotpotqa.base < profile env < os.environ
 ```
 
-For HotpotQA fullwiki, configure the dataset and corpus paths in `.env.hotpotqa.base`. The dataset directory should contain both the parquet split and the Wikipedia corpus directory referenced by that base env file.
+For HotpotQA fullwiki, configure the dataset and corpus paths in `.env.hotpotqa.base`. `HOTPOT_DATASET_DIR` can point either to the dataset root or directly to the `fullwiki/` parquet directory. When it points directly to `fullwiki/`, set `HOTPOT_WIKI_CORPUS_DIR` to the raw Wikipedia corpus directory explicitly.
 
 ```text
-HOTPOT_DATASET_DIR/
+# Option A: dataset root
+HOTPOT_DATASET_DIR=/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset
+HOTPOT_WIKI_CORPUS_DIRNAME=enwiki-20171001-pages-meta-current-withlinks-abstracts
+
+# Option B: direct fullwiki parquet directory (current local setup)
+HOTPOT_DATASET_DIR=/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset/fullwiki
+HOTPOT_WIKI_CORPUS_DIR=/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset/enwiki-20171001-pages-meta-current-withlinks-abstracts
+```
+
+Expected local layout:
+
+```text
+/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset/
   fullwiki/
     validation-*.parquet
+    test-*.parquet
+    train-*.parquet
   enwiki-20171001-pages-meta-current-withlinks-abstracts/
     ... raw wiki files ...
 ```
 
 Use the exploration profile for smoke tests and development subsets. Use the frozen profile for paper-grade evaluation only. The base env should contain shared settings; profile env files should only contain stage-specific overrides.
+
+For a no-API smoke test, enable the deterministic mock LLM in a private env file:
+
+```text
+HOTPOT_MOCK_LLM=true
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_API_KEY=<your-api-key>
+LLM_MODEL_NAME=qwen3.7-plus
+```
+
+For real LLM runs, keep `HOTPOT_MOCK_LLM=false` and set the real `LLM_API_KEY` via shell or a private ignored env file; never commit real secrets.
+
+### Mock Smoke Test (No External LLM Calls)
+
+Use the ignored private mock profile to verify the full runner/retrieval/judge/artifact chain on 10 samples:
+
+```bash
+printf 'skip\n' | python benchmarks/run_research_loop.py \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.mock \
+  --limit 10 \
+  --max-iter 1 \
+  --dry-run \
+  --log-level INFO
+```
+
+The mock run is expected to have low or zero answer accuracy because the mock LLM is deterministic and not semantically correct. The success criterion is pipeline completion: 10/10 samples executed, corpus validation passed, predictions/metrics/artifacts written, and BadCase analysis generated.
 
 ### Stage 1: Exploration Or Smoke Runs
 

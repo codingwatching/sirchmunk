@@ -167,6 +167,7 @@ class HotpotQAAdapter(BenchmarkAdapter):
             "enable_gpt_eval":  self._get_bool("HOTPOT_ENABLE_GPT_EVAL", False),
             "llm_model":        self._get("LLM_MODEL_NAME", ""),
             "llm_base_url":     self._get("LLM_BASE_URL", ""),
+            "mock_llm":         self._get_bool("HOTPOT_MOCK_LLM", False),
             "max_concurrent":   self._get_int("HOTPOT_MAX_CONCURRENT", 3),
             "setting":          self._get("HOTPOT_SETTING", "fullwiki"),
             "split":            self._get("HOTPOT_SPLIT", "validation"),
@@ -194,14 +195,18 @@ class HotpotQAAdapter(BenchmarkAdapter):
         与 FinanceBenchAdapter 的 .work 完全隔离。
         """
         if self._searcher is None:
-            from sirchmunk.llm.openai_chat import OpenAIChat
             from sirchmunk.search import AgenticSearch
 
-            llm = OpenAIChat(
-                api_key=self._get("LLM_API_KEY", ""),
-                base_url=self._get("LLM_BASE_URL", "https://api.openai.com/v1"),
-                model=self._get("LLM_MODEL_NAME", "gpt-4o-mini"),
-            )
+            if self._get_bool("HOTPOT_MOCK_LLM", False):
+                from hotpotqa.mock_llm import MockHotpotLLM
+                llm = MockHotpotLLM(model=self._get("LLM_MODEL_NAME", "mock-hotpot-llm"))
+            else:
+                from sirchmunk.llm.openai_chat import OpenAIChat
+                llm = OpenAIChat(
+                    api_key=self._get("LLM_API_KEY", ""),
+                    base_url=self._get("LLM_BASE_URL", "https://api.openai.com/v1"),
+                    model=self._get("LLM_MODEL_NAME", "gpt-4o-mini"),
+                )
             self._searcher = AgenticSearch(
                 llm=llm,
                 work_path=self.get_work_path(),  # 使用隔离后的绝对路径
@@ -330,6 +335,7 @@ class HotpotQAAdapter(BenchmarkAdapter):
 
     def _wiki_dir(self) -> str:
         dataset_dir = Path(self._get("HOTPOT_DATASET_DIR", ""))
+        setting = self._get("HOTPOT_SETTING", "fullwiki")
         wiki_dir_override = self._get("HOTPOT_WIKI_CORPUS_DIR", "")
         if wiki_dir_override:
             return wiki_dir_override
@@ -337,4 +343,8 @@ class HotpotQAAdapter(BenchmarkAdapter):
             "HOTPOT_WIKI_CORPUS_DIRNAME",
             "enwiki-20171001-pages-meta-current-withlinks-abstracts",
         )
+        # Support HOTPOT_DATASET_DIR pointing either to the dataset root or
+        # directly to the setting directory (e.g. .../hotpotqa_dataset/fullwiki).
+        if dataset_dir.name == setting and (dataset_dir.parent / wiki_dirname).exists():
+            return str(dataset_dir.parent / wiki_dirname)
         return str(dataset_dir / wiki_dirname)

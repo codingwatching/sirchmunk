@@ -18,7 +18,7 @@ def load_hotpotqa_samples(
     limit: int = 0,
     seed: int = 42,
 ) -> List[BenchmarkSample]:
-    parquet_dir = dataset_dir / setting
+    parquet_dir = _resolve_parquet_dir(dataset_dir, setting)
     if not parquet_dir.exists():
         raise FileNotFoundError(f"HotpotQA dataset directory not found: {parquet_dir}")
     parquet_files = sorted(parquet_dir.glob(f"{split}*.parquet"))
@@ -64,7 +64,7 @@ def validate_hotpotqa_corpus(wiki_dir: Path) -> Tuple[int, List[str]]:
 
 
 def build_dataset_manifest(dataset_dir: Path, wiki_dir: Path, *, setting: str, split: str) -> Dict[str, Any]:
-    parquet_dir = dataset_dir / setting
+    parquet_dir = _resolve_parquet_dir(dataset_dir, setting)
     parquet_files = sorted(parquet_dir.glob(f"{split}*.parquet")) if parquet_dir.exists() else []
     manifest = {
         "dataset_dir": str(dataset_dir),
@@ -89,6 +89,21 @@ def build_dataset_manifest(dataset_dir: Path, wiki_dir: Path, *, setting: str, s
             "corpus_validation_level": "directory_exists_with_sampled_stats",
         })
     return manifest
+
+
+def _resolve_parquet_dir(dataset_dir: Path, setting: str) -> Path:
+    """Resolve parquet directory from either dataset root or setting directory.
+
+    Supported layouts:
+    - HOTPOT_DATASET_DIR=/path/hotpotqa_dataset with /fullwiki/*.parquet
+    - HOTPOT_DATASET_DIR=/path/hotpotqa_dataset/fullwiki directly
+    """
+    direct = dataset_dir / setting
+    if direct.exists():
+        return direct
+    if dataset_dir.name == setting and list(dataset_dir.glob("*.parquet")):
+        return dataset_dir
+    return direct
 
 
 def _json_safe(value: Any) -> Any:

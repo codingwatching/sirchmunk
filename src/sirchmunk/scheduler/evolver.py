@@ -25,8 +25,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-import igraph as ig
-import leidenalg
+try:
+    import igraph as ig
+    import leidenalg
+except ImportError:  # Optional: only required for meta-cluster detection.
+    ig = None
+    leidenalg = None
 
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import (
@@ -441,6 +445,11 @@ class KnowledgeEvolver:
         For each community, if the number of clusters exceeds a threshold, a meta cluster
         is created to represent the community to reduce complexity during search.       
         """
+        if ig is None or leidenalg is None:
+            await self._log.warning(
+                "[Evolver] igraph/leidenalg not installed; skipping meta-cluster detection"
+            )
+            return
         # Before running the meta cluster detection, we need to clean up existing meta clusters
         self._cleanup_meta_clusters()
         non_meta_cluster_count = self._get_non_meta_cluster_count()

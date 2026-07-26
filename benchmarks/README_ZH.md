@@ -53,6 +53,7 @@ cp benchmarks/.env.global.example benchmarks/.env.global
 cp benchmarks/hotpotqa/env.hotpotqa.base.example benchmarks/hotpotqa/.env.hotpotqa.base
 cp benchmarks/hotpotqa/env.hotpotqa.exploration.example benchmarks/hotpotqa/.env.hotpotqa.exploration
 cp benchmarks/hotpotqa/env.hotpotqa.frozen.example benchmarks/hotpotqa/.env.hotpotqa.frozen
+cp benchmarks/hotpotqa/env.hotpotqa.mock.example benchmarks/hotpotqa/.env.hotpotqa.mock
 export LLM_API_KEY="..."
 ```
 
@@ -77,17 +78,58 @@ os.environ
 .env.global < .env.hotpotqa.base < profile env < os.environ
 ```
 
-对于 HotpotQA fullwiki，请在 `.env.hotpotqa.base` 中配置数据集和语料路径。数据集目录应同时包含 parquet split 和该 base env 文件所引用的 Wikipedia 语料目录。
+对于 HotpotQA fullwiki，请在 `.env.hotpotqa.base` 中配置数据集和语料路径。`HOTPOT_DATASET_DIR` 可以指向 dataset 根目录，也可以直接指向 `fullwiki/` parquet 目录；若直接指向 `fullwiki/`，请显式设置 `HOTPOT_WIKI_CORPUS_DIR` 到 raw Wikipedia 语料目录。
 
 ```text
-HOTPOT_DATASET_DIR/
+# 方式 A：dataset 根目录
+HOTPOT_DATASET_DIR=/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset
+HOTPOT_WIKI_CORPUS_DIRNAME=enwiki-20171001-pages-meta-current-withlinks-abstracts
+
+# 方式 B：直接指向 fullwiki parquet 目录（当前本地配置）
+HOTPOT_DATASET_DIR=/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset/fullwiki
+HOTPOT_WIKI_CORPUS_DIR=/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset/enwiki-20171001-pages-meta-current-withlinks-abstracts
+```
+
+当前本地期望目录结构：
+
+```text
+/Users/jason/work/github/sirchmunk_work/data/hotpotqa_dataset/
   fullwiki/
     validation-*.parquet
+    test-*.parquet
+    train-*.parquet
   enwiki-20171001-pages-meta-current-withlinks-abstracts/
     ... raw wiki files ...
 ```
 
 exploration profile 用于冒烟测试和开发子集。frozen profile 仅用于论文级评估。base env 应承载共享配置；profile env 文件只保留阶段相关的覆盖项。
+
+无需外部 API 的 smoke test 可使用私有 env 开启 deterministic mock LLM：
+
+```text
+HOTPOT_MOCK_LLM=true
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_API_KEY=<your-api-key>
+LLM_MODEL_NAME=qwen3.7-plus
+```
+
+真实 LLM 运行时保持 `HOTPOT_MOCK_LLM=false`，并通过 shell 或私有 ignored env 文件设置真实 `LLM_API_KEY`，不要提交真实密钥。
+
+### Mock Smoke Test（不调用外部 LLM）
+
+使用被 git 忽略的私有 mock profile，可在 10 条样本上验证 runner / retrieval / judge / artifact 全链路：
+
+```bash
+printf 'skip\n' | python benchmarks/run_research_loop.py \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.mock \
+  --limit 10 \
+  --max-iter 1 \
+  --dry-run \
+  --log-level INFO
+```
+
+Mock run 的目标不是答案正确率；mock LLM 是确定性占位模型，预期 accuracy 可能为 0。成功标准是链路完整跑通：10/10 样本完成、corpus validation 通过、predictions/metrics/artifacts 写出、BadCase 分析生成。
 
 ### 阶段 1：探索或冒烟运行
 
