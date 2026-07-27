@@ -107,7 +107,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--baselines", default="",
                    help=(
                        "运行的竞品列表（逗号分隔）: "
-                       "bm25, bm25_rag, react, naive_rag, lightrag_v1, graphrag, "
+                       "bm25, bm25_rag, react, naive_rag, lightrag_v1, lightrag_v136, graphrag, "
                        "lens_full, lens_no_prior, lens_no_seq, lens_no_reuse, or module:factory"
                    ))
     p.add_argument("--import-baseline", action="append", dest="import_baseline",
@@ -157,6 +157,15 @@ def _parse_args() -> argparse.Namespace:
                    help="LightRAG v1 预计算预测 JSONL 路径")
     p.add_argument("--lightrag-setup-metrics", default="", dest="lightrag_setup_metrics",
                    help="LightRAG v1 setup metrics JSON 路径")
+    p.add_argument("--lightrag-query-mode", default="hybrid", dest="lightrag_query_mode",
+                   choices=["naive", "local", "global", "hybrid", "mix"],
+                   help="LightRAG v1.3.6 SDK baseline query mode，默认 hybrid")
+    p.add_argument("--lightrag-working-dir", default="", dest="lightrag_working_dir",
+                   help="LightRAG v1.3.6 working_dir；为空时按benchmark/stage work_path隔离")
+    p.add_argument("--lightrag-max-files", type=int, default=0, dest="lightrag_max_files",
+                   help="LightRAG v1.3.6 最多索引文件数，0=不限制")
+    p.add_argument("--lightrag-max-file-chars", type=int, default=300000, dest="lightrag_max_file_chars",
+                   help="LightRAG v1.3.6 单文件最大读取字符数")
     p.add_argument("--graphrag-predictions", default="", dest="graphrag_predictions",
                    help="GraphRAG 预计算预测 JSONL 路径")
     p.add_argument("--graphrag-setup-metrics", default="", dest="graphrag_setup_metrics",
@@ -414,6 +423,7 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None
     from baselines import (
         BM25RAGBaseline,
         GraphRAGBaseline,
+        LightRAGV136Baseline,
         LightRAGV1Baseline,
         LocalBM25Baseline,
         NaiveRAGBaseline,
@@ -434,6 +444,18 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None
         return LightRAGV1Baseline(
             predictions_path=args.lightrag_predictions,
             setup_metrics_path=args.lightrag_setup_metrics,
+        )
+    if lower in ("lightrag_v136", "lightrag_136", "lightrag_sdk", "lightrag_hybrid") or lower.startswith("lightrag_v136_"):
+        mode = args.lightrag_query_mode
+        for candidate in ("naive", "local", "global", "hybrid", "mix"):
+            if lower.endswith("_" + candidate):
+                mode = candidate
+                break
+        return LightRAGV136Baseline(
+            query_mode=mode,
+            working_dir=args.lightrag_working_dir,
+            max_files=args.lightrag_max_files,
+            max_file_chars=args.lightrag_max_file_chars,
         )
     if lower == "graphrag":
         return GraphRAGBaseline(
@@ -468,7 +490,7 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None
         return baseline
     raise ValueError(
         "Unknown baseline. Use bm25, bm25_rag, react, naive_rag, lightrag_v1, "
-        "graphrag, lens_no_prior, lens_no_seq, lens_no_reuse, or module:factory."
+        "lightrag_v136, graphrag, lens_no_prior, lens_no_seq, lens_no_reuse, or module:factory."
     )
 
 

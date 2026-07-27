@@ -40,6 +40,14 @@ pip install -r requirements/core.txt -r requirements/benchmarks.txt
 
 `requirements/benchmarks.txt` contains benchmark-only extras such as `pyarrow` for HotpotQA fullwiki parquet files. Normal Sirchmunk usage does not require these extras.
 
+LightRAG v1.3.6 is an optional related-work baseline. Install it only when you want to reproduce the LightRAG lifecycle rows:
+
+```bash
+pip install git+https://github.com/HKUDS/LightRAG.git@v1.3.6
+```
+
+The LightRAG adapter uses OpenAI-compatible LLM and embedding calls through the LightRAG SDK. Keep provider credentials in `benchmarks/.env.global` or shell environment variables, not in committed files.
+
 ## Prepare Private Environments
 
 Create private env files from examples and never commit secrets:
@@ -397,6 +405,68 @@ python benchmarks/run_benchmark.py assets update-readiness \
 
 Report scaling and update cost separately from warm-query accuracy. A system whose full-corpus index is not `READY` should not appear as a warm-query quality baseline without an explicit feasibility caveat.
 
+## Related-Work Lifecycle Baselines
+
+LightRAG v1.3.6 is supported as an index-heavy related-work baseline, not as a stateless QA API. It builds a LightRAG `working_dir` for each `D_n/documents` snapshot, records setup/index/storage metrics, and reports `rebuild_required=true` for dynamic corpus updates.
+
+Use `lightrag_v136` for the SDK-backed lifecycle reproduction:
+
+```bash
+python benchmarks/run_dynamic_evaluation.py \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --golden-n 2000 \
+  --stages 500,1000,2000 \
+  --materialize symlink \
+  --run-baselines \
+  --baselines lightrag_v136 \
+  --lightrag-query-mode hybrid
+```
+
+For appendix sensitivity analysis, run individual query modes:
+
+```bash
+python benchmarks/run_dynamic_evaluation.py \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --golden-n 2000 \
+  --stages 500,1000,2000 \
+  --materialize symlink \
+  --run-baselines \
+  --baselines lightrag_v136_naive,lightrag_v136_local,lightrag_v136_global,lightrag_v136_hybrid,lightrag_v136_mix
+```
+
+Manual single-GoldenSet evaluation is also available:
+
+```bash
+python benchmarks/run_evaluation.py \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --baselines lightrag_v136 \
+  --lightrag-query-mode hybrid \
+  --sampling-method stratified \
+  --golden-n 2000 \
+  --strata type,supporting_fact_bucket
+```
+
+`lightrag_v1` remains the imported-prediction baseline for externally produced LightRAG predictions and setup metrics. Use `lightrag_v136` when the benchmark runner should build the index locally and account for lifecycle cost.
+
+LightRAG lifecycle fields to inspect:
+
+```text
+setup_seconds
+index_build_seconds
+storage_bytes
+indexed_documents / expected_documents
+partial_index
+rebuild_required
+query_ready_immediately
+query_mode
+working_dir
+```
+
+For v4 paper claims, LightRAG should be reported in related-work / lifecycle / appendix tables. It is not part of the minimal main table unless the experiment explicitly expands the baseline scope.
+
 ## Advanced Direct Scripts
 
 The direct scripts remain available for debugging and backward compatibility. Prefer `run_benchmark.py` for normal workflows.
@@ -408,6 +478,7 @@ The direct scripts remain available for debugging and backward compatibility. Pr
 | `run_lifecycle_eval.py` | `assets` | Legacy lifecycle experiments |
 | `run_scaling_study.py` | `assets scaling` | Legacy scaling runs |
 | `run_evaluation.py` | `main` | Manual table assembly |
+| `run_dynamic_evaluation.py` | v4 dynamic protocol | Build `G_n/D_n` snapshots and optional dynamic baselines |
 | `run_report.py` | `report` | Manual report regeneration |
 | `run_queue.py` | `queue` | Low-level queue debugging |
 | `run_research_loop.py` | `smoke-tune` | Exploration and badcase tuning |
@@ -500,4 +571,6 @@ Do not write sampled results as full benchmark results. Published full-benchmark
 - `Gate 3` fails: verify `stage=frozen`, `cache-mode cold|compiled`, and disabled eval feedback/memory updates.
 - `Gate 5` fails: regenerate the report with `run_benchmark.py report` and inspect validator errors.
 - Env file missing: create the private profile from examples and keep secrets in ignored files.
+- LightRAG v1.3.6 skipped: install `lightrag-hku` or the `v1.3.6` Git ref, then rerun with `--baselines lightrag_v136`.
+- LightRAG partial index: inspect `working_dir`, `indexed_documents`, `expected_documents`, and the stage `D_n/documents` snapshot.
 - Imported baseline coverage low: ensure the JSONL contains one prediction for every frozen sample ID.

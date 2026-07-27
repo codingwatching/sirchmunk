@@ -55,7 +55,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-missing-evidence", action="store_true", help="Allow snapshots with unresolved evidence titles; not for main-table runs")
     parser.add_argument("--force-recreate-golden", action="store_true")
     parser.add_argument("--run-baselines", action="store_true", help="Run built-in baselines for each G/D stage")
-    parser.add_argument("--baselines", default="bm25_rag,react", help="Comma separated: bm25_rag,react,lens_full,lens_no_prior,lens_no_seq")
+    parser.add_argument("--baselines", default="bm25_rag,react", help="Comma separated: bm25_rag,react,lens_full,lens_no_prior,lens_no_seq,lightrag_v136")
+    parser.add_argument("--lightrag-query-mode", default="hybrid", choices=["naive", "local", "global", "hybrid", "mix"], help="Default LightRAG v1.3.6 query mode")
+    parser.add_argument("--lightrag-max-files", type=int, default=0, help="LightRAG v1.3.6 max indexed files, 0=unlimited")
+    parser.add_argument("--lightrag-max-file-chars", type=int, default=300000, help="LightRAG v1.3.6 max chars per indexed file")
     parser.add_argument("--skip-existing", action="store_true", help="Reuse existing per-stage baseline JSONL when present")
     return parser.parse_args()
 
@@ -192,7 +195,7 @@ async def _run_baselines_for_bindings(args, base_adapter, golden_set, bindings, 
         stage_adapter = _StageAdapter(base_adapter, binding)
         stage_samples = _select_sample_dicts(golden_set.samples, _load_sample_ids(binding.sample_ids_file))
         stage_golden = _StageGoldenSet(stage_samples, binding)
-        baselines = [_baseline_by_name(spec, stage_adapter) for spec in baseline_specs]
+        baselines = [_baseline_by_name(spec, stage_adapter, args) for spec in baseline_specs]
         baseline_dir = Path(binding.output_dir) / "baselines"
         records_dir = Path(binding.output_dir) / "stage_records"
         records_dir.mkdir(parents=True, exist_ok=True)
@@ -321,7 +324,7 @@ class _StageAdapter:
         )
 
 
-def _baseline_by_name(spec: str, bm_adapter):
+def _baseline_by_name(spec: str, bm_adapter, args=None):
     lower = spec.strip().lower().replace("-", "_")
     if lower in {"bm25_rag", "rag_bm25"}:
         from baselines import BM25RAGBaseline
@@ -332,6 +335,18 @@ def _baseline_by_name(spec: str, bm_adapter):
     if lower in {"lens_full", "full", "lens_no_prior", "no_prior", "lens_no_seq", "no_seq"}:
         from ablations import build_single_lens_ablation
         return build_single_lens_ablation(bm_adapter, profile_name=lower)
+    if lower in {"lightrag_v136", "lightrag_136", "lightrag_sdk", "lightrag_hybrid"} or lower.startswith("lightrag_v136_"):
+        from baselines import LightRAGV136Baseline
+        mode = getattr(args, "lightrag_query_mode", "hybrid") if args is not None else "hybrid"
+        for candidate in ("naive", "local", "global", "hybrid", "mix"):
+            if lower.endswith("_" + candidate):
+                mode = candidate
+                break
+        return LightRAGV136Baseline(
+            query_mode=mode,
+            max_files=getattr(args, "lightrag_max_files", 0) if args is not None else 0,
+            max_file_chars=getattr(args, "lightrag_max_file_chars", 300000) if args is not None else 300000,
+        )
     raise ValueError(f"Unsupported v4 baseline: {spec}")
 
 
