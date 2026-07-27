@@ -11,7 +11,7 @@ import re
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .base_adapter import BaselineAdapter, BaselinePrediction, BaselineSetupResult
 
@@ -25,12 +25,16 @@ class LocalBM25Baseline(BaselineAdapter):
         max_files: int = 20000,
         max_file_bytes: int = 256_000,
         top_k: int = 5,
+        llm: Optional[Any] = None,
+        use_llm_synthesis: bool = True,
         name: str = "bm25_local",
-        citation_name: str = "BM25 (local lexical)",
+        citation_name: str = "BM25 + LLM (local)",
     ) -> None:
         self._max_files = max_files
         self._max_file_bytes = max_file_bytes
         self._top_k = top_k
+        self._llm = llm
+        self._use_llm_synthesis = use_llm_synthesis
         self._name = name
         self._citation = citation_name
         self._docs: List[Dict[str, Any]] = []
@@ -48,6 +52,11 @@ class LocalBM25Baseline(BaselineAdapter):
 
     async def prepare(self, golden_set: Any = None, bm_adapter: Any = None) -> BaselineSetupResult:
         start = time.monotonic()
+        if self._llm is None and bm_adapter is not None:
+            try:
+                self._llm = bm_adapter.build_searcher().llm
+            except Exception:
+                self._llm = None
         paths = _collect_context_paths(golden_set, bm_adapter)
         docs = []
         corpus_bytes = 0
@@ -73,7 +82,12 @@ class LocalBM25Baseline(BaselineAdapter):
             index_build_seconds=elapsed,
             storage_bytes=corpus_bytes,
             indexed_documents=len(docs),
-            metadata={"max_files": self._max_files, "max_file_bytes": self._max_file_bytes, "top_k": self._top_k},
+            metadata={
+                "max_files": self._max_files,
+                "max_file_bytes": self._max_file_bytes,
+                "top_k": self._top_k,
+                "llm_synthesis_enabled": bool(self._use_llm_synthesis and self._llm is not None),
+            },
         )
         return self._setup
 
@@ -87,15 +101,27 @@ class LocalBM25Baseline(BaselineAdapter):
             key=lambda x: x[0],
             reverse=True,
         )[: self._top_k]
-        best_text = _best_sentence(question, [doc["text"] for score, doc in ranked if score > 0])
-        answer = best_text or "No lexical BM25 evidence found."
+        evidence_texts = [doc["text"][:1800] for score, doc in ranked if score > 0]
+        top_paths = [doc["path"] for score, doc in ranked if score > 0]
+        fallback = _best_sentence(question, [doc["text"] for score, doc in ranked if score > 0]) or "No lexical BM25 evidence found."
+        answer, tokens = await _synthesize_answer(
+            self._llm if self._use_llm_synthesis else None,
+            question,
+            evidence_texts,
+            fallback=fallback,
+            source="BM25",
+        )
         return BaselinePrediction(
             answer=answer,
             elapsed=time.monotonic() - start,
-            tokens_used=0,
+            tokens_used=tokens,
             metadata={
                 "baseline_type": "bm25",
+                "llm_synthesis_used": bool(tokens),
                 "top_docs": [{"path": doc["path"], "score": score} for score, doc in ranked],
+                "read_file_ids": top_paths,
+                "evidence_sources": top_paths,
+                "evidence_snippets": evidence_texts,
                 "setup_metrics": self.collect_setup_metrics(),
             },
         )
@@ -112,13 +138,17 @@ class NaiveRAGBaseline(BaselineAdapter):
         chunk_overlap: int = 40,
         max_files: int = 5000,
         max_chunks: int = 50000,
+        llm: Optional[Any] = None,
+        use_llm_synthesis: bool = True,
         name: str = "naive_rag_local",
-        citation_name: str = "Naive RAG (chunk lexical)",
+        citation_name: str = "Naive RAG + LLM (chunk lexical)",
     ) -> None:
         self._chunk_words = chunk_words
         self._chunk_overlap = chunk_overlap
         self._max_files = max_files
         self._max_chunks = max_chunks
+        self._llm = llm
+        self._use_llm_synthesis = use_llm_synthesis
         self._chunks: List[Dict[str, Any]] = []
         self._name = name
         self._citation = citation_name
@@ -134,6 +164,11 @@ class NaiveRAGBaseline(BaselineAdapter):
 
     async def prepare(self, golden_set: Any = None, bm_adapter: Any = None) -> BaselineSetupResult:
         start = time.monotonic()
+        if self._llm is None and bm_adapter is not None:
+            try:
+                self._llm = bm_adapter.build_searcher().llm
+            except Exception:
+                self._llm = None
         paths = _collect_context_paths(golden_set, bm_adapter)
         chunks: List[Dict[str, Any]] = []
         bytes_read = 0
@@ -163,7 +198,12 @@ class NaiveRAGBaseline(BaselineAdapter):
             index_build_seconds=elapsed,
             storage_bytes=bytes_read,
             indexed_documents=len(chunks),
-            metadata={"chunk_words": self._chunk_words, "chunk_overlap": self._chunk_overlap, "max_chunks": self._max_chunks},
+            metadata={
+                "chunk_words": self._chunk_words,
+                "chunk_overlap": self._chunk_overlap,
+                "max_chunks": self._max_chunks,
+                "llm_synthesis_enabled": bool(self._use_llm_synthesis and self._llm is not None),
+            },
         )
         return self._setup
 
@@ -177,14 +217,27 @@ class NaiveRAGBaseline(BaselineAdapter):
             key=lambda x: x[0],
             reverse=True,
         )[:5]
-        answer = ranked[0][1]["text"][:1000] if ranked and ranked[0][0] > 0 else "No chunk evidence found."
+        evidence_texts = [chunk["text"][:1800] for score, chunk in ranked if score > 0]
+        top_paths = [chunk["path"] for score, chunk in ranked if score > 0]
+        fallback = ranked[0][1]["text"][:1000] if ranked and ranked[0][0] > 0 else "No chunk evidence found."
+        answer, tokens = await _synthesize_answer(
+            self._llm if self._use_llm_synthesis else None,
+            question,
+            evidence_texts,
+            fallback=fallback,
+            source="Naive RAG",
+        )
         return BaselinePrediction(
             answer=answer,
             elapsed=time.monotonic() - start,
-            tokens_used=0,
+            tokens_used=tokens,
             metadata={
                 "baseline_type": "naive_rag_chunk_lexical",
+                "llm_synthesis_used": bool(tokens),
                 "top_chunks": [{"path": chunk["path"], "score": score} for score, chunk in ranked],
+                "read_file_ids": top_paths,
+                "evidence_sources": top_paths,
+                "evidence_snippets": evidence_texts,
                 "setup_metrics": self.collect_setup_metrics(),
             },
         )
@@ -277,6 +330,47 @@ def _setup_to_dict(setup: BaselineSetupResult) -> Dict[str, Any]:
         "indexed_documents": setup.indexed_documents,
         "metadata": setup.metadata,
     }
+
+
+async def _synthesize_answer(
+    llm: Optional[Any],
+    question: str,
+    evidence_texts: List[str],
+    *,
+    fallback: str,
+    source: str,
+) -> Tuple[str, int]:
+    """Use the shared benchmark LLM for lightweight answer synthesis when available."""
+    if llm is None or not evidence_texts:
+        return fallback, 0
+    evidence = "\n\n---\n\n".join(
+        f"[Evidence {idx}]\n{text[:1600]}"
+        for idx, text in enumerate(evidence_texts[:5], 1)
+        if text.strip()
+    )
+    if not evidence.strip():
+        return fallback, 0
+    prompt = f"""You are a HotpotQA answerer using retrieved evidence from {source}.
+
+Question:
+{question}
+
+Retrieved evidence:
+{evidence}
+
+Instructions:
+- Answer using only the retrieved evidence.
+- Return a concise final answer span, not a paragraph.
+- If the evidence is insufficient, return the best supported short answer rather than a refusal.
+"""
+    try:
+        resp = await llm.achat(messages=[{"role": "user", "content": prompt}], stream=False)
+        answer = (getattr(resp, "content", "") or "").strip()
+        usage = getattr(resp, "usage", {}) or {}
+        tokens = int(usage.get("total_tokens", 0) or 0) if isinstance(usage, dict) else 0
+        return (answer or fallback), tokens
+    except Exception:
+        return fallback, 0
 
 
 class _SinglePathAdapter:

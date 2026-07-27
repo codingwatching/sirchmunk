@@ -448,10 +448,14 @@ def _merge_prediction_telemetry(telemetry: Dict[str, Any], metadata: Dict[str, A
             value = source.get(key) if isinstance(source, dict) else None
             if value and not telemetry.get(key):
                 telemetry[key] = value
-    top_chunks = metadata.get("top_chunks")
-    if isinstance(top_chunks, list):
+    top_items = []
+    for key in ("top_chunks", "top_docs"):
+        value = metadata.get(key)
+        if isinstance(value, list):
+            top_items.extend(value)
+    if top_items:
         paths = []
-        for item in top_chunks:
+        for item in top_items:
             if isinstance(item, dict) and item.get("path"):
                 paths.append(str(item["path"]))
         if paths:

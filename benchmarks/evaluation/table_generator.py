@@ -418,8 +418,8 @@ class PaperTableGenerator:
         include_setup = any(e.setup_metrics for e in entries)
         include_import = any(e.imported_baseline for e in entries)
         include_failures = any(e.failure_counts for e in entries)
-        cols = ["l", "r", "r"]
-        headers = ["System", "Accuracy (\\%)", "Coverage (\\%)"]
+        cols = ["l", "r", "r", "r", "r", "r", "r"]
+        headers = ["System", "Accuracy (\\%)", "EM (\\%)", "F1 (\\%)", "LLM Acc. (\\%)", "Evi. Rec. (\\%)", "Coverage (\\%)"]
         if include_import:
             cols.append("r")
             headers.append("Import Cov. (\\%)")
@@ -472,7 +472,15 @@ class PaperTableGenerator:
         ours_entries = [e for e in entries if e.is_ours]
 
         for e in non_ours:
-            row = [e.system_name, _fmt_acc(e), _fmt_cov(e)]
+            row = [
+                e.system_name,
+                _fmt_acc(e),
+                f"{e.official_em:.1f}",
+                f"{e.official_f1:.1f}",
+                f"{e.llm_assisted_accuracy:.1f}",
+                f"{e.evidence_recall:.1f}",
+                _fmt_cov(e),
+            ]
             if include_import:
                 row.append(_format_import_coverage(e))
             if include_failures:
@@ -490,7 +498,15 @@ class PaperTableGenerator:
             lines.append("\\hline")
 
         for e in ours_entries:
-            row = [f"\\textbf{{{e.system_name}}}", _fmt_acc(e), _fmt_cov(e)]
+            row = [
+                f"\\textbf{{{e.system_name}}}",
+                _fmt_acc(e),
+                f"{e.official_em:.1f}",
+                f"{e.official_f1:.1f}",
+                f"{e.llm_assisted_accuracy:.1f}",
+                f"{e.evidence_recall:.1f}",
+                _fmt_cov(e),
+            ]
             if include_import:
                 row.append(_format_import_coverage(e))
             if include_failures:
@@ -557,7 +573,7 @@ class PaperTableGenerator:
         if not entries:
             return "_No entries_\n"
 
-        headers = ["System", "Accuracy (%)", "Coverage (%)"]
+        headers = ["System", "Accuracy (%)", "Official EM (%)", "Official F1 (%)", "LLM Acc (%)", "Evidence Recall (%)", "Coverage (%)"]
         include_setup = any(e.setup_metrics for e in entries)
         include_import = any(e.imported_baseline for e in entries)
         include_failures = any(e.failure_counts for e in entries)
@@ -591,6 +607,10 @@ class PaperTableGenerator:
             row = [
                 f"{prefix}{e.system_name}{suffix}",
                 acc_str,
+                f"{e.official_em:.1f}",
+                f"{e.official_f1:.1f}",
+                f"{e.llm_assisted_accuracy:.1f}",
+                f"{e.evidence_recall:.1f}",
                 f"{e.coverage:.1f}",
             ]
             if include_import:

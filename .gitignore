@@ -273,6 +273,10 @@ benchmarks/.env.global
 benchmarks/experiments.jsonl
 benchmarks/multi_experiments.jsonl
 benchmarks/**/*experiments*.jsonl
+benchmarks/**/golden_set*.json
+benchmarks/**/sampling_*_sample_ids.json
+benchmarks/**/sampling_*_manifest.json
+benchmarks/**/sampling_*_protocol.json
 benchmarks/**/*queue*.json
 benchmarks/**/*registry*.jsonl
 benchmarks/**/logs/
