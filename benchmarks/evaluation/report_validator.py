@@ -224,6 +224,24 @@ class AcademicReportValidator:
             issues.append(ValidationIssue("warning", "metrics", "Token usage is missing from metrics."))
         if "official_exact_match" not in metrics or "official_f1_correct" not in metrics:
             issues.append(ValidationIssue("warning", "official_metrics", "Official EM/F1-derived metrics are missing from metrics.json."))
+        else:
+            llm_acc = _safe_float(metrics.get("llm_assisted_accuracy", metrics.get("accuracy", 0.0)))
+            official_em = _safe_float(metrics.get("official_exact_match"))
+            official_f1_correct = _safe_float(metrics.get("official_f1_correct"))
+            if llm_acc - official_em >= 20.0:
+                issues.append(ValidationIssue(
+                    "warning",
+                    "llm_vs_official_gap",
+                    f"LLM-assisted accuracy ({llm_acc:.1f}) exceeds official EM ({official_em:.1f}) by {llm_acc - official_em:.1f} points; use official EM/F1 as primary paper metrics.",
+                    str(run_path / "results" / "metrics.json"),
+                ))
+            if llm_acc - official_f1_correct >= 20.0:
+                issues.append(ValidationIssue(
+                    "warning",
+                    "llm_vs_official_f1_gap",
+                    f"LLM-assisted accuracy ({llm_acc:.1f}) exceeds official F1-correct ({official_f1_correct:.1f}) by {llm_acc - official_f1_correct:.1f} points; inspect answer normalization and semantic-judge reliance.",
+                    str(run_path / "results" / "metrics.json"),
+                ))
         failure_info = metrics.get("failure_classification", {}) or {}
         system_failures = int(failure_info.get("system_failures", 0) or 0)
         failure_types = failure_info.get("system_failure_types", {}) or {}

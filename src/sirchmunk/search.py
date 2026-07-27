@@ -217,6 +217,9 @@ class DataRequirements:
     formula: Optional[str]
     time_period: Optional[str]
     intent: str
+    expected_answer_type: str = ""
+    target_slot: str = ""
+    answer_constraints: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1094,6 +1097,14 @@ class AgenticSearch(BaseSearch):
 
         should_answer = should_answer_str in ["true", "yes", "1"]
         should_save = should_save_str in ["true", "yes", "1"]
+
+        precise_norm = re.sub(r"[\s_:\-=]+", "", precise.lower())
+        if precise_norm in {"shouldanswerfalse", "false", "noanswer"}:
+            precise = ""
+            should_answer = False
+            should_save = False
+            if not summary:
+                summary = _NO_RESULTS_MESSAGE
 
         if precise and summary:
             summary = f"**Answer: {precise}**\n\n{summary}"
@@ -2241,6 +2252,7 @@ class AgenticSearch(BaseSearch):
             query, _query_intent, retrieval, merged_files,
             formula=data_reqs.formula,
             background_context=spec_context,
+            data_reqs=data_reqs,
         )
 
         # ==============================================================
@@ -6817,6 +6829,7 @@ class AgenticSearch(BaseSearch):
         intent: str = "",
         *,
         document_context: Optional[str] = None,
+        answer_contract: str = "",
     ) -> str:
         """Select and format the synthesis prompt based on query intent.
 
@@ -6827,11 +6840,96 @@ class AgenticSearch(BaseSearch):
 
         prompt = template.format(user_input=query, text_content=evidence)
 
+        if answer_contract:
+            prompt = f"{prompt}\n\n### Answer Contract\n{answer_contract}"
+
         if document_context:
             prompt = (
                 f"{prompt}\n\n### Document Context\n{document_context}"
             )
         return prompt
+
+    @staticmethod
+    def _format_answer_contract(data_reqs: Optional[DataRequirements]) -> str:
+        if data_reqs is None:
+            return ""
+        lines: List[str] = []
+        if data_reqs.expected_answer_type:
+            lines.append(f"- Expected answer type: {data_reqs.expected_answer_type}")
+        if data_reqs.target_slot:
+            lines.append(f"- Target slot/relation: {data_reqs.target_slot}")
+        for constraint in data_reqs.answer_constraints or []:
+            if constraint:
+                lines.append(f"- Constraint: {constraint}")
+        if lines:
+            lines.append("- PRECISE_ANSWER must be the minimal answer span only; do not include explanations, multiple candidates, or SHOULD_ANSWER=false as the answer text.")
+            lines.append("- If evidence is relevant but partial, provide the best supported concise answer instead of refusing.")
+        return "\n".join(lines)
+
+    @classmethod
+    def _finalize_answer(
+        cls,
+        query: str,
+        answer: str,
+        data_reqs: Optional[DataRequirements] = None,
+    ) -> str:
+        """Conservatively normalize final answer text for benchmark evaluation."""
+        if not answer or answer == _NO_RESULTS_MESSAGE:
+            return answer
+        expected = (data_reqs.expected_answer_type if data_reqs else "").lower()
+        short = cls._extract_answer_span(answer)
+        if not short:
+            return answer
+        if re.sub(r"[\s_:\-=]+", "", short.lower()) in {"shouldanswerfalse", "false", "noanswer"}:
+            return _NO_RESULTS_MESSAGE
+        if expected == "yes_no" or cls._looks_yes_no_question(query):
+            yes_no = cls._extract_yes_no(short)
+            if yes_no:
+                short = yes_no
+        elif expected in {"single_entity", "person", "organization", "location", "work_title"}:
+            short = cls._trim_single_entity_answer(short, expected)
+        if answer.startswith("**Answer:"):
+            return re.sub(
+                r"^\*\*Answer:\s*.*?\*\*",
+                f"**Answer: {short}**",
+                answer,
+                count=1,
+                flags=re.DOTALL,
+            )
+        return f"**Answer: {short}**\n\n{answer}"
+
+    @staticmethod
+    def _extract_answer_span(answer: str) -> str:
+        patterns = [
+            r"^\*\*Answer:\s*(.+?)\*\*",
+            r"<PRECISE_ANSWER>(.*?)</PRECISE_ANSWER>",
+            r"(?:^|\n)Answer\s*:\s*(.+?)(?:\n|$)",
+            r"(?:^|\n)Final answer\s*:\s*(.+?)(?:\n|$)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, answer, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                return match.group(1).strip()
+        first = next((line.strip() for line in answer.splitlines() if line.strip()), "")
+        return first[:500]
+
+    @staticmethod
+    def _looks_yes_no_question(query: str) -> bool:
+        return bool(re.match(r"\s*(are|is|was|were|do|does|did|has|have|had|can|could|will|would|should)\b", query, re.I))
+
+    @staticmethod
+    def _extract_yes_no(text: str) -> str:
+        match = re.search(r"\b(yes|no)\b", text, flags=re.IGNORECASE)
+        return match.group(1).capitalize() if match else ""
+
+    @staticmethod
+    def _trim_single_entity_answer(text: str, expected: str = "") -> str:
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        if expected != "location":
+            split = re.split(r"\s*(?:,|;|\n|\band\b|\bor\b)\s*", cleaned, maxsplit=1, flags=re.I)
+            return split[0].strip() if split and split[0].strip() else cleaned
+        split = re.split(r"\s*(?:;|\n|\band\b|\bor\b)\s*", cleaned, maxsplit=1, flags=re.I)
+        return split[0].strip() if split and split[0].strip() else cleaned
 
     async def _summarise_fast_fallback(
         self, query: str, context: "SearchContext",
@@ -6880,6 +6978,9 @@ class AgenticSearch(BaseSearch):
                     formula=data.get("formula"),
                     time_period=data.get("time_period"),
                     intent=intent,
+                    expected_answer_type=str(data.get("expected_answer_type") or ""),
+                    target_slot=str(data.get("target_slot") or ""),
+                    answer_constraints=[str(x) for x in data.get("answer_constraints", [])] if isinstance(data.get("answer_constraints"), list) else [],
                 )
         except Exception as exc:
             await self._logger.warning(
@@ -6888,6 +6989,9 @@ class AgenticSearch(BaseSearch):
         return DataRequirements(
             data_points=[query], likely_sources=[], formula=None,
             time_period=None, intent=intent,
+            expected_answer_type="",
+            target_slot="",
+            answer_constraints=[],
         )
 
     def _select_target_files(
@@ -7489,6 +7593,9 @@ class AgenticSearch(BaseSearch):
                 formula=data_reqs.formula,
                 time_period=data_reqs.time_period,
                 intent=data_reqs.intent,
+                expected_answer_type=data_reqs.expected_answer_type,
+                target_slot=data_reqs.target_slot,
+                answer_constraints=list(data_reqs.answer_constraints or []),
             )
 
         # Fallback: if zero evidence after loop, try broad page extraction
@@ -7628,6 +7735,7 @@ class AgenticSearch(BaseSearch):
         file_paths: List[str],
         formula: Optional[str] = None,
         background_context: str = "",
+        data_reqs: Optional[DataRequirements] = None,
     ) -> Tuple[str, bool, Optional["KnowledgeCluster"]]:
         """Synthesize final answer from agentic retrieval evidence."""
         if not retrieval.evidence.strip():
@@ -7652,7 +7760,10 @@ class AgenticSearch(BaseSearch):
                 )
 
         synth_prompt = self._select_synthesis_prompt(
-            query, evidence, intent,
+            query,
+            evidence,
+            intent,
+            answer_contract=self._format_answer_contract(data_reqs),
         )
         resp = await self.llm.achat(
             messages=[{"role": "user", "content": synth_prompt}],
@@ -7662,6 +7773,9 @@ class AgenticSearch(BaseSearch):
 
         raw = resp.content or ""
         answer, should_save, should_answer = self._parse_summary_response(raw)
+        answer = self._finalize_answer(query, answer, data_reqs)
+        if not should_answer and self._is_refusal_answer(answer):
+            return _NO_RESULTS_MESSAGE, False, None
 
         accepted, reason = self._evaluate_evidence_acceptance(
             query, retrieval.evidence, should_answer,

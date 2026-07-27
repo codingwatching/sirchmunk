@@ -238,6 +238,8 @@ def _compute_basic_metrics(results: List[PredictionResult]) -> dict:
     em_values = [float(t.get("em", 0.0) or 0.0) for t in telemetry]
     f1_values = [float(t.get("f1", 0.0) or 0.0) for t in telemetry]
     evidence_values = [float(t.get("evidence_recall", 0.0) or 0.0) for t in telemetry]
+    system_failures = sum(1 for r in results if r.error)
+    answer_failures = sum(1 for r in results if not r.error and not r.judge_correct)
 
     return {
         "n": n,
@@ -255,6 +257,10 @@ def _compute_basic_metrics(results: List[PredictionResult]) -> dict:
             "search_tokens": search_tokens,
             "judge_tokens": judge_tokens,
             "avg_tokens_per_question": round((search_tokens + judge_tokens) / n, 1),
+        },
+        "failure_classification": {
+            "system_failures": system_failures,
+            "answer_failures": answer_failures,
         },
     }
 

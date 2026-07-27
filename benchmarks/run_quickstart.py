@@ -371,7 +371,13 @@ def _print_summary(
     print(f"run_dir   : {run_dir or 'N/A'}")
     print(f"samples   : {metrics.get('n', 'N/A')}")
     print(f"accuracy  : {metrics.get('accuracy', 'N/A')}")
+    print(f"llm_acc   : {metrics.get('llm_assisted_accuracy', 'N/A')}")
+    print(f"official_em: {metrics.get('official_exact_match', 'N/A')}")
+    print(f"official_f1_correct: {metrics.get('official_f1_correct', 'N/A')}")
+    print(f"official_f1: {metrics.get('f1', 'N/A')}")
     print(f"coverage  : {metrics.get('coverage', 'N/A')}")
+    print(f"evidence_recall: {metrics.get('evidence_recall', 'N/A')}")
+    print(f"source_grounding: {metrics.get('source_grounding_accuracy', 'N/A')}")
     failure = metrics.get("failure_classification", {}) if isinstance(metrics, dict) else {}
     system_failures = failure.get("system_failures", 0)
     try:

@@ -804,16 +804,19 @@ DEEP_DATA_REQUIREMENTS = """Given the user's question, identify the specific dat
 ### Instructions
 1. List each specific data point needed to answer this question (e.g., "Total Revenue for FY2022", "Accounts Payable as of fiscal year end 2019").
 2. For each data point, identify the likely document section type where it would appear (e.g., "Income Statement", "Balance Sheet", "Cash Flow Statement", "Notes to Financial Statements", "Management Discussion and Analysis", "Segment Information").
-3. If a calculation is required, state the exact formula with explicit variable names matching how they typically appear in financial statements. If the question provides its own formula definition, use THAT formula exactly. Otherwise use these standard definitions:
+3. Infer the expected final answer type, such as: year, date, person, location, organization, work_title, yes_no, number, single_entity, list, or phrase.
+4. Identify the target slot/relation that must be answered, not just the source entity. Examples: "founding year of the university", "county where Fort Snelling is located", "specific common ingredient".
+5. If a calculation is required, state the exact formula with explicit variable names matching how they typically appear in financial statements. If the question provides its own formula definition, use THAT formula exactly. Otherwise use these standard definitions:
    - Quick Ratio = (Cash and Cash Equivalents + Short-term Investments + Net Receivables) / Total Current Liabilities
    - Interest Coverage Ratio = EBIT / Interest Expense (if EBIT is negative, ratio = 0)
    - Asset Turnover = Revenue / Average Total Assets
    - Net Profit Margin = Net Income / Total Revenue
-4. Identify the time period(s) required.
-5. For comparison or identification questions (e.g., "What is the largest segment?", "Which year had the highest growth?"), note what dimensions need comparison.
+6. Identify the time period(s) required.
+7. For comparison or identification questions (e.g., "What is the largest segment?", "Which year had the highest growth?"), note what dimensions need comparison.
+8. Add answer constraints that prevent over-broad or wrong-granularity answers. Examples: "return one minimal entity", "answer yes/no first", "do not return a role if the question asks for a work title".
 
 Return ONLY valid JSON on a single line:
-{{"data_points": ["data point 1", "data point 2"], "likely_sources": ["section type 1", "section type 2"], "formula": "explicit formula with variable names, or null", "time_period": "period or null"}}
+{{"data_points": ["data point 1", "data point 2"], "likely_sources": ["section type 1", "section type 2"], "formula": "explicit formula with variable names, or null", "time_period": "period or null", "expected_answer_type": "year|date|person|location|organization|work_title|yes_no|number|single_entity|list|phrase", "target_slot": "the exact target relation/slot to fill", "answer_constraints": ["constraint 1", "constraint 2"]}}
 """
 
 DEEP_PAGE_SELECT = """You are locating specific data in a document. Select pages to fetch.

@@ -231,19 +231,80 @@ class ExperimentTracker:
         if not records:
             print("  (no experiments recorded yet)")
             return
-        print(f"\n{'Run ID':<35} {'Acc%':>6} {'Cov%':>6} {'Latency':>8} {'Git':>12}  Notes")
-        print("─" * 90)
+        header = (
+            f"\n{'Run ID':<35} {'Samples':>7} {'Acc%':>6} {'EM%':>6} "
+            f"{'F1%':>6} {'Cov%':>6} {'Evid%':>6} {'Avg':>8} {'P95':>8} "
+            f"{'Tok/Q':>8} {'Fail':>5} {'Git':>12}  Notes"
+        )
+        print(header)
+        print("─" * 130)
         for r in records:
-            acc = r.metrics.get("accuracy", 0)
-            cov = r.metrics.get("coverage", 0)
-            lat = r.metrics.get("avg_latency", 0)
+            metrics = r.metrics or {}
+            samples = self._metric_number(metrics, "n", default=0, as_int=True)
+            acc = self._metric_number(metrics, "accuracy")
+            em = self._metric_number(metrics, "em")
+            f1 = self._metric_number(metrics, "f1")
+            cov = self._metric_number(metrics, "coverage")
+            evidence = self._metric_number(metrics, "evidence_recall")
+            avg_latency = self._latency_metric(metrics, "avg")
+            p95_latency = self._latency_metric(metrics, "p95")
+            avg_tokens = self._avg_tokens_per_question(metrics)
+            failures = self._system_failures(metrics)
             reg_tag = " ⚠️" if r.is_regression else ""
             note = r.notes[:30] if r.notes else ""
             print(
-                f"  {r.run_id:<33} {acc:>5.1f} {cov:>5.1f} {lat:>7.1f}s "
-                f"{r.git_commit:>12}  {note}{reg_tag}"
+                f"  {r.run_id:<33} {samples:>7} {acc:>5.1f} {em:>5.1f} "
+                f"{f1:>5.1f} {cov:>5.1f} {evidence:>5.1f} "
+                f"{avg_latency:>7.1f}s {p95_latency:>7.1f}s {avg_tokens:>7.1f} "
+                f"{failures:>5} {r.git_commit:>12}  {note}{reg_tag}"
             )
         print()
+
+    @staticmethod
+    def _metric_number(metrics: Dict, key: str, default: float = 0.0, *, as_int: bool = False):
+        value = metrics.get(key, default)
+        try:
+            number = float(value if value is not None else default)
+        except (TypeError, ValueError):
+            number = float(default)
+        return int(number) if as_int else number
+
+    @classmethod
+    def _latency_metric(cls, metrics: Dict, key: str) -> float:
+        if key == "avg":
+            flat_value = metrics.get("avg_latency")
+        else:
+            flat_value = metrics.get(f"latency_{key}")
+        if flat_value is not None:
+            return cls._metric_number({"value": flat_value}, "value")
+        latency = metrics.get("latency", {})
+        if isinstance(latency, dict):
+            return cls._metric_number(latency, key)
+        return 0.0
+
+    @staticmethod
+    def _avg_tokens_per_question(metrics: Dict) -> float:
+        token_usage = metrics.get("token_usage", {})
+        if isinstance(token_usage, dict):
+            value = token_usage.get("avg_tokens_per_question", token_usage.get("avg_tokens", 0.0))
+        else:
+            value = token_usage
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _system_failures(metrics: Dict) -> int:
+        failure = metrics.get("failure_classification", {})
+        if isinstance(failure, dict):
+            value = failure.get("system_failures", 0)
+        else:
+            value = metrics.get("system_failures", 0)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
 
     # ------------------------------------------------------------------
     # Internals

@@ -138,6 +138,8 @@ Loading priority is:
 .env.global < .env.hotpotqa.base < profile env < os.environ
 ```
 
+HotpotQA LLM judge uses the explicit `HOTPOT_JUDGE_MODEL_NAME` from `.env.hotpotqa.base` and inherits `LLM_BASE_URL` / `LLM_API_KEY` from `benchmarks/.env.global`. `LLM_MODEL_NAME` remains the shared search/generation model setting and is not used as a judge-model fallback.
+
 For HotpotQA fullwiki, configure the dataset and corpus paths in `.env.hotpotqa.base`. `HOTPOT_DATASET_DIR` can point either to the dataset root or directly to the `fullwiki/` parquet directory. When it points directly to `fullwiki/`, set `HOTPOT_WIKI_CORPUS_DIR` to the raw Wikipedia corpus directory explicitly.
 
 ```text

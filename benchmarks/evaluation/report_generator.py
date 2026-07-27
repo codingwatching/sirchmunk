@@ -118,6 +118,8 @@ class ReportGenerator:
                 lines.append(f"- Official exact match: `{metrics.get('official_exact_match')}`")
             if "f1" in metrics:
                 lines.append(f"- Official token F1: `{metrics.get('f1')}`")
+            if "official_f1_correct" in metrics:
+                lines.append(f"- Official F1-correct: `{metrics.get('official_f1_correct')}`")
             if "llm_assisted_accuracy" in metrics:
                 lines.append(f"- LLM-assisted accuracy: `{metrics.get('llm_assisted_accuracy')}`")
             else:

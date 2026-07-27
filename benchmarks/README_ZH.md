@@ -138,6 +138,8 @@ os.environ
 .env.global < .env.hotpotqa.base < profile env < os.environ
 ```
 
+HotpotQA LLM judge 使用 `.env.hotpotqa.base` 中显式配置的 `HOTPOT_JUDGE_MODEL_NAME`，并继承 `benchmarks/.env.global` 中的 `LLM_BASE_URL` / `LLM_API_KEY`。`LLM_MODEL_NAME` 仍然表示共享的搜索/生成模型配置，不会作为 judge model fallback。
+
 对于 HotpotQA fullwiki，请在 `.env.hotpotqa.base` 中配置数据集和语料路径。`HOTPOT_DATASET_DIR` 可以指向 dataset 根目录，也可以直接指向 `fullwiki/` parquet 目录；若直接指向 `fullwiki/`，请显式设置 `HOTPOT_WIKI_CORPUS_DIR` 到 raw Wikipedia 语料目录。
 
 ```text

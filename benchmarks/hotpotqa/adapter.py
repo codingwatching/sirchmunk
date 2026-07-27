@@ -124,6 +124,16 @@ class HotpotQAAdapter(BenchmarkAdapter):
     def _get_bool(self, key: str, default: bool = False) -> bool:
         return self._get(key, str(default)).lower() in ("true", "1", "yes")
 
+    def _judge_model_name(self, *, required: bool = True) -> str:
+        """Return the explicitly configured HotpotQA judge model."""
+        model = self._get("HOTPOT_JUDGE_MODEL_NAME", "")
+        if model or not required:
+            return model
+        raise RuntimeError(
+            "HOTPOT_JUDGE_MODEL_NAME is required when HOTPOT_ENABLE_LLM_JUDGE=true. "
+            "It configures the HotpotQA judge model separately from LLM_MODEL_NAME."
+        )
+
     def get_profile_limit(self, default: int = 0) -> int:
         return self._get_int("HOTPOT_LIMIT", default)
 
@@ -203,6 +213,7 @@ class HotpotQAAdapter(BenchmarkAdapter):
             "allow_frozen_llm_judge_auxiliary": self._get_bool("ALLOW_FROZEN_LLM_JUDGE_AUXILIARY", False),
             "enable_gpt_eval":  self._get_bool("HOTPOT_ENABLE_GPT_EVAL", False),
             "llm_model":        self._get("LLM_MODEL_NAME", ""),
+            "judge_model":      self._judge_model_name(required=False),
             "llm_base_url":     self._get("LLM_BASE_URL", ""),
             "max_concurrent":   self._get_int("HOTPOT_MAX_CONCURRENT", 3),
             "setting":          self._get("HOTPOT_SETTING", "fullwiki"),
@@ -225,6 +236,7 @@ class HotpotQAAdapter(BenchmarkAdapter):
             "env_sources": list(self._env_sources),
             "top_k_env_key":    "HOTPOT_TOP_K_FILES",
             "mode_env_key":     "HOTPOT_MODE",
+            "judge_model_env_key": "HOTPOT_JUDGE_MODEL_NAME",
             "judge_threshold_env_key": "HOTPOT_JUDGE_F1_THRESHOLD",
         }
 
@@ -254,17 +266,26 @@ class HotpotQAAdapter(BenchmarkAdapter):
     def build_judge(self) -> Optional[Any]:
         """Build HotpotQA EM/F1 judge with optional LLM semantic fallback."""
         if self._judge is None:
-            try:
-                searcher = self.build_searcher()
-                llm = getattr(searcher, "llm", None)
-            except Exception as exc:
-                raise RuntimeError(
-                    "Failed to build HotpotQA judge because the shared searcher/LLM could not be initialized. "
-                    "Check LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME, and benchmark env layering."
-                ) from exc
+            llm = None
+            enable_llm_judge = self._get_bool("HOTPOT_ENABLE_LLM_JUDGE", True)
+            if enable_llm_judge:
+                judge_model = self._judge_model_name()
+                try:
+                    from sirchmunk.llm.openai_chat import OpenAIChat
+
+                    llm = OpenAIChat(
+                        api_key=self._get("LLM_API_KEY", ""),
+                        base_url=self._get("LLM_BASE_URL", "https://api.openai.com/v1"),
+                        model=judge_model,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Failed to build HotpotQA judge LLM. "
+                        "Check LLM_BASE_URL, LLM_API_KEY, HOTPOT_JUDGE_MODEL_NAME, and benchmark env layering."
+                    ) from exc
             self._judge = HotpotQAJudge(
                 llm=llm,
-                enable_llm_judge=self._get_bool("HOTPOT_ENABLE_LLM_JUDGE", True),
+                enable_llm_judge=enable_llm_judge,
                 llm_fallback_f1_threshold=float(self._get("HOTPOT_JUDGE_F1_THRESHOLD", "0.3")),
             )
         return self._judge
@@ -388,6 +409,7 @@ class HotpotQAAdapter(BenchmarkAdapter):
             ],
             "top_k_env_key": "HOTPOT_TOP_K_FILES",
             "mode_env_key": "HOTPOT_MODE",
+            "judge_model_env_key": "HOTPOT_JUDGE_MODEL_NAME",
             "judge_threshold_env_key": "HOTPOT_JUDGE_F1_THRESHOLD",
         }
 
