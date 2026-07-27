@@ -14,10 +14,11 @@ import os
 import shutil
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
+from framework.time_utils import local_timestamp, now_local_iso
 
 
 class UpdateOperation(str, Enum):
@@ -116,7 +117,7 @@ class DynamicUpdateManager:
             doc_count=len(docs),
             total_bytes=sum(_safe_size(p) for p in docs),
             checksum=checksum,
-            created_at=datetime.now(timezone.utc).isoformat(),
+            created_at=now_local_iso(),
             materialize_mode=self.materialize_mode,
         )
         (version_dir / "corpus_version_manifest.json").write_text(
@@ -247,7 +248,7 @@ def _safe_size(path: Path) -> int:
 
 
 def _timestamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return local_timestamp()
 
 
 def _classify_update_failure(exc: Exception) -> str:

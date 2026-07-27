@@ -13,7 +13,6 @@ import importlib
 import logging
 import sys
 from dataclasses import asdict
-from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List
@@ -35,6 +34,7 @@ from framework.lifecycle_schema import (
     ResourceBudget,
 )  # noqa: E402
 from framework.registry import load_benchmark_adapter, supported_benchmarks  # noqa: E402
+from framework.time_utils import local_timestamp  # noqa: E402
 
 logger = logging.getLogger("run_lifecycle_eval")
 
@@ -143,7 +143,7 @@ async def _main() -> int:
     lifecycle_output = output_dir / "lifecycle_eval"
     lifecycle_output.mkdir(parents=True, exist_ok=True)
 
-    run_id = f"lifecycle_{args.benchmark}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    run_id = f"lifecycle_{args.benchmark}_{local_timestamp()}"
     budget = ResourceBudget(
         wall_clock_seconds=args.build_timeout,
         max_ram_bytes=args.max_ram_bytes,

@@ -5,7 +5,6 @@ import asyncio
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -14,6 +13,7 @@ from .experiment_registry import ExperimentRegistry
 from .guards import TimeoutGuard
 from .registry import load_benchmark_adapter
 from .runner import UnifiedExperimentRunner
+from .time_utils import now_local_iso
 
 
 class QueueTaskStatus(str, Enum):
@@ -54,8 +54,8 @@ class QueueTask:
     command: List[str] = field(default_factory=list)
     attempts: int = 0
     max_attempts: int = 1
-    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    created_at: str = field(default_factory=now_local_iso)
+    updated_at: str = field(default_factory=now_local_iso)
     started_at: str = ""
     ended_at: str = ""
     artifact_dir: str = ""
@@ -415,7 +415,7 @@ def _run_id(benchmark: str, system: str, seed: int, cache_mode: str, stage: str)
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return now_local_iso()
 
 
 def _safe_float(value: Any) -> float:

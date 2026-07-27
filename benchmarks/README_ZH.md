@@ -40,7 +40,7 @@ LLM_MODEL_NAME=qwen3.7-plus
 python benchmarks/run_quickstart.py
 ```
 
-这个命令会自动在 10 条 HotpotQA fullwiki 样本上运行配置好的真实 LLM，自动跳过交互式改进确认，定位最新 run artifact，并生成报告。默认使用 `--context-corpus-mode sample`，即把每条样本 parquet 中自带的 context 物化为临时原始文本文件，并筛选 context-answerable 的 smoke 样本，使 quickstart 拥有闭合检索语料。若要测试配置的 raw fullwiki 语料，请显式使用 `--context-corpus-mode wiki`。
+这个命令会自动按当前 profile 中配置的样本数（`HOTPOT_LIMIT`；显式传入 `--limit` 时覆盖它）运行配置好的真实 LLM，自动跳过交互式改进确认，定位最新 run artifact，并生成报告。默认使用 `--context-corpus-mode sample`，即把每条样本 parquet 中自带的 context 物化为临时原始文本文件，并筛选 context-answerable 的 smoke 样本，使 quickstart 拥有闭合检索语料。若要测试配置的 raw fullwiki 语料，请显式使用 `--context-corpus-mode wiki`。
 
 ### 第 3 步：查看输出
 
@@ -165,11 +165,12 @@ exploration profile 用于冒烟测试和开发子集。frozen profile 仅用于
 printf 'skip\n' | python benchmarks/run_research_loop.py \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.exploration \
-  --limit 10 \
   --max-iter 1 \
   --dry-run \
   --log-level INFO
 ```
+
+省略 `--limit` 时会使用当前 profile 的 `HOTPOT_LIMIT`；只有需要临时覆盖时才传 `--limit <N>`。
 
 然后手动生成报告：
 

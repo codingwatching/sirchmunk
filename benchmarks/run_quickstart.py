@@ -14,7 +14,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 _SCRIPT_DIR = Path(__file__).parent.resolve()
 _PROJECT_ROOT = _SCRIPT_DIR.parent
@@ -33,7 +33,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--benchmark", "-b", default="hotpotqa", choices=supported_benchmarks())
     parser.add_argument("--env", "-e", default="benchmarks/hotpotqa/.env.hotpotqa.exploration")
-    parser.add_argument("--limit", "-l", type=int, default=10)
+    parser.add_argument("--limit", "-l", type=int, default=None, help="Sample limit. Omit to use benchmark profile env, e.g. HOTPOT_LIMIT; fallback is 10.")
     parser.add_argument("--max-iter", "-n", type=int, default=1)
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--title", default="HotpotQA Quickstart Smoke Test Report")
@@ -50,19 +50,21 @@ def main() -> None:
     _preflight_dependencies(args.benchmark)
 
     adapter = load_benchmark_adapter(args.benchmark, str(env_path))
+    limit = _resolve_limit(args.limit, adapter, default=10)
     output_dir = Path(adapter.get_output_dir()).resolve()
     before = _latest_run_dir(output_dir)
 
     print("== Benchmarks Quickstart ==")
     print(f"benchmark : {args.benchmark}")
     print(f"env       : {env_path}")
-    print(f"limit     : {args.limit}")
+    print(f"limit     : {limit}")
     if args.benchmark == "hotpotqa":
         print(f"corpus    : {args.context_corpus_mode}")
     print()
 
     child_env = os.environ.copy()
     if args.benchmark == "hotpotqa":
+        child_env["HOTPOT_LIMIT"] = str(limit)
         child_env["HOTPOT_CONTEXT_CORPUS_MODE"] = args.context_corpus_mode
         if args.context_corpus_mode == "sample":
             child_env["HOTPOT_REQUIRE_CONTEXT_ANSWERABLE"] = "true"
@@ -75,7 +77,7 @@ def main() -> None:
         "--env",
         str(env_path),
         "--limit",
-        str(args.limit),
+        str(limit),
         "--max-iter",
         str(args.max_iter),
         "--dry-run",
@@ -113,6 +115,15 @@ def main() -> None:
     metrics = _read_json(run_dir / "results" / "metrics.json")
     validation = _read_json(Path(report_paths.get("validation", ""))) if report_paths else {}
     _print_summary(run_dir, metrics, report_paths, validation)
+
+
+def _resolve_limit(cli_limit: Optional[int], adapter: Any, *, default: int) -> int:
+    if cli_limit is not None:
+        return max(int(cli_limit), 0)
+    getter = getattr(adapter, "get_profile_limit", None)
+    if callable(getter):
+        return max(int(getter(default)), 0)
+    return default
 
 
 def _run_step(

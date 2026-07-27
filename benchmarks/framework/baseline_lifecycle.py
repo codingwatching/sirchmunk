@@ -5,7 +5,6 @@ import asyncio
 import json
 import time
 from dataclasses import asdict
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -17,6 +16,7 @@ from framework.lifecycle_schema import (
     FailureReason,
     ResourceBudget,
 )
+from framework.time_utils import now_local_iso
 
 
 class BaselineLifecycleManager:
@@ -50,7 +50,7 @@ class BaselineLifecycleManager:
         corpus_scale: str = "fullwiki",
     ) -> BaselineLifecycleRecord:
         """Run baseline preparation and index validation under a budget."""
-        started = _utc_now()
+        started = _now()
         t0 = time.monotonic()
         corpus_manifest = corpus_manifest or {}
         corpus_id = str(corpus_manifest.get("corpus_id") or corpus_manifest.get("id") or "")
@@ -84,7 +84,7 @@ class BaselineLifecycleManager:
             record.phase = BaselinePhase.SKIPPED
             record.failure_reason = FailureReason.UNAVAILABLE
             record.failure_message = "Baseline dependencies are unavailable."
-            record.ended_at = _utc_now()
+            record.ended_at = _now()
             self.save_record(record)
             return record
 
@@ -144,7 +144,7 @@ class BaselineLifecycleManager:
             self._mark_failed(record, reason, exc)
         finally:
             record.build_time_seconds = record.build_time_seconds or (time.monotonic() - t0)
-            record.ended_at = _utc_now()
+            record.ended_at = _now()
             record.metadata.update(baseline.get_lifecycle_metadata())
             self.save_record(record)
 
@@ -238,8 +238,8 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _now() -> str:
+    return now_local_iso()
 
 
 __all__ = ["BaselineLifecycleManager"]

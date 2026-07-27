@@ -7190,6 +7190,7 @@ class AgenticSearch(BaseSearch):
         evidence_parts: List[str],
         pages_extracted: Dict[str, set],
         query: str,
+        context: "SearchContext",
     ) -> None:
         """Add sibling text docs whose title is mentioned in already-read evidence.
 
@@ -7232,7 +7233,33 @@ class AgenticSearch(BaseSearch):
                 if content:
                     evidence_parts.append(content)
                     pages_extracted[sibling_str] = set()
+                    self._record_deep_evidence_read(
+                        context,
+                        sibling_str,
+                        content,
+                        source="sibling_text",
+                    )
                     seen.add(sibling_str)
+
+    @staticmethod
+    def _record_deep_evidence_read(
+        context: "SearchContext",
+        file_path: str,
+        content: str,
+        *,
+        source: str,
+    ) -> None:
+        """Record DEEP-mode evidence reads for downstream benchmark telemetry."""
+        context.mark_file_read(file_path)
+        context.add_log(
+            tool_name="deep_file_extract",
+            tokens=max(len(content) // 4, 1),
+            metadata={
+                "file_path": file_path,
+                "path": file_path,
+                "source": source,
+            },
+        )
 
     async def _agentic_retrieve(
         self,
@@ -7307,6 +7334,7 @@ class AgenticSearch(BaseSearch):
             if content:
                 evidence_parts.append(content)
                 pages_extracted[fp] = set()
+                self._record_deep_evidence_read(context, fp, content, source="non_paginated")
 
         if evidence_parts and non_paginated_files:
             await self._expand_sibling_text_evidence(
@@ -7314,6 +7342,7 @@ class AgenticSearch(BaseSearch):
                 evidence_parts,
                 pages_extracted,
                 query,
+                context,
             )
 
         for fp in outline_target_files:
@@ -7498,6 +7527,7 @@ class AgenticSearch(BaseSearch):
                     if content:
                         evidence_parts.append(content)
                         pages_extracted[fp] = set()
+                        self._record_deep_evidence_read(context, fp, content, source="broad_fallback")
                         break
 
         combined = "\n\n".join(evidence_parts)

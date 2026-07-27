@@ -122,6 +122,9 @@ class HotpotQAAdapter(BenchmarkAdapter):
     def _get_bool(self, key: str, default: bool = False) -> bool:
         return self._get(key, str(default)).lower() in ("true", "1", "yes")
 
+    def get_profile_limit(self, default: int = 0) -> int:
+        return self._get_int("HOTPOT_LIMIT", default)
+
     @property
     def name(self) -> str:
         return "hotpotqa"
@@ -187,6 +190,7 @@ class HotpotQAAdapter(BenchmarkAdapter):
             "max_concurrent":   self._get_int("HOTPOT_MAX_CONCURRENT", 3),
             "setting":          self._get("HOTPOT_SETTING", "fullwiki"),
             "split":            self._get("HOTPOT_SPLIT", "validation"),
+            "limit":            self.get_profile_limit(0),
             "context_corpus_mode": self._context_corpus_mode(),
             "require_context_answerable": self._require_context_answerable(),
             "reuse_knowledge":  self._get_bool("HOTPOT_REUSE_KNOWLEDGE", False),

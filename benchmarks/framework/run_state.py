@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from .time_utils import now_local_iso
 
 
 class RunStatus(str, Enum):
@@ -46,7 +47,7 @@ class RunState:
     failed_samples: int = 0
     retry_count: int = 0
     started_at: Optional[str] = None
-    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = field(default_factory=now_local_iso)
     ended_at: Optional[str] = None
     artifact_dir: str = ""
     results_path: str = ""
@@ -88,7 +89,7 @@ class RunStateStore:
         return RunState.from_dict(row) if row else None
 
     def upsert(self, state: RunState) -> RunState:
-        state.updated_at = datetime.now(timezone.utc).isoformat()
+        state.updated_at = now_local_iso()
         data = self._load()
         data[state.run_id] = state.to_dict()
         self._save(data)
@@ -103,9 +104,9 @@ class RunStateStore:
             raise ValueError(f"Invalid run transition: {current.value} -> {status.value}")
         state.status = status
         if status == RunStatus.RUNNING and not state.started_at:
-            state.started_at = datetime.now(timezone.utc).isoformat()
+            state.started_at = now_local_iso()
         if status in _TERMINAL:
-            state.ended_at = datetime.now(timezone.utc).isoformat()
+            state.ended_at = now_local_iso()
         for key, value in updates.items():
             if hasattr(state, key):
                 setattr(state, key, value)

@@ -40,7 +40,7 @@ LLM_MODEL_NAME=qwen3.7-plus
 python benchmarks/run_quickstart.py
 ```
 
-This command runs 10 HotpotQA fullwiki samples with the configured real LLM provider, automatically skips the interactive improvement step, locates the generated run artifact, and generates a report. By default it uses `--context-corpus-mode sample`, which materializes each sample's parquet context as temporary raw-text files and filters to context-answerable smoke samples so the quickstart has a closed retrieval corpus. Use `--context-corpus-mode wiki` when you want to exercise the configured raw fullwiki corpus instead.
+This command runs the sample count configured by the active profile (`HOTPOT_LIMIT`; `--limit` explicitly overrides it) with the configured real LLM provider, automatically skips the interactive improvement step, locates the generated run artifact, and generates a report. By default it uses `--context-corpus-mode sample`, which materializes each sample's parquet context as temporary raw-text files and filters to context-answerable smoke samples so the quickstart has a closed retrieval corpus. Use `--context-corpus-mode wiki` when you want to exercise the configured raw fullwiki corpus instead.
 
 ### Step 3: Read The Outputs
 
@@ -165,11 +165,12 @@ For real LLM runs, set the real `LLM_API_KEY` in the private ignored `benchmarks
 printf 'skip\n' | python benchmarks/run_research_loop.py \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.exploration \
-  --limit 10 \
   --max-iter 1 \
   --dry-run \
   --log-level INFO
 ```
+
+Omit `--limit` to use the active profile's `HOTPOT_LIMIT`; pass `--limit <N>` only when you want a one-off override.
 
 Then generate the report manually:
 

@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -32,6 +31,7 @@ from .protocol import ProtocolValidator, default_protocol
 from .retry import RetryConfig, RetryExhausted, RetryPolicy
 from .run_state import RunState, RunStateStore, RunStatus
 from .schema import PredictionResult
+from .time_utils import local_timestamp, now_local_iso, now_utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +151,7 @@ class UnifiedExperimentRunner:
             results_path / timestamp。
         """
         adapter = self._adapter
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        ts = local_timestamp()
         run_id = run_id or f"{adapter.name}_{ts}"
 
         git_commit = _get_git_commit()
@@ -218,7 +218,8 @@ class UnifiedExperimentRunner:
                     "benchmark": adapter.name,
                     "system": system_name,
                     "stage": stage,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": now_local_iso(),
+                    "timestamp_utc": now_utc_iso(),
                     "git_commit": git_commit,
                     "config_hash": cfg_hash,
                     "results_path": existing_state.results_path,
@@ -442,7 +443,8 @@ class UnifiedExperimentRunner:
             "benchmark": adapter.name,
             "system": system_name,
             "stage": stage,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": now_local_iso(),
+            "timestamp_utc": now_utc_iso(),
             "git_commit": git_commit,
             "config_hash": cfg_hash,
             "results_path": results_path,

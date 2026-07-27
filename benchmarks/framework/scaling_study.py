@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -11,6 +10,7 @@ from baselines.base_adapter import BaselineAdapter
 from framework.baseline_lifecycle import BaselineLifecycleManager
 from framework.lifecycle_schema import BaselineLifecycleRecord, BaselinePhase, ResourceBudget
 from framework.metric_engine import lifecycle_cost_curve, scaling_efficiency
+from framework.time_utils import local_timestamp
 
 
 @dataclass
@@ -215,7 +215,7 @@ def _sirchmunk_no_index_record(
 
 
 def _timestamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return local_timestamp()
 
 
 __all__ = ["CorpusScaleSpec", "ScalingStudyManager", "ScalingStudyResult"]

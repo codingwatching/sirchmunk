@@ -13,11 +13,11 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .schema import ExperimentRecord
+from .time_utils import now_local_iso
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,7 @@ class ExperimentTracker:
         record = ExperimentRecord(
             run_id=run_id,
             benchmark=benchmark,
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=now_local_iso(),
             git_commit=git_commit,
             config_hash=config_hash,
             metrics=metrics,

@@ -101,8 +101,8 @@ def _parse_args() -> argparse.Namespace:
     # 公共参数
     parser.add_argument(
         "--limit", "-l",
-        type=int, default=0,
-        help="每次实验每个 benchmark 的最大样本数（0=全量，默认 0）",
+        type=int, default=None,
+        help="每次实验每个 benchmark 的最大样本数（0=全量；省略时使用 profile env 中的 HOTPOT_LIMIT，若无则 0）",
     )
     parser.add_argument(
         "--seed",
@@ -173,6 +173,15 @@ def _setup_logging(level: str) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+def _resolve_limit(cli_limit, adapter, default: int) -> int:
+    if cli_limit is not None:
+        return max(int(cli_limit), 0)
+    getter = getattr(adapter, "get_profile_limit", None)
+    if callable(getter):
+        return max(int(getter(default)), 0)
+    return default
+
+
 async def _main() -> int:
     args = _parse_args()
     _setup_logging(args.log_level)
@@ -220,7 +229,7 @@ async def _main() -> int:
         try:
             await orch.run(
                 max_iterations=args.max_iter,
-                limit_per_bm=args.limit,
+                limit_per_bm=args.limit if args.limit is not None else 0,
                 seed=args.seed,
                 shadow_fraction=args.shadow_fraction,
                 convergence_threshold=args.convergence_threshold,
@@ -251,6 +260,8 @@ async def _main() -> int:
         logger.error("加载 adapter 失败: %s", exc)
         return 1
 
+    effective_limit = _resolve_limit(args.limit, adapter, default=0)
+
     experiments_path = str(Path(
         args.experiments_path or "benchmarks/experiments.jsonl"
     ).resolve())
@@ -263,7 +274,7 @@ async def _main() -> int:
     try:
         await orchestrator.run(
             max_iterations=args.max_iter,
-            limit=args.limit,
+            limit=effective_limit,
             seed=args.seed,
             convergence_threshold=args.convergence_threshold,
             convergence_window=args.convergence_window,

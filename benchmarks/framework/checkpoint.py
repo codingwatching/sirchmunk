@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
+
+from .time_utils import now_local_iso
 
 
 _CHECKPOINT_COMPLETED = "completed"
@@ -21,7 +22,7 @@ class CheckpointRecord:
     row: Dict[str, Any] = field(default_factory=dict)
     error: str = ""
     attempts: int = 0
-    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = field(default_factory=now_local_iso)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -41,7 +42,7 @@ class CheckpointRecord:
             row=data.get("row", {}) if isinstance(data.get("row", {}), dict) else {},
             error=str(data.get("error", "")),
             attempts=int(data.get("attempts", 0) or 0),
-            updated_at=str(data.get("updated_at") or datetime.now(timezone.utc).isoformat()),
+            updated_at=str(data.get("updated_at") or now_local_iso()),
         )
 
 

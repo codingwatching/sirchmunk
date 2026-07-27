@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
+from .time_utils import now_local_iso
 
 
 @dataclass
@@ -32,7 +33,7 @@ class ExperimentRegistryRecord:
     checkpoint_path: str = ""
     started_at: str = ""
     ended_at: str = ""
-    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = field(default_factory=now_local_iso)
     metrics: Dict[str, Any] = field(default_factory=dict)
     meta: Dict[str, Any] = field(default_factory=dict)
     error: str = ""
@@ -54,7 +55,7 @@ class ExperimentRegistry:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def append(self, record: ExperimentRegistryRecord) -> None:
-        record.updated_at = datetime.now(timezone.utc).isoformat()
+        record.updated_at = now_local_iso()
         with self.path.open("a", encoding="utf-8") as fp:
             fp.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
 

@@ -7,7 +7,6 @@ import asyncio
 import importlib
 import logging
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, List
 
@@ -23,6 +22,7 @@ from baselines.base_adapter import BaselineAdapter  # noqa: E402
 from framework.lifecycle_schema import ResourceBudget  # noqa: E402
 from framework.registry import load_benchmark_adapter, supported_benchmarks  # noqa: E402
 from framework.scaling_study import CorpusScaleSpec, ScalingStudyManager  # noqa: E402
+from framework.time_utils import local_timestamp  # noqa: E402
 from hotpotqa.subset_sampler import create_corpus_subset  # noqa: E402
 
 logger = logging.getLogger("run_scaling_study")
@@ -180,7 +180,7 @@ async def _main() -> int:
         resource_budget=budget,
         q_values=q_values,
     )
-    run_id = f"scaling_{args.benchmark}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    run_id = f"scaling_{args.benchmark}_{local_timestamp()}"
     result = await manager.run(
         baseline_factories=_baseline_factories(args.baselines),
         scales=scale_specs,

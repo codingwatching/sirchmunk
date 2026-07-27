@@ -19,9 +19,10 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from .time_utils import now_local_iso
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +104,7 @@ class ParetoTracker:
         """
         point = MultiMetricsPoint(
             run_id=run_id,
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=now_local_iso(),
             git_commit=git_commit,
             config_hash=config_hash,
             metrics_vector=metrics_vector,

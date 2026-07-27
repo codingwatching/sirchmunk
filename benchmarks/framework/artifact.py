@@ -6,11 +6,11 @@ import os
 import platform
 import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .protocol import protocol_to_text
+from .time_utils import local_timezone_name, now_local_iso, now_utc_iso
 
 
 _SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH")
@@ -75,7 +75,9 @@ class RunArtifactManager:
         manifest = {
             "run_id": self.run_id,
             "benchmark": benchmark,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": now_local_iso(),
+            "created_at_utc": now_utc_iso(),
+            "timezone": local_timezone_name(),
             "git_commit": git_commit,
             "git_branch": git_snapshot.get("branch", "unknown"),
             "git_dirty": git_snapshot.get("dirty", True),

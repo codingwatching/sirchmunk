@@ -22,9 +22,10 @@ import json
 import logging
 import random
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
+
+from framework.time_utils import now_local_iso
 
 logger = logging.getLogger(__name__)
 
@@ -218,7 +219,7 @@ class GoldenSetManager:
             benchmark=adapter.name,
             seed=seed,
             n_questions=len(samples),
-            created_at=datetime.now(timezone.utc).isoformat(),
+            created_at=now_local_iso(),
             checksum=checksum,
             samples=samples,
         )
