@@ -22,6 +22,7 @@ class ExperimentProtocol:
     metrics: Dict[str, List[str]] = field(default_factory=dict)
     seeds: List[int] = field(default_factory=list)
     cache_policy: Dict[str, Any] = field(default_factory=dict)
+    sampling: Dict[str, Any] = field(default_factory=dict)
     report: Dict[str, Any] = field(default_factory=dict)
     config: Dict[str, Any] = field(default_factory=dict)
 
@@ -165,6 +166,7 @@ def default_protocol(
             "mode": config.get("cache_mode", "declared_by_adapter"),
             "reuse_knowledge": config.get("reuse_knowledge", False),
         },
+        sampling=config.get("sampling", {}) if isinstance(config.get("sampling", {}), dict) else {},
         report={"format": ["markdown", "latex"]},
         config=config,
     )

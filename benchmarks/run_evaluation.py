@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import json
 import logging
 import sys
@@ -63,6 +64,14 @@ def _setup_logging(level: str) -> None:
 
 
 from framework.registry import load_benchmark_adapter, supported_benchmarks  # noqa: E402
+from evaluation.sampling_protocol import (  # noqa: E402
+    DEFAULT_HOTPOTQA_POPULATION_SIZE,
+    DEFAULT_HOTPOTQA_STRATA,
+    create_sampling_protocol,
+    load_sampling_protocol,
+    validate_sampling_manifest,
+    write_sample_ids,
+)
 
 
 def _load_bm_adapter(benchmark: str, env_file: str):
@@ -96,7 +105,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sirchmunk-results", default=None, dest="sirchmunk_results",
                    help="本文系统（LENS/Sirchmunk）的结果 JSONL 文件路径")
     p.add_argument("--baselines", default="",
-                   help="运行的竞品列表（逗号分隔）: bm25, naive_rag, lightrag_v1, graphrag")
+                   help="运行的竞品列表（逗号分隔）: bm25, naive_rag, lightrag_v1, graphrag, or module:factory")
     p.add_argument("--import-baseline", action="append", dest="import_baseline",
                    metavar="NAME=PATH",
                    help="导入预计算预测并重新 Judge（可多次）")
@@ -107,9 +116,31 @@ def _parse_args() -> argparse.Namespace:
                    metavar="'Name:acc=XX,cov=XX,lat=XX'",
                    help="直接导入已发表数字（无需 Judge，可多次）")
     p.add_argument("--golden-n", type=int, default=150, dest="golden_n",
-                   help="GoldenSet 大小（默认 150，0=全量）")
+                   help="GoldenSet 大小（默认 150，0=全量；stratified时推荐2000）")
     p.add_argument("--golden-seed", type=int, default=42, dest="golden_seed",
                    help="GoldenSet 随机种子（默认 42）")
+    p.add_argument("--sampling-method", default="simple_random",
+                   choices=["simple_random", "stratified", "full", "diagnostic_rare", "fixed_ids"],
+                   dest="sampling_method",
+                   help="GoldenSet抽样方法；论文主实验推荐 stratified")
+    p.add_argument("--strata", default=",".join(DEFAULT_HOTPOTQA_STRATA),
+                   help="stratified抽样的分层键，逗号分隔；默认 type,supporting_fact_bucket")
+    p.add_argument("--sampling-allocation", default="proportional",
+                   choices=["proportional", "equal", "uniform"],
+                   dest="sampling_allocation",
+                   help="stratified抽样的层内分配策略")
+    p.add_argument("--min-per-stratum", type=int, default=1, dest="min_per_stratum",
+                   help="stratified抽样每个非空stratum最少样本数")
+    p.add_argument("--sampling-protocol", default="", dest="sampling_protocol",
+                   help="已冻结的sampling protocol JSON路径；提供后覆盖CLI抽样参数")
+    p.add_argument("--sample-ids-file", default="", dest="sample_ids_file",
+                   help="固定sample IDs JSON路径；提供后使用fixed_ids协议")
+    p.add_argument("--expected-population-size", type=int, default=0, dest="expected_population_size",
+                   help="期望总体规模；HotpotQA fullwiki validation默认7405")
+    p.add_argument("--sampling-report-dir", default="", dest="sampling_report_dir",
+                   help="额外写出sampling protocol/manifest/sample_ids的目录")
+    p.add_argument("--create-golden-only", action="store_true", dest="create_golden_only",
+                   help="只创建并校验GoldenSet，不运行/汇聚baseline")
     p.add_argument("--output-dir", default=None, dest="output_dir",
                    help="输出目录（默认 benchmarks/{benchmark}/output/paper_table/）")
     p.add_argument("--table-only", action="store_true", dest="table_only",
@@ -179,6 +210,9 @@ async def _main() -> int:
 
     ours_name = args.ours_name or "LENS (ours)"
     baseline_guard_config = _baseline_guard_config(args)
+    if args.sampling_protocol:
+        logger.info("Using --sampling-protocol=%s; CLI sampling-method/golden-n/strata options are ignored.", args.sampling_protocol)
+    sampling_protocol = _build_sampling_protocol(args, bm_adapter)
 
     # ── 初始化 PaperTableGenerator ──────────────────────────────────
     from evaluation.table_generator import PaperTableGenerator
@@ -196,20 +230,20 @@ async def _main() -> int:
         pass
 
     golden_set = None
-    if args.sirchmunk_results or (args.baselines and not args.table_only) or (args.import_baseline and not args.table_only):
-        from evaluation.golden_set import GoldenSetManager
-        manager = GoldenSetManager(str(_SCRIPT_DIR / args.benchmark))
-        golden_set = manager.get_or_create(
-            adapter=bm_adapter,
-            seed=args.golden_seed,
-            n=args.golden_n,
-        )
+    if args.create_golden_only or args.sirchmunk_results or (args.baselines and not args.table_only) or (args.import_baseline and not args.table_only):
+        _, golden_set = _get_or_create_golden_set(args, bm_adapter, sampling_protocol)
+        _attach_sampling_metadata(gen, golden_set)
+        _write_sampling_report(args, golden_set)
         logger.info(
-            "GoldenSet: %d questions seed=%d checksum=%s",
+            "GoldenSet: %d questions seed=%d checksum=%s method=%s",
             golden_set.n_questions,
-            args.golden_seed,
+            golden_set.seed,
             golden_set.sample_id_checksum(),
+            golden_set.sampling_protocol.get("method", "unknown"),
         )
+        if args.create_golden_only:
+            print(json.dumps(_golden_summary(golden_set), indent=2, ensure_ascii=False))
+            return 0
 
     # ── 加载本文结果 ─────────────────────────────────────────────────
     if args.sirchmunk_results:
@@ -232,41 +266,21 @@ async def _main() -> int:
     # ── 运行真实 / SDK 竞品 ─────────────────────────────────────────
     if args.baselines and not args.table_only:
         from evaluation.suite import BaselineEvaluationSuite
-        from baselines import (
-            GraphRAGBaseline,
-            LightRAGV1Baseline,
-            LocalBM25Baseline,
-            NaiveRAGBaseline,
-        )
 
         if golden_set is None:
-            from evaluation.golden_set import GoldenSetManager
-            manager = GoldenSetManager(str(_SCRIPT_DIR / args.benchmark))
-            golden_set = manager.get_or_create(
-                adapter=bm_adapter,
-                seed=args.golden_seed,
-                n=args.golden_n,
-            )
+            _, golden_set = _get_or_create_golden_set(args, bm_adapter, sampling_protocol)
+            _attach_sampling_metadata(gen, golden_set)
 
         baseline_list = []
-        for bname in args.baselines.split(","):
-            bname = bname.strip().lower()
-            if bname in ("bm25", "bm25_local"):
-                baseline_list.append(LocalBM25Baseline(max_files=args.bm25_max_files))
-            elif bname in ("naive_rag", "naive_rag_local"):
-                baseline_list.append(NaiveRAGBaseline(max_files=args.naive_rag_max_files))
-            elif bname in ("lightrag", "lightrag_v1"):
-                baseline_list.append(LightRAGV1Baseline(
-                    predictions_path=args.lightrag_predictions,
-                    setup_metrics_path=args.lightrag_setup_metrics,
-                ))
-            elif bname == "graphrag":
-                baseline_list.append(GraphRAGBaseline(
-                    predictions_path=args.graphrag_predictions,
-                    setup_metrics_path=args.graphrag_setup_metrics,
-                ))
-            else:
-                logger.warning("未知竞品名称: '%s'，跳过", bname)
+        for raw_bname in args.baselines.split(","):
+            raw_bname = raw_bname.strip()
+            if not raw_bname:
+                continue
+            try:
+                baseline_list.append(_load_baseline_spec(raw_bname, args))
+            except Exception as exc:
+                logger.error("加载竞品 '%s' 失败: %s", raw_bname, exc)
+                return 1
 
         if baseline_list:
             suite = BaselineEvaluationSuite(
@@ -291,11 +305,8 @@ async def _main() -> int:
         from baselines import ManualImportAdapter
 
         if golden_set is None:
-            from evaluation.golden_set import GoldenSetManager
-            manager = GoldenSetManager(str(_SCRIPT_DIR / args.benchmark))
-            golden_set = manager.get_or_create(
-                adapter=bm_adapter, seed=args.golden_seed, n=args.golden_n
-            )
+            _, golden_set = _get_or_create_golden_set(args, bm_adapter, sampling_protocol)
+            _attach_sampling_metadata(gen, golden_set)
 
         import_adapters = []
         import_setup_paths = _parse_named_paths(args.import_baseline_setup or [])
@@ -352,7 +363,7 @@ async def _main() -> int:
         output_dir=out_dir,
         caption=args.caption,
     )
-    print(f"\n✅ 论文表格已生成：")
+    print("\n✅ 论文表格已生成：")
     for fmt, path in paths.items():
         print(f"   {fmt.upper():8}: {path}")
 
@@ -366,7 +377,7 @@ async def _main() -> int:
             output_dir=report_out,
             title=f"{args.benchmark.upper()} ResearchOps Report",
         )
-        print(f"\n✅ 学术报告已生成：")
+        print("\n✅ 学术报告已生成：")
         for name, path in report_paths.items():
             print(f"   {name.upper():12}: {path}")
     print()
@@ -393,6 +404,175 @@ def _parse_named_paths(specs: list[str]) -> dict[str, str]:
         name, _, path = spec.partition("=")
         out[name.strip()] = str(Path(path.strip()).resolve())
     return out
+
+
+def _load_baseline_spec(raw_name: str, args: argparse.Namespace):
+    from baselines import GraphRAGBaseline, LightRAGV1Baseline, LocalBM25Baseline, NaiveRAGBaseline
+    from baselines.base_adapter import BaselineAdapter
+
+    lower = raw_name.strip().lower()
+    if lower in ("bm25", "bm25_local"):
+        return LocalBM25Baseline(max_files=args.bm25_max_files)
+    if lower in ("naive_rag", "naive_rag_local"):
+        return NaiveRAGBaseline(max_files=args.naive_rag_max_files)
+    if lower in ("lightrag", "lightrag_v1"):
+        return LightRAGV1Baseline(
+            predictions_path=args.lightrag_predictions,
+            setup_metrics_path=args.lightrag_setup_metrics,
+        )
+    if lower == "graphrag":
+        return GraphRAGBaseline(
+            predictions_path=args.graphrag_predictions,
+            setup_metrics_path=args.graphrag_setup_metrics,
+        )
+    if ":" in raw_name:
+        module_name, _, factory_name = raw_name.partition(":")
+        module = importlib.import_module(module_name)
+        factory = getattr(module, factory_name)
+        baseline = factory()
+        if not isinstance(baseline, BaselineAdapter):
+            raise TypeError(f"Factory {raw_name} did not return BaselineAdapter")
+        return baseline
+    raise ValueError("Unknown baseline. Use bm25, naive_rag, lightrag_v1, graphrag, or module:factory.")
+
+
+def _build_sampling_protocol(args: argparse.Namespace, bm_adapter) -> object:
+    if args.sampling_protocol:
+        return load_sampling_protocol(args.sampling_protocol)
+    if args.sample_ids_file:
+        args.sampling_method = "fixed_ids"
+    population_size = _population_size_of(bm_adapter)
+    expected_population_size = args.expected_population_size
+    if not expected_population_size and args.benchmark == "hotpotqa":
+        expected_population_size = DEFAULT_HOTPOTQA_POPULATION_SIZE
+    method = args.sampling_method
+    target_n = 0 if method in {"full", "diagnostic_rare", "fixed_ids"} else args.golden_n
+    strata = args.strata if method == "stratified" else ""
+    split = "validation"
+    try:
+        split = str(bm_adapter.get_run_config().get("split") or "validation")
+    except Exception:
+        pass
+    return create_sampling_protocol(
+        benchmark=args.benchmark,
+        split=split,
+        population_size=population_size,
+        method=method,
+        seed=args.golden_seed,
+        target_n=target_n,
+        strata=strata,
+        allocation=args.sampling_allocation,
+        min_per_stratum=args.min_per_stratum,
+        expected_population_size=expected_population_size,
+        sample_ids_file=str(Path(args.sample_ids_file).expanduser().resolve()) if args.sample_ids_file else "",
+    )
+
+
+def _population_size_of(bm_adapter) -> int:
+    try:
+        if hasattr(bm_adapter, "describe_split"):
+            return int(bm_adapter.describe_split().get("population_size", 0) or 0)
+    except Exception:
+        pass
+    try:
+        return len(bm_adapter.load_samples(limit=0, seed=42))
+    except Exception:
+        return 0
+
+
+def _get_or_create_golden_set(args: argparse.Namespace, bm_adapter, sampling_protocol):
+    from evaluation.golden_set import GoldenSetManager
+
+    manager = GoldenSetManager(str(_SCRIPT_DIR / args.benchmark))
+    target_n = int(getattr(sampling_protocol, "target_n", args.golden_n) or 0)
+    if getattr(sampling_protocol, "method", "") in {"full", "diagnostic_rare", "fixed_ids"}:
+        target_n = 0
+    golden_set = manager.get_or_create(
+        adapter=bm_adapter,
+        seed=int(getattr(sampling_protocol, "seed", args.golden_seed)),
+        n=target_n,
+        sampling_protocol=sampling_protocol,
+    )
+    validation = validate_sampling_manifest(golden_set.sampling_manifest)
+    if not validation["passed"]:
+        raise ValueError(f"Invalid GoldenSet sampling manifest: {validation['errors']}")
+    return manager, golden_set
+
+
+def _attach_sampling_metadata(gen, golden_set) -> None:
+    if golden_set is None or not hasattr(gen, "set_sampling_metadata"):
+        return
+    gen.set_sampling_metadata(_golden_summary(golden_set))
+
+
+def _write_sampling_report(args: argparse.Namespace, golden_set) -> None:
+    if not args.sampling_report_dir or golden_set is None:
+        return
+    out_dir = Path(args.sampling_report_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    method = str(golden_set.sampling_protocol.get("method", "sampling"))
+    seed = int(golden_set.sampling_protocol.get("seed", golden_set.seed) or golden_set.seed)
+    target_n = golden_set.sampling_protocol.get("target_n", golden_set.n_questions)
+    stem = f"sampling_{method}_{seed}_{target_n or 'full'}"
+    (out_dir / f"{stem}_protocol.json").write_text(
+        json.dumps(golden_set.sampling_protocol, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (out_dir / f"{stem}_manifest.json").write_text(
+        json.dumps(golden_set.sampling_manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    write_sample_ids(
+        out_dir / f"{stem}_sample_ids.json",
+        golden_set.sample_ids(),
+        metadata={
+            "benchmark": golden_set.benchmark,
+            "sample_id_checksum": golden_set.sample_id_checksum(),
+            "golden_set_checksum": golden_set.checksum,
+        },
+    )
+
+
+def _golden_summary(golden_set) -> dict:
+    manifest = golden_set.sampling_manifest or {}
+    protocol = golden_set.sampling_protocol or manifest.get("protocol", {}) or {}
+    method = str(protocol.get("method") or "")
+    population_size = int(golden_set.population_size or manifest.get("population_size") or 0)
+    n_questions = int(golden_set.n_questions or manifest.get("actual_n") or 0)
+    if method == "full" and population_size and n_questions == population_size:
+        evaluation_scope = "full_validation"
+    elif method == "diagnostic_rare":
+        evaluation_scope = "diagnostic_rare"
+    elif method == "fixed_ids":
+        evaluation_scope = "fixed_sample_ids"
+    else:
+        evaluation_scope = "sampled_evaluation"
+    return {
+        "benchmark": golden_set.benchmark,
+        "n_questions": n_questions,
+        "population_size": population_size,
+        "evaluation_scope": evaluation_scope,
+        "benchmark_label": _benchmark_label(golden_set.benchmark, evaluation_scope, n_questions),
+        "sample_id_checksum": golden_set.sample_id_checksum(),
+        "golden_set_checksum": golden_set.checksum,
+        "sampling_protocol": protocol,
+        "sampling_manifest": manifest,
+        "sampling_validation": validate_sampling_manifest(manifest),
+    }
+
+
+def _benchmark_label(benchmark: str, evaluation_scope: str, n_questions: int) -> str:
+    if benchmark == "hotpotqa":
+        base = "HotpotQA fullwiki validation"
+    else:
+        base = benchmark
+    if evaluation_scope == "full_validation":
+        return base
+    if evaluation_scope == "diagnostic_rare":
+        return f"{base} diagnostic rare subset (n={n_questions})"
+    if evaluation_scope == "fixed_sample_ids":
+        return f"{base} fixed sample-ID subset (n={n_questions})"
+    return f"{base} sampled subset (n={n_questions})"
 
 
 def main() -> None:

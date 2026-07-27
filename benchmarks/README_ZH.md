@@ -40,7 +40,15 @@ LLM_MODEL_NAME=qwen3.7-plus
 python benchmarks/run_quickstart.py
 ```
 
-这个命令会自动按当前 profile 中配置的样本数（`HOTPOT_LIMIT`；显式传入 `--limit` 时覆盖它）运行配置好的真实 LLM，自动跳过交互式改进确认，定位最新 run artifact，并生成报告。默认使用 `--context-corpus-mode sample`，即把每条样本 parquet 中自带的 context 物化为临时原始文本文件，并筛选 context-answerable 的 smoke 样本，使 quickstart 拥有闭合检索语料。若要测试配置的 raw fullwiki 语料，请显式使用 `--context-corpus-mode wiki`。
+这个命令会自动按当前 profile 中配置的样本数（`HOTPOT_LIMIT`；显式传入 `--limit` 时覆盖它）运行配置好的真实 LLM，自动跳过交互式改进确认，定位最新 run artifact，并生成报告。对于 HotpotQA，默认使用 `--context-corpus-mode sample`，即把每条样本 parquet 中自带的 context 物化为临时原始文本文件，并筛选 context-answerable 的 smoke 样本，使 quickstart 拥有闭合检索语料。若要测试配置的 raw fullwiki 语料，请显式使用 `--context-corpus-mode wiki`。
+
+`run_quickstart.py` 不再只面向 HotpotQA。机制类 benchmark 可以直接指定注册名称：
+
+```bash
+python benchmarks/run_quickstart.py --benchmark setup_cost --limit 1 --skip-report
+```
+
+如果需要在 smoke 之后做轻量级竞品复现检查，追加 `--run-evaluation`。Quickstart 会把本次运行产出的 sample IDs 冻结为 `fixed_ids` GoldenSet，并调用 `run_evaluation.py`，因此内置 baselines、导入式 LightRAG/GraphRAG predictions 和 `module:factory` adapter 都会复用同一批 paired samples。
 
 ### 第 3 步：查看输出
 
@@ -81,7 +89,8 @@ benchmarks/
   storage_overhead/       # 机制 benchmark：存储开销
   source_fidelity/        # 机制 benchmark：原始来源可追溯性
   warm_reuse/             # 机制 benchmark：warm cache / 复用行为
-  run_quickstart.py       # 一键 HotpotQA smoke + report CLI
+  run_quickstart.py       # benchmark 通用 smoke + 可选 baseline evaluation CLI
+  run_sampling.py         # 可审计 GoldenSet 抽样协议 CLI
   run_queue.py            # P3 queue 和无人值守执行 CLI
   run_evaluation.py       # baseline 对比和论文表格 CLI
   run_lifecycle_eval.py   # full-corpus baseline 构建/索引可行性 CLI
@@ -206,9 +215,46 @@ python benchmarks/run_queue.py run \
 
 探索阶段可以使用 warm cache 和辅助诊断，但除非实验明确研究自适应行为，否则应保持 eval feedback 关闭。探索阶段 artifacts 适合用于调试和 badcase 分析，不应用于最终结论。共享的数据路径和搜索默认值应保留在 `.env.hotpotqa.base` 中；profile 文件只覆盖阶段相关的配置键。
 
+### 阶段 1.5：冻结抽样协议
+
+HotpotQA fullwiki validation set 共 7,405 条样本。当全量评估成本过高时，不应把临时 `limit` 当作论文子集。应先用显式 sampling protocol 冻结 GoldenSet，再让所有系统运行同一批 sample IDs。
+
+推荐的主论文 sampled evaluation 为 `n=2000`，按 `type + supporting_fact_bucket` 分层抽样。该分布保留 bridge/comparison 和多跳难度结构，同时避免把 answer type 也纳入主分层后造成稀疏单元。预算允许时应再跑完整 7,405 条 validation set 做最终确认；任何 sampled 结果都必须表述为 sampled evaluation，而不能声称是 full-validation performance。
+
+```bash
+python benchmarks/run_sampling.py describe \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen
+
+python benchmarks/run_sampling.py create \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --method stratified \
+  --target-n 2000 \
+  --seed 42 \
+  --strata type,supporting_fact_bucket \
+  --allocation proportional \
+  --output-dir benchmarks/hotpotqa
+```
+
+`create` 命令会写出 GoldenSet JSON、sampling protocol、sampling manifest 和 `sampling_*_sample_ids.json`。Sirchmunk frozen run 应在私有 frozen env profile 中将 `HOTPOT_SAMPLE_IDS_FILE` 指向该 sample ID 文件。adapter 随后会按文件顺序精确加载这些冻结 ID，因此 Sirchmunk、BM25/NaiveRAG，以及 LightRAG 等导入式竞品都会在同一批 paired samples 上评估。
+
+错误分析应单独创建 rare diagnostic subset：
+
+```bash
+python benchmarks/run_sampling.py create \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --method diagnostic_rare \
+  --seed 42 \
+  --output-dir benchmarks/hotpotqa
+```
+
+该命令会选择 validation set 中所有 supporting facts 不少于 5 个的样本（`n=104`）。它应进入诊断分析或附录，不应作为主表 overall score。
+
 ### 阶段 2：冻结 Sirchmunk 评估（frozen evaluation）
 
-冻结评估生成 Sirchmunk 的主结果。runner 和 protocol validator 会在该阶段执行更严格的约束。
+冻结评估生成 Sirchmunk 的主结果。runner 和 protocol validator 会在该阶段执行更严格的约束。对于 sampled paper evaluation，请在 `benchmarks/hotpotqa/.env.hotpotqa.frozen` 中把 `HOTPOT_SAMPLE_IDS_FILE` 设置为阶段 1.5 生成的 `sampling_*_sample_ids.json`；同时保持 `--limit 0`，让固定 sample ID 文件而不是临时 limit 定义评估集合。
 
 ```bash
 python benchmarks/run_queue.py add-matrix \
@@ -259,7 +305,7 @@ benchmarks/hotpotqa/output/frozen/runs/<run_id>/
 
 ### 阶段 3：Baseline 对比
 
-使用 `run_evaluation.py` 在同一 GoldenSet 上比较 Sirchmunk 与 baselines。该框架会强制 sample ID 一致性，并记录 setup cost 以支持公平比较。
+使用 `run_evaluation.py` 在同一 GoldenSet 上比较 Sirchmunk 与 baselines。该框架会强制 sample ID 一致性，记录 sampling manifest，并记录 setup cost 以支持公平比较。
 
 对于本地 baselines：
 
@@ -269,8 +315,11 @@ python benchmarks/run_evaluation.py \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --sirchmunk-results benchmarks/hotpotqa/output/frozen/results_YYYYMMDD_HHMMSS.jsonl \
   --baselines bm25,naive_rag \
-  --golden-n 0 \
+  --sampling-method stratified \
+  --golden-n 2000 \
   --golden-seed 42 \
+  --strata type,supporting_fact_bucket \
+  --sampling-report-dir benchmarks/hotpotqa/output/paper_table/sampling \
   --baseline-sample-timeout 300 \
   --baseline-max-runtime 172800 \
   --output-dir benchmarks/hotpotqa/output/paper_table
@@ -285,8 +334,10 @@ python benchmarks/run_evaluation.py \
   --sirchmunk-results benchmarks/hotpotqa/output/frozen/results_YYYYMMDD_HHMMSS.jsonl \
   --import-baseline "LightRAG v1=outputs/lightrag_hotpotqa_predictions.jsonl" \
   --import-baseline-setup "LightRAG v1=outputs/lightrag_hotpotqa_setup_metrics.json" \
-  --golden-n 0 \
+  --sampling-method stratified \
+  --golden-n 2000 \
   --golden-seed 42 \
+  --strata type,supporting_fact_bucket \
   --output-dir benchmarks/hotpotqa/output/paper_table
 ```
 
@@ -311,6 +362,7 @@ setup metrics JSON 应报告预处理和索引构建成本：
 论文级 baseline comparison 要求：
 
 - 所有非 published systems 使用完全相同的 sample ID 集合；
+- 任何非 full evaluation 都必须记录 sampling protocol 和 sampling manifest；
 - 每个 baseline 都提供 setup metrics；
 - 导入式 baseline 的 prediction coverage 至少为 95%；
 - 已分类的 baseline failures 低于 validator threshold；
@@ -339,7 +391,7 @@ tables/feasibility_table.{md,tex,json}
 lifecycle_summary.json
 ```
 
-真实接入 LightRAG / GraphRAG / RAPTOR 时，使用 `module:factory` 形式：
+真实接入 LightRAG / GraphRAG / RAPTOR 时，`run_evaluation.py`、lifecycle 和 scaling CLI 都支持 `module:factory` 形式：
 
 ```bash
 --baselines bm25,my_lightrag_adapter:create_lightrag_v1

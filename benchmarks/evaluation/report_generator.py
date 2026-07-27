@@ -102,6 +102,17 @@ class ReportGenerator:
         lines.append(f"- Git commit: `{manifest.get('git_commit')}`")
         lines.append(f"- Config hash: `{manifest.get('config_hash')}`")
         lines.append(f"- Samples: `{metrics.get('n', 'unknown')}`")
+        sampling = table.get("sampling", {}) if isinstance(table.get("sampling", {}), dict) else {}
+        sampling_protocol = sampling.get("sampling_protocol", {}) if isinstance(sampling.get("sampling_protocol", {}), dict) else {}
+        sampling_manifest = sampling.get("sampling_manifest", {}) if isinstance(sampling.get("sampling_manifest", {}), dict) else {}
+        if sampling:
+            lines.append(f"- Evaluation scope: `{sampling.get('evaluation_scope', 'unknown')}`")
+            if sampling.get("benchmark_label"):
+                lines.append(f"- Benchmark label: `{sampling.get('benchmark_label')}`")
+            lines.append(f"- Sampling method: `{sampling_protocol.get('method', 'unknown')}`")
+            lines.append(f"- Population size: `{sampling.get('population_size', sampling_manifest.get('population_size', 'unknown'))}`")
+            lines.append(f"- Sampled questions: `{sampling.get('n_questions', sampling_manifest.get('actual_n', 'unknown'))}`")
+            lines.append(f"- Sample ID checksum: `{sampling.get('sample_id_checksum', sampling_manifest.get('sample_id_checksum', ''))}`")
         if metrics:
             if "official_exact_match" in metrics:
                 lines.append(f"- Official exact match: `{metrics.get('official_exact_match')}`")
@@ -117,6 +128,20 @@ class ReportGenerator:
             if "latency" in metrics:
                 lines.append(f"- Latency: `{json.dumps(metrics.get('latency'), ensure_ascii=False)}`")
         lines.append("")
+
+        if sampling:
+            lines.append("## Sampling Protocol")
+            lines.append(f"- Method: `{sampling_protocol.get('method', 'unknown')}`")
+            lines.append(f"- Evaluation scope: `{sampling.get('evaluation_scope', 'unknown')}`")
+            lines.append(f"- Seed: `{sampling_protocol.get('seed', 'unknown')}`")
+            lines.append(f"- Target N: `{sampling_protocol.get('target_n', 'unknown')}`")
+            lines.append(f"- Strata: `{', '.join(sampling_protocol.get('strata', []) or [])}`")
+            lines.append(f"- Allocation: `{sampling_protocol.get('allocation', 'n/a')}`")
+            deviation = sampling_manifest.get('deviation_report', {}) if isinstance(sampling_manifest, dict) else {}
+            if deviation:
+                lines.append(f"- Max absolute distribution delta: `{deviation.get('max_abs_proportion_delta', 'n/a')}`")
+            lines.append("- Publication claim rule: sampled tables must be described as sampled evaluation unless `method=full` and actual N equals the population size.")
+            lines.append("")
 
         if table.get("systems"):
             lines.append("## Main Result Table")

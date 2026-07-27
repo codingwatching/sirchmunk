@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+
+from evaluation.sampling_protocol import DEFAULT_HOTPOTQA_POPULATION_SIZE, compute_sample_id_checksum
 
 
 @dataclass
@@ -281,6 +283,7 @@ class AcademicReportValidator:
         if len(sample_sizes) > 1:
             issues.append(ValidationIssue("error", "paired_samples", f"Non-published systems have different sample sizes: {sorted(sample_sizes)}", str(table_path)))
         non_published = [s for s in systems if not s.get("is_published_only")]
+        issues.extend(self._validate_table_sampling(table_path, table, non_published))
         missing_checksums = [s.get("system_name") for s in non_published if not s.get("sample_id_checksum")]
         if missing_checksums:
             issues.append(ValidationIssue("error", "sample_id_checksum", f"Systems lack sample_id_checksum: {missing_checksums}", str(table_path)))
@@ -320,6 +323,66 @@ class AcademicReportValidator:
                 missing_samples = int(system.get("missing_samples", 0) or 0)
                 if missing_samples and not system.get("missing_sample_ids"):
                     issues.append(ValidationIssue("warning", "import_missing_samples", f"Imported baseline '{system.get('system_name')}' has missing samples without sample id details.", str(table_path)))
+        return issues
+
+    def _validate_table_sampling(
+        self,
+        table_path: Path,
+        table: Dict[str, Any],
+        non_published: List[Dict[str, Any]],
+    ) -> List[ValidationIssue]:
+        issues: List[ValidationIssue] = []
+        if not non_published:
+            return issues
+        sampling = table.get("sampling") if isinstance(table.get("sampling"), dict) else {}
+        if not sampling:
+            return [ValidationIssue("error", "sampling", "Paper table must include sampling metadata for non-published systems.", str(table_path))]
+        protocol = sampling.get("sampling_protocol", {}) if isinstance(sampling.get("sampling_protocol", {}), dict) else {}
+        manifest = sampling.get("sampling_manifest", {}) if isinstance(sampling.get("sampling_manifest", {}), dict) else {}
+        if not protocol:
+            issues.append(ValidationIssue("error", "sampling_protocol", "Sampling protocol is missing from paper table JSON.", str(table_path)))
+        if not manifest:
+            issues.append(ValidationIssue("error", "sampling_manifest", "Sampling manifest is missing from paper table JSON.", str(table_path)))
+        method = str(protocol.get("method") or "")
+        evaluation_scope = str(sampling.get("evaluation_scope") or "")
+        if method not in {"simple_random", "stratified", "full", "diagnostic_rare", "fixed_ids", "random", "stratified_proportional"}:
+            issues.append(ValidationIssue("error", "sampling_method", f"Unsupported or missing sampling method: {method!r}.", str(table_path)))
+        sample_ids = manifest.get("sample_ids", []) if isinstance(manifest, dict) else []
+        sample_checksum = str(sampling.get("sample_id_checksum") or manifest.get("sample_id_checksum") or "")
+        if not sample_ids:
+            issues.append(ValidationIssue("error", "sampling_sample_ids", "Sampling manifest must record fixed sample_ids.", str(table_path)))
+        elif sample_checksum and sample_checksum != compute_sample_id_checksum([str(s) for s in sample_ids]):
+            issues.append(ValidationIssue("error", "sampling_checksum", "Sampling sample_id_checksum does not match sample_ids.", str(table_path)))
+        if not sample_checksum:
+            issues.append(ValidationIssue("error", "sampling_checksum", "Sampling metadata must record sample_id_checksum.", str(table_path)))
+        if method != "full" and not evaluation_scope:
+            issues.append(ValidationIssue("error", "sampling_scope", "Sampled/fixed/diagnostic evaluation must explicitly record evaluation_scope.", str(table_path)))
+        if evaluation_scope == "full_validation" and method != "full":
+            issues.append(ValidationIssue("error", "sampling_scope", "evaluation_scope=full_validation is only valid when sampling method is full.", str(table_path)))
+        system_checksums = {s.get("sample_id_checksum") for s in non_published if s.get("sample_id_checksum")}
+        if sample_checksum and system_checksums and system_checksums != {sample_checksum}:
+            issues.append(ValidationIssue("error", "sampling_pairing", "System rows do not share the sampling sample_id_checksum.", str(table_path)))
+        population_size = _safe_int(sampling.get("population_size") or manifest.get("population_size") or protocol.get("population_size"))
+        actual_n = _safe_int(sampling.get("n_questions") or manifest.get("actual_n"))
+        expected_population = _safe_int(protocol.get("expected_population_size"))
+        benchmark = str(protocol.get("benchmark") or table.get("benchmark") or "").lower()
+        split = str(protocol.get("split") or "").lower()
+        if "hotpotqa" in benchmark and (not split or split == "validation"):
+            expected_population = expected_population or DEFAULT_HOTPOTQA_POPULATION_SIZE
+        if expected_population and population_size != expected_population:
+            issues.append(ValidationIssue("error", "sampling_population", f"Population size mismatch: expected {expected_population}, got {population_size}.", str(table_path)))
+        if method == "full" and population_size and actual_n != population_size:
+            issues.append(ValidationIssue("error", "sampling_full", "Full evaluation must have actual_n equal to population_size.", str(table_path)))
+        if method != "full" and population_size and actual_n == population_size:
+            issues.append(ValidationIssue("warning", "sampling_claim", "Sampling method is not full but actual_n equals population_size; verify claim wording.", str(table_path)))
+        if method.startswith("stratified"):
+            strata = protocol.get("strata") if isinstance(protocol.get("strata"), list) else []
+            if not strata:
+                issues.append(ValidationIssue("error", "sampling_strata", "Stratified sampling must record strata keys.", str(table_path)))
+            before = manifest.get("distribution_before", {}) if isinstance(manifest, dict) else {}
+            after = manifest.get("distribution_after", {}) if isinstance(manifest, dict) else {}
+            if not (isinstance(before, dict) and before.get("strata") and isinstance(after, dict) and after.get("strata")):
+                issues.append(ValidationIssue("error", "sampling_distribution", "Stratified sampling must record before/after strata distributions.", str(table_path)))
         return issues
 
 

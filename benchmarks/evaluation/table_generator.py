@@ -24,7 +24,7 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from framework.metric_engine import collect_setup_metrics
 
@@ -32,7 +32,6 @@ from .golden_set import compute_sample_id_checksum
 from .statistics import (
     bonferroni_correction,
     bootstrap_ci,
-    cohens_h,
     mcnemar_test,
     significance_marker,
 )
@@ -69,6 +68,13 @@ class SystemEntry:
     covered_samples: int = 0
     missing_samples: int = 0
     missing_sample_ids: List[str] = field(default_factory=list)
+    sampling_method: str = ""
+    population_size: int = 0
+    sampled_n: int = 0
+    sampling_protocol: Dict[str, Any] = field(default_factory=dict)
+    sampling_manifest: Dict[str, Any] = field(default_factory=dict)
+    strata_distribution: Dict[str, Any] = field(default_factory=dict)
+    weighted_metric_available: bool = False
     # 显著性（由 finalize() 填入）
     p_value: Optional[float] = None
     is_significant: bool = False
@@ -114,6 +120,11 @@ class PaperTableGenerator:
         self._benchmark = benchmark_name
         self._our_name = our_system_name
         self._entries: List[SystemEntry] = []
+        self._sampling_metadata: Dict[str, Any] = {}
+
+    def set_sampling_metadata(self, sampling_metadata: Dict[str, Any]) -> None:
+        """Attach auditable sampling metadata to the whole table and each row."""
+        self._sampling_metadata = dict(sampling_metadata or {})
 
     # ------------------------------------------------------------------
     # 数据输入接口
@@ -197,6 +208,8 @@ class PaperTableGenerator:
             for qt, v in by_qt.items()
         }
 
+        sampling_protocol = self._sampling_metadata.get("sampling_protocol", {}) if isinstance(self._sampling_metadata, dict) else {}
+        sampling_manifest = self._sampling_metadata.get("sampling_manifest", {}) if isinstance(self._sampling_metadata, dict) else {}
         entry = SystemEntry(
             system_name=system_name,
             n=n,
@@ -224,6 +237,13 @@ class PaperTableGenerator:
             covered_samples=covered_samples,
             missing_samples=missing_samples,
             missing_sample_ids=missing_sample_ids[:50],
+            sampling_method=str(sampling_protocol.get("method", "")),
+            population_size=int(self._sampling_metadata.get("population_size", 0) or 0) if isinstance(self._sampling_metadata, dict) else 0,
+            sampled_n=int(self._sampling_metadata.get("n_questions", n) or n) if isinstance(self._sampling_metadata, dict) else n,
+            sampling_protocol=sampling_protocol,
+            sampling_manifest=sampling_manifest,
+            strata_distribution=sampling_manifest.get("distribution_after", {}).get("strata", {}) if isinstance(sampling_manifest.get("distribution_after", {}), dict) else {},
+            weighted_metric_available=bool(sampling_manifest.get("weighted_metrics")),
         )
         self._entries.append(entry)
 
@@ -601,6 +621,7 @@ class PaperTableGenerator:
     def _to_json(self) -> str:
         data = {
             "benchmark": self._benchmark,
+            "sampling": self._sampling_metadata,
             "systems": [
                 {
                     "system_name":       e.system_name,
@@ -630,6 +651,13 @@ class PaperTableGenerator:
                     "covered_samples":    e.covered_samples,
                     "missing_samples":    e.missing_samples,
                     "missing_sample_ids": e.missing_sample_ids,
+                    "sampling_method":    e.sampling_method,
+                    "population_size":    e.population_size,
+                    "sampled_n":          e.sampled_n,
+                    "sampling_protocol":  e.sampling_protocol,
+                    "sampling_manifest":  e.sampling_manifest,
+                    "strata_distribution": e.strata_distribution,
+                    "weighted_metric_available": e.weighted_metric_available,
                     "by_question_type":  e.by_question_type,
                 }
                 for e in self._entries

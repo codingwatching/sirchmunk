@@ -36,10 +36,12 @@ sys.path.insert(0, str(_BENCHMARKS_ROOT))
 from framework.adapter import BenchmarkAdapter  # noqa: E402
 from framework.protocol import default_protocol  # noqa: E402
 from framework.schema import BenchmarkSample    # noqa: E402
+from evaluation.sampling_protocol import extract_sample_ids  # noqa: E402
 from hotpotqa.evidence import evaluate_supporting_facts  # noqa: E402
 from hotpotqa.judge import HotpotQAJudge  # noqa: E402
 from hotpotqa.loader import (  # noqa: E402
     build_dataset_manifest,
+    describe_hotpotqa_split,
     load_hotpotqa_samples,
     validate_hotpotqa_corpus,
 )
@@ -138,23 +140,38 @@ class HotpotQAAdapter(BenchmarkAdapter):
     # ------------------------------------------------------------------
 
     def load_samples(self, limit: int = 0, seed: int = 42) -> List[BenchmarkSample]:
-        """Load HotpotQA samples from parquet files via HotpotQALoader."""
-        dataset_dir = Path(self._get("HOTPOT_DATASET_DIR", ""))
-        setting = self._get("HOTPOT_SETTING", "fullwiki")
-        split = self._get("HOTPOT_SPLIT", "validation")
-        samples = load_hotpotqa_samples(
-            dataset_dir,
-            setting=setting,
-            split=split,
-            limit=0 if self._require_context_answerable() else limit,
-            seed=seed,
-        )
+        """Load HotpotQA samples from parquet files via HotpotQALoader.
+
+        If HOTPOT_SAMPLE_IDS_FILE is configured, the adapter returns exactly
+        those sample IDs in file order.  This lets Sirchmunk frozen runs execute
+        the same sampled GoldenSet used later by run_evaluation.py.
+        """
+        samples = self.load_sampling_population(seed=seed)
+        fixed_sample_ids_file = self._sample_ids_file()
         if self._require_context_answerable():
             samples = [s for s in samples if self._is_context_answerable(s)]
-            if limit > 0 and limit < len(samples):
-                random.seed(seed)
-                samples = random.sample(samples, limit)
+        if fixed_sample_ids_file:
+            samples = self._filter_samples_by_ids(samples, fixed_sample_ids_file)
+        elif limit > 0 and limit < len(samples):
+            random.seed(seed)
+            samples = random.sample(samples, limit)
         return samples
+
+    def load_sampling_population(self, seed: int = 42) -> List[BenchmarkSample]:
+        """Load the full declared split for sampling protocol generation.
+
+        This intentionally ignores HOTPOT_SAMPLE_IDS_FILE and context-answerable
+        smoke filters so GoldenSet creation always sees the 7405-example
+        fullwiki validation population.
+        """
+        dataset_dir = Path(self._get("HOTPOT_DATASET_DIR", ""))
+        return load_hotpotqa_samples(
+            dataset_dir,
+            setting=self._get("HOTPOT_SETTING", "fullwiki"),
+            split=self._get("HOTPOT_SPLIT", "validation"),
+            limit=0,
+            seed=seed,
+        )
 
     def validate_corpus(self) -> Tuple[int, List[str]]:
         """Validate HotpotQA wiki corpus availability."""
@@ -191,6 +208,7 @@ class HotpotQAAdapter(BenchmarkAdapter):
             "setting":          self._get("HOTPOT_SETTING", "fullwiki"),
             "split":            self._get("HOTPOT_SPLIT", "validation"),
             "limit":            self.get_profile_limit(0),
+            "sample_ids_file":   self._sample_ids_file(),
             "context_corpus_mode": self._context_corpus_mode(),
             "require_context_answerable": self._require_context_answerable(),
             "reuse_knowledge":  self._get_bool("HOTPOT_REUSE_KNOWLEDGE", False),
@@ -236,9 +254,16 @@ class HotpotQAAdapter(BenchmarkAdapter):
     def build_judge(self) -> Optional[Any]:
         """Build HotpotQA EM/F1 judge with optional LLM semantic fallback."""
         if self._judge is None:
-            searcher = self.build_searcher()
+            try:
+                searcher = self.build_searcher()
+                llm = getattr(searcher, "llm", None)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to build HotpotQA judge because the shared searcher/LLM could not be initialized. "
+                    "Check LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME, and benchmark env layering."
+                ) from exc
             self._judge = HotpotQAJudge(
-                llm=getattr(searcher, "llm", None),
+                llm=llm,
                 enable_llm_judge=self._get_bool("HOTPOT_ENABLE_LLM_JUDGE", True),
                 llm_fallback_f1_threshold=float(self._get("HOTPOT_JUDGE_F1_THRESHOLD", "0.3")),
             )
@@ -281,6 +306,9 @@ class HotpotQAAdapter(BenchmarkAdapter):
             "hotpot_id": sample.sample_id,
             "type":      sample.metadata.get("type", ""),
             "level":     sample.metadata.get("level", ""),
+            "answer_type": sample.metadata.get("answer_type", ""),
+            "supporting_fact_count": sample.metadata.get("supporting_fact_count", 0),
+            "supporting_fact_bucket": sample.metadata.get("supporting_fact_bucket", ""),
             "supporting_facts": sample.metadata.get("supporting_facts", []),
         }
 
@@ -299,17 +327,32 @@ class HotpotQAAdapter(BenchmarkAdapter):
             "coverage",
         ]
         protocol["metrics"]["retrieval"] = ["evidence_recall", "supporting_fact_hit_rate", "source_grounding_accuracy"]
+        sample_ids_file = self._sample_ids_file()
+        if sample_ids_file:
+            protocol["sampling"] = {
+                "sample_ids_file": sample_ids_file,
+                "method": "fixed_sample_ids",
+            }
         protocol["limit"] = limit
         return protocol
 
     def get_dataset_manifest(self) -> Dict[str, Any]:
         dataset_dir = Path(self._get("HOTPOT_DATASET_DIR", ""))
-        return build_dataset_manifest(
+        manifest = build_dataset_manifest(
             dataset_dir,
             Path(self._wiki_dir()),
             setting=self._get("HOTPOT_SETTING", "fullwiki"),
             split=self._get("HOTPOT_SPLIT", "validation"),
         )
+        sample_ids_file = self._sample_ids_file()
+        if sample_ids_file:
+            manifest["sample_ids_file"] = sample_ids_file
+            try:
+                ids = extract_sample_ids(sample_ids_file)
+                manifest["sample_ids_count"] = len(ids)
+            except Exception as exc:
+                manifest["sample_ids_error"] = str(exc)
+        return manifest
 
     def enrich_telemetry(self, sample, prediction, telemetry, **kwargs) -> Dict[str, Any]:
         return evaluate_supporting_facts(
@@ -350,6 +393,43 @@ class HotpotQAAdapter(BenchmarkAdapter):
 
     def get_metric_aggregator(self):
         return compute_hotpotqa_metrics
+
+    def describe_split(self) -> Dict[str, Any]:
+        """Return HotpotQA split distribution for sampling protocol design."""
+        return describe_hotpotqa_split(
+            Path(self._get("HOTPOT_DATASET_DIR", "")),
+            setting=self._get("HOTPOT_SETTING", "fullwiki"),
+            split=self._get("HOTPOT_SPLIT", "validation"),
+        )
+
+    def _sample_ids_file(self) -> str:
+        raw = self._get("HOTPOT_SAMPLE_IDS_FILE", "").strip()
+        if not raw:
+            return ""
+        path = Path(raw).expanduser()
+        if path.is_absolute():
+            return str(path.resolve())
+        candidates = [
+            (_HERE / path),
+            (_PROJECT_ROOT / path),
+            (_BENCHMARKS_ROOT / path),
+            (Path.cwd() / path),
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate.resolve())
+        return str((_HERE / path).resolve())
+
+    def _filter_samples_by_ids(self, samples: List[BenchmarkSample], sample_ids_file: str) -> List[BenchmarkSample]:
+        sample_ids = extract_sample_ids(sample_ids_file)
+        by_id = {str(sample.sample_id): sample for sample in samples}
+        missing = [sample_id for sample_id in sample_ids if sample_id not in by_id]
+        if missing:
+            raise ValueError(
+                f"HOTPOT_SAMPLE_IDS_FILE references ids not present in loaded split: "
+                f"missing={missing[:10]} total_missing={len(missing)}"
+            )
+        return [by_id[sample_id] for sample_id in sample_ids]
 
     def _wiki_dir(self) -> str:
         dataset_dir = Path(self._get("HOTPOT_DATASET_DIR", ""))

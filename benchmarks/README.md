@@ -40,7 +40,15 @@ LLM_MODEL_NAME=qwen3.7-plus
 python benchmarks/run_quickstart.py
 ```
 
-This command runs the sample count configured by the active profile (`HOTPOT_LIMIT`; `--limit` explicitly overrides it) with the configured real LLM provider, automatically skips the interactive improvement step, locates the generated run artifact, and generates a report. By default it uses `--context-corpus-mode sample`, which materializes each sample's parquet context as temporary raw-text files and filters to context-answerable smoke samples so the quickstart has a closed retrieval corpus. Use `--context-corpus-mode wiki` when you want to exercise the configured raw fullwiki corpus instead.
+This command runs the sample count configured by the active profile (`HOTPOT_LIMIT`; `--limit` explicitly overrides it) with the configured real LLM provider, automatically skips the interactive improvement step, locates the generated run artifact, and generates a report. By default it uses `--context-corpus-mode sample` for HotpotQA, which materializes each sample's parquet context as temporary raw-text files and filters to context-answerable smoke samples so the quickstart has a closed retrieval corpus. Use `--context-corpus-mode wiki` when you want to exercise the configured raw fullwiki corpus instead.
+
+`run_quickstart.py` is no longer limited to HotpotQA. For mechanism benchmarks, pass another registered benchmark name:
+
+```bash
+python benchmarks/run_quickstart.py --benchmark setup_cost --limit 1 --skip-report
+```
+
+To perform a lightweight competitor-reproduction smoke after the run, add `--run-evaluation`. Quickstart freezes the produced sample IDs into a `fixed_ids` GoldenSet and calls `run_evaluation.py`, so built-in baselines, imported LightRAG/GraphRAG predictions, and `module:factory` adapters all reuse the same paired samples.
 
 ### Step 3: Read The Outputs
 
@@ -81,7 +89,8 @@ benchmarks/
   storage_overhead/       # Mechanism benchmark: storage overhead
   source_fidelity/        # Mechanism benchmark: raw-source traceability
   warm_reuse/             # Mechanism benchmark: warm cache / reuse behavior
-  run_quickstart.py       # One-command HotpotQA smoke + report CLI
+  run_quickstart.py       # Benchmark-agnostic smoke + optional baseline evaluation CLI
+  run_sampling.py         # Auditable GoldenSet sampling protocol CLI
   run_queue.py            # P3 queue and unattended execution CLI
   run_evaluation.py       # Baseline comparison and paper table CLI
   run_lifecycle_eval.py   # Full-corpus baseline build/index feasibility CLI
@@ -206,9 +215,46 @@ python benchmarks/run_queue.py run \
 
 Exploration may use warm cache and auxiliary diagnostics, but it should keep eval feedback disabled unless the experiment is explicitly designed to study adaptive behavior. Exploration artifacts are useful for debugging and badcase analysis, not for final claims. Shared dataset and search defaults should remain in `.env.hotpotqa.base`; profile files should only override the stage-dependent keys.
 
+### Stage 1.5: Freeze The Sampling Protocol
+
+HotpotQA fullwiki validation contains 7,405 examples. When full evaluation is too expensive for iteration, do not use an ad hoc `limit` as a paper subset. First freeze a GoldenSet with an explicit sampling protocol, then run every system on the same sample IDs.
+
+The recommended main sampled evaluation is `n=2000`, stratified by `type + supporting_fact_bucket`. This preserves the bridge/comparison and multi-hop difficulty mix while avoiding sparse cells from over-stratifying on answer type. Use the full 7,405-example validation set for final confirmation when budget allows, and report any sampled result as sampled evaluation rather than full-validation performance.
+
+```bash
+python benchmarks/run_sampling.py describe \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen
+
+python benchmarks/run_sampling.py create \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --method stratified \
+  --target-n 2000 \
+  --seed 42 \
+  --strata type,supporting_fact_bucket \
+  --allocation proportional \
+  --output-dir benchmarks/hotpotqa
+```
+
+The create command writes a GoldenSet JSON, a sampling protocol, a sampling manifest, and a `sampling_*_sample_ids.json` file. For the Sirchmunk frozen run, set `HOTPOT_SAMPLE_IDS_FILE` in the private frozen env profile to that sample ID file. The adapter will then load exactly the frozen IDs in file order, so Sirchmunk, BM25/NaiveRAG, and imported systems such as LightRAG are evaluated on the same paired samples.
+
+For error analysis, create the rare diagnostic subset separately:
+
+```bash
+python benchmarks/run_sampling.py create \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --method diagnostic_rare \
+  --seed 42 \
+  --output-dir benchmarks/hotpotqa
+```
+
+This selects all validation examples with at least five supporting facts (`n=104`) and should be reported as diagnostic analysis, not as the main overall score.
+
 ### Stage 2: Frozen Sirchmunk Evaluation
 
-Frozen evaluation produces the main Sirchmunk result. The runner and protocol validator enforce stricter constraints in this stage.
+Frozen evaluation produces the main Sirchmunk result. The runner and protocol validator enforce stricter constraints in this stage. For sampled paper evaluation, set `HOTPOT_SAMPLE_IDS_FILE` in `benchmarks/hotpotqa/.env.hotpotqa.frozen` to the `sampling_*_sample_ids.json` created in Stage 1.5; keep `--limit 0` so the fixed sample ID file, not an ad hoc limit, defines the evaluation set.
 
 ```bash
 python benchmarks/run_queue.py add-matrix \
@@ -259,7 +305,7 @@ benchmarks/hotpotqa/output/frozen/runs/<run_id>/
 
 ### Stage 3: Baseline Comparison
 
-Use `run_evaluation.py` to compare Sirchmunk with baselines on the same GoldenSet. The framework enforces sample ID consistency and records setup cost for fair comparison.
+Use `run_evaluation.py` to compare Sirchmunk with baselines on the same GoldenSet. The framework enforces sample ID consistency, records the sampling manifest, and records setup cost for fair comparison.
 
 For local baselines:
 
@@ -269,8 +315,11 @@ python benchmarks/run_evaluation.py \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --sirchmunk-results benchmarks/hotpotqa/output/frozen/results_YYYYMMDD_HHMMSS.jsonl \
   --baselines bm25,naive_rag \
-  --golden-n 0 \
+  --sampling-method stratified \
+  --golden-n 2000 \
   --golden-seed 42 \
+  --strata type,supporting_fact_bucket \
+  --sampling-report-dir benchmarks/hotpotqa/output/paper_table/sampling \
   --baseline-sample-timeout 300 \
   --baseline-max-runtime 172800 \
   --output-dir benchmarks/hotpotqa/output/paper_table
@@ -285,8 +334,10 @@ python benchmarks/run_evaluation.py \
   --sirchmunk-results benchmarks/hotpotqa/output/frozen/results_YYYYMMDD_HHMMSS.jsonl \
   --import-baseline "LightRAG v1=outputs/lightrag_hotpotqa_predictions.jsonl" \
   --import-baseline-setup "LightRAG v1=outputs/lightrag_hotpotqa_setup_metrics.json" \
-  --golden-n 0 \
+  --sampling-method stratified \
+  --golden-n 2000 \
   --golden-seed 42 \
+  --strata type,supporting_fact_bucket \
   --output-dir benchmarks/hotpotqa/output/paper_table
 ```
 
@@ -311,6 +362,7 @@ The setup metrics JSON should report preprocessing and indexing cost:
 Publication-grade baseline comparison requires:
 
 - identical sample ID sets for all non-published systems;
+- a recorded sampling protocol and sampling manifest for any non-full evaluation;
 - setup metrics for every baseline;
 - imported baseline prediction coverage of at least 95%;
 - classified baseline failures below the validator threshold;
@@ -339,7 +391,7 @@ tables/feasibility_table.{md,tex,json}
 lifecycle_summary.json
 ```
 
-Use `module:factory` baseline specs to plug in real index-heavy competitors:
+Use `module:factory` baseline specs to plug in real index-heavy competitors in both `run_evaluation.py` and lifecycle/scaling CLIs:
 
 ```bash
 --baselines bm25,my_lightrag_adapter:create_lightrag_v1
