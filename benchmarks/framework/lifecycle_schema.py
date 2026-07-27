@@ -96,6 +96,9 @@ class BaselineLifecycleRecord:
     build_completed: bool = False
     index_ready: bool = False
     query_eligible: bool = False
+    rebuild_required: bool = False
+    query_ready_immediately: bool = False
+    partial_index: bool = False
     build_time_seconds: float = 0.0
     preprocessing_seconds: float = 0.0
     index_build_seconds: float = 0.0

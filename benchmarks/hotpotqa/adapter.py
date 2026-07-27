@@ -375,6 +375,41 @@ class HotpotQAAdapter(BenchmarkAdapter):
                 manifest["sample_ids_error"] = str(exc)
         return manifest
 
+    def get_title_resolver(self):
+        """Return a HotpotQA raw wiki title resolver for v4 dynamic snapshots."""
+        from hotpotqa.title_resolver import HotpotQATitleResolver
+        return HotpotQATitleResolver(self._wiki_dir())
+
+    def derive_v4_sample_sets(self, golden_set: Any, *, stages: List[int], output_dir: str | Path):
+        """Derive nested G_n sample-id artifacts from a parent GoldenSet."""
+        from hotpotqa.dynamic_corpus import derive_nested_sample_sets
+        return derive_nested_sample_sets(golden_set, stages=stages, output_dir=output_dir)
+
+    def build_v4_corpus_snapshot(
+        self,
+        samples: List[BenchmarkSample],
+        *,
+        sample_ids: List[str],
+        output_dir: str | Path,
+        stage_name: str,
+        materialize_mode: str = "symlink",
+        background_ratio: float = 3.0,
+        background_seed: int = 42,
+    ):
+        """Build a D_n snapshot aligned with one frozen G_n sample-id set."""
+        from hotpotqa.dynamic_corpus import build_dynamic_corpus_snapshot
+        return build_dynamic_corpus_snapshot(
+            samples,
+            sample_ids=sample_ids,
+            wiki_dir=self._wiki_dir(),
+            output_dir=output_dir,
+            stage_name=stage_name,
+            materialize_mode=materialize_mode,
+            background_ratio=background_ratio,
+            background_seed=background_seed,
+            resolver=self.get_title_resolver(),
+        )
+
     def enrich_telemetry(self, sample, prediction, telemetry, **kwargs) -> Dict[str, Any]:
         return evaluate_supporting_facts(
             sample.metadata.get("supporting_facts", []),

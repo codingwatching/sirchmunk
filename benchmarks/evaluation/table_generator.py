@@ -53,6 +53,11 @@ class SystemEntry:
     coverage: float = 0.0
     avg_latency: float = 0.0  # 秒
     avg_tokens: float = 0.0
+    evidence_recall: float = 0.0
+    supporting_fact_title_recall: float = 0.0
+    source_grounding_accuracy: float = 0.0
+    corpus_checksum: str = ""
+    frozen_order_checksum: str = ""
     by_question_type: Dict[str, Dict] = field(default_factory=dict)
     is_ours: bool = False
     is_published_only: bool = False   # True = 只有发表数字，无 CI
@@ -167,6 +172,9 @@ class PaperTableGenerator:
         metric_payloads = [_metric_payload_of(r) for r in ordered_results]
         official_em_values = [float(p.get("official_em", p.get("em", 0.0)) or 0.0) for p in metric_payloads]
         official_f1_values = [float(p.get("official_f1", p.get("f1", 0.0)) or 0.0) for p in metric_payloads]
+        evidence_recall_values = [float(p.get("evidence_recall", 0.0) or 0.0) for p in metric_payloads]
+        title_recall_values = [float(p.get("supporting_fact_title_recall", 0.0) or 0.0) for p in metric_payloads]
+        grounded_values = [1.0 if p.get("answer_source_grounded") else 0.0 for p in metric_payloads]
         failure_counts: Dict[str, int] = defaultdict(int)
         imported_baseline = False
         missing_sample_ids: List[str] = []
@@ -210,6 +218,7 @@ class PaperTableGenerator:
 
         sampling_protocol = self._sampling_metadata.get("sampling_protocol", {}) if isinstance(self._sampling_metadata, dict) else {}
         sampling_manifest = self._sampling_metadata.get("sampling_manifest", {}) if isinstance(self._sampling_metadata, dict) else {}
+        corpus_metadata = self._sampling_metadata.get("corpus_snapshot", {}) if isinstance(self._sampling_metadata, dict) else {}
         entry = SystemEntry(
             system_name=system_name,
             n=n,
@@ -222,6 +231,11 @@ class PaperTableGenerator:
             coverage=round(sum(coverage_list) / n * 100, 1),
             avg_latency=round(sum(latencies) / n, 1) if latencies else 0.0,
             avg_tokens=round(sum(tokens) / n, 1) if tokens else 0.0,
+            evidence_recall=round(sum(evidence_recall_values) / n * 100, 1) if n else 0.0,
+            supporting_fact_title_recall=round(sum(title_recall_values) / n * 100, 1) if n else 0.0,
+            source_grounding_accuracy=round(sum(grounded_values) / n * 100, 1) if n else 0.0,
+            corpus_checksum=str(corpus_metadata.get("corpus_checksum", "")),
+            frozen_order_checksum=str(corpus_metadata.get("frozen_order_checksum", "")),
             by_question_type=by_qt_final,
             is_ours=bool(is_ours or (self._our_name and system_name == self._our_name)),
             is_published_only=False,
@@ -633,6 +647,9 @@ class PaperTableGenerator:
                     "ci_lower":          e.ci_lower,
                     "ci_upper":          e.ci_upper,
                     "coverage":          e.coverage,
+                    "evidence_recall":   e.evidence_recall,
+                    "supporting_fact_title_recall": e.supporting_fact_title_recall,
+                    "source_grounding_accuracy": e.source_grounding_accuracy,
                     "avg_latency":       e.avg_latency,
                     "avg_tokens":        e.avg_tokens,
                     "is_ours":           e.is_ours,
@@ -641,6 +658,8 @@ class PaperTableGenerator:
                     "is_significant":    e.is_significant,
                     "sig_marker":        e.sig_marker,
                     "sample_id_checksum": e.sample_id_checksum,
+                    "frozen_order_checksum": e.frozen_order_checksum,
+                    "corpus_checksum":    e.corpus_checksum,
                     "sample_ids":         e.sample_ids,
                     "setup_metrics":      e.setup_metrics,
                     "failure_counts":     e.failure_counts,
@@ -727,20 +746,33 @@ def _format_failure_counts(entry: SystemEntry, *, latex: bool = False) -> str:
 
 
 def _metric_payload_of(result: Any) -> Dict[str, Any]:
-    telemetry = getattr(result, "telemetry", None)
-    if isinstance(telemetry, dict) and telemetry:
-        return telemetry
-    metadata = getattr(result, "metadata", None)
-    if isinstance(metadata, dict):
-        judge_result = metadata.get("judge_result")
-        if isinstance(judge_result, dict):
-            return judge_result
+    payload: Dict[str, Any] = {}
     raw = getattr(result, "raw", None)
     if isinstance(raw, dict):
         per_sample = raw.get("per_sample_eval")
         if isinstance(per_sample, dict):
-            return per_sample
-    return {}
+            payload.update(per_sample)
+        raw_telemetry = raw.get("telemetry")
+        if isinstance(raw_telemetry, dict):
+            payload.update(raw_telemetry)
+    metadata = getattr(result, "metadata", None)
+    if isinstance(metadata, dict):
+        judge_result = metadata.get("judge_result")
+        if isinstance(judge_result, dict):
+            payload.update(judge_result)
+        for key in (
+            "evidence_recall",
+            "supporting_fact_title_recall",
+            "answer_source_grounded",
+            "official_em",
+            "official_f1",
+        ):
+            if key in metadata:
+                payload[key] = metadata[key]
+    telemetry = getattr(result, "telemetry", None)
+    if isinstance(telemetry, dict):
+        payload.update(telemetry)
+    return payload
 
 
 def _setup_seconds(entry: SystemEntry) -> float:

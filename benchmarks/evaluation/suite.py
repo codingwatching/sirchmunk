@@ -203,6 +203,7 @@ class BaselineEvaluationSuite:
                     pass
                 qt = sample_dict.get("metadata", {}).get(qt_key, "")
 
+                sample_obj = None
                 try:
                     from framework.schema import BenchmarkSample
                     sample_obj = BenchmarkSample(
@@ -276,6 +277,7 @@ class BaselineEvaluationSuite:
                     pred_tokens = prediction_obj.tokens_used
                     if isinstance(prediction_obj.metadata, dict):
                         base_metadata.update(prediction_obj.metadata)
+                        _merge_prediction_telemetry(telemetry, prediction_obj.metadata)
                 elif not error:
                     error = "Baseline returned no prediction."
                     failure_reason = "prediction_error"
@@ -299,10 +301,16 @@ class BaselineEvaluationSuite:
                         judge_correct = bool(eval_result.get("judge_correct", False))
                         coverage = bool(eval_result.get("coverage", False))
                         judge_tokens = int(eval_result.get("judge_tokens", 0) or 0)
+                        judge_result = eval_result.get("judge_result", {})
+                        coverage_result = eval_result.get("coverage_result", {})
                         judge_payload = {
-                            "judge_result": eval_result.get("judge_result", {}),
-                            "coverage_result": eval_result.get("coverage_result", {}),
+                            "judge_result": judge_result,
+                            "coverage_result": coverage_result,
                         }
+                        if isinstance(judge_result, dict):
+                            telemetry.update(judge_result)
+                        if isinstance(coverage_result, dict):
+                            telemetry["coverage_result"] = coverage_result
                     except SampleTimeout as exc:
                         error = str(exc)
                         failure_reason = "timeout"
@@ -326,6 +334,27 @@ class BaselineEvaluationSuite:
                     base_metadata["failure_reason"] = failure_reason
                     base_metadata["failure_phase"] = failure_phase
 
+                if sample_obj is not None:
+                    enrich = getattr(self._bm_adapter, "enrich_telemetry", None)
+                    if callable(enrich):
+                        try:
+                            extra = enrich(
+                                sample=sample_obj,
+                                prediction=prediction_text,
+                                telemetry=telemetry,
+                                elapsed=pred_elapsed,
+                                judge_correct=judge_correct,
+                                coverage=coverage,
+                            )
+                            if isinstance(extra, dict):
+                                telemetry.update(extra)
+                        except Exception as exc:
+                            telemetry["enrich_telemetry_error"] = str(exc)
+                try:
+                    evidence_recall = float(telemetry.get("evidence_recall", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    evidence_recall = 0.0
+
                 result = BaselineResult(
                     sample_id=sid,
                     system_name=baseline.citation_name,
@@ -334,6 +363,7 @@ class BaselineEvaluationSuite:
                     prediction=prediction_text,
                     judge_correct=judge_correct,
                     coverage=coverage,
+                    evidence_recall=evidence_recall,
                     elapsed=pred_elapsed,
                     tokens_used=pred_tokens,
                     judge_tokens=judge_tokens,
@@ -358,6 +388,7 @@ class BaselineEvaluationSuite:
             "prediction":    r.prediction,
             "judge_correct": r.judge_correct,
             "coverage":      r.coverage,
+            "evidence_recall": r.evidence_recall,
             "elapsed":       r.elapsed,
             "tokens_used":   r.tokens_used,
             "judge_tokens":  r.judge_tokens,
@@ -392,6 +423,7 @@ class BaselineEvaluationSuite:
                         prediction=d.get("prediction", ""),
                         judge_correct=bool(d.get("judge_correct", False)),
                         coverage=bool(d.get("coverage", False)),
+                        evidence_recall=float(d.get("evidence_recall", telemetry.get("evidence_recall", 0.0)) or 0.0),
                         elapsed=float(d.get("elapsed", 0)),
                         tokens_used=int(d.get("tokens_used", 0)),
                         judge_tokens=int(d.get("judge_tokens", 0)),
@@ -408,6 +440,23 @@ class BaselineEvaluationSuite:
                     pass
         return results
 
+def _merge_prediction_telemetry(telemetry: Dict[str, Any], metadata: Dict[str, Any]) -> None:
+    """Promote baseline-specific retrieval metadata into common telemetry keys."""
+    nested = metadata.get("telemetry") if isinstance(metadata.get("telemetry"), dict) else {}
+    for source in (nested, metadata):
+        for key in ("read_file_ids", "retrieval_logs", "evidence_sources", "evidence_snippets", "search_history"):
+            value = source.get(key) if isinstance(source, dict) else None
+            if value and not telemetry.get(key):
+                telemetry[key] = value
+    top_chunks = metadata.get("top_chunks")
+    if isinstance(top_chunks, list):
+        paths = []
+        for item in top_chunks:
+            if isinstance(item, dict) and item.get("path"):
+                paths.append(str(item["path"]))
+        if paths:
+            telemetry.setdefault("read_file_ids", paths)
+            telemetry.setdefault("evidence_sources", paths)
 
 def _coerce_guard_config(value: Optional[GuardConfig | Dict[str, Any]]) -> GuardConfig:
     if value is None:

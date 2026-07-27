@@ -1,120 +1,62 @@
 # Benchmarks ResearchOps Usage
 
-This module provides the experimental infrastructure used to evaluate Sirchmunk under research-grade conditions. It is designed for experiments where the central claim is not simply that one question-answering system is always more accurate than another, but that a system can operate directly over dynamic raw data while preserving traceability, setup-cost transparency, and competitive answer quality.
+The `benchmarks/` module is the ResearchOps layer for evaluating Sirchmunk under reproducible, paper-grade conditions. The main workflow is now the unified control entry point:
 
-The default reference workflow is HotpotQA fullwiki, but the framework is benchmark-agnostic. The same lifecycle also supports mechanism-oriented experiments such as setup cost, freshness, storage overhead, source fidelity, and warm reuse.
+```bash
+python benchmarks/run_benchmark.py <block> [options]
+```
 
-## Quickstart: Run The Full Pipeline
+Use this README from top to bottom. The direct low-level scripts still exist, but they are now advanced/debug tools and are documented after the main workflow.
 
-Use this path first. It validates the complete local pipeline — config loading, HotpotQA data loading, retrieval, real LLM calls, metrics, artifacts, and report generation.
+## Main Workflow
 
-### Step 0: Install Dependencies
+The recommended paper workflow is:
+
+```text
+smoke-tune
+→ assets
+→ main
+→ ablation
+→ report/status
+```
+
+The purpose is to keep exploration, baseline asset construction, frozen evaluation, ablation, reporting, and status inspection in separate, auditable stages while exposing one user-facing command surface.
+
+| Block | Command | Role | Paper claim? |
+|---|---|---|---|
+| `smoke-tune` | `run_benchmark.py smoke-tune` | Small smoke run, integration check, tuning | No |
+| `assets` | `run_benchmark.py assets` | Baseline preprocessing/index/graph/embedding lifecycle | Setup evidence only |
+| `main` | `run_benchmark.py main` | Frozen main experiment and paper table/report | Yes, if gates pass |
+| `ablation` | `run_benchmark.py ablation` | Frozen LENS/Sirchmunk mechanism variants | Yes, as ablation |
+| `report` | `run_benchmark.py report` | Regenerate report/table validation from artifacts | Depends on gates |
+| `status` | `run_benchmark.py status` | Inspect summaries and asset registries | No |
+| `queue` | `run_benchmark.py queue` | Advanced queue operations | Operational |
+
+## Install Benchmark Dependencies
 
 ```bash
 pip install -r requirements/core.txt -r requirements/benchmarks.txt
 ```
 
-`requirements/benchmarks.txt` contains benchmark-only extras such as `pyarrow`, which HotpotQA needs to read fullwiki parquet files. Normal Sirchmunk usage does not require these extras.
+`requirements/benchmarks.txt` contains benchmark-only extras such as `pyarrow` for HotpotQA fullwiki parquet files. Normal Sirchmunk usage does not require these extras.
 
-### Step 1: Create Private Env Files
+## Prepare Private Environments
 
-```bash
-cp benchmarks/.env.global.example benchmarks/.env.global
-cp benchmarks/hotpotqa/env.hotpotqa.base.example benchmarks/hotpotqa/.env.hotpotqa.base
-cp benchmarks/hotpotqa/env.hotpotqa.exploration.example benchmarks/hotpotqa/.env.hotpotqa.exploration
-# Then edit benchmarks/.env.global and set LLM_API_KEY=<your-api-key>.
-```
-
-The default local setup uses DashScope-compatible Qwen:
-
-```text
-LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-LLM_MODEL_NAME=qwen3.7-plus
-```
-
-`LLM_API_KEY` should live in the private ignored `benchmarks/.env.global` file. Shell environment variables still work as temporary highest-priority overrides, but the recommended persistent setup is the private env file.
-
-### Step 2: Run One Command
-
-```bash
-python benchmarks/run_quickstart.py
-```
-
-This command runs the sample count configured by the active profile (`HOTPOT_LIMIT`; `--limit` explicitly overrides it) with the configured real LLM provider, automatically skips the interactive improvement step, locates the generated run artifact, and generates a report. By default it uses `--context-corpus-mode sample` for HotpotQA, which materializes each sample's parquet context as temporary raw-text files and filters to context-answerable smoke samples so the quickstart has a closed retrieval corpus. Use `--context-corpus-mode wiki` when you want to exercise the configured raw fullwiki corpus instead.
-
-`run_quickstart.py` is no longer limited to HotpotQA. For mechanism benchmarks, pass another registered benchmark name:
-
-```bash
-python benchmarks/run_quickstart.py --benchmark setup_cost --limit 1 --skip-report
-```
-
-To perform a lightweight competitor-reproduction smoke after the run, add `--run-evaluation`. Quickstart freezes the produced sample IDs into a `fixed_ids` GoldenSet and calls `run_evaluation.py`, so built-in baselines, imported LightRAG/GraphRAG predictions, and `module:factory` adapters all reuse the same paired samples.
-
-### Step 3: Read The Outputs
-
-The command prints the latest `run_dir`, `metrics.json`, and report paths. Typical outputs are:
-
-```text
-benchmarks/hotpotqa/output/exploration/runs/<run_id>/results/metrics.json
-benchmarks/hotpotqa/output/exploration/runs/<run_id>/results/predictions.jsonl
-benchmarks/hotpotqa/output/exploration/runs/<run_id>/reports/report.md
-benchmarks/hotpotqa/output/exploration/runs/<run_id>/reports/validation.json
-```
-
-Quickstart is an exploration smoke test. `quickstart_ok=True` means the end-to-end run completed without system failures and retrieved supporting evidence. `paper_ready=False` is expected for exploration runs because publication-grade reports require frozen stage settings and baseline comparison artifacts.
-
-## Design Philosophy
-
-The benchmark stack follows a ResearchOps philosophy: every reported number should be reproducible, attributable, and falsifiable from structured artifacts rather than reconstructed from logs or narrative claims.
-
-The framework therefore separates four concerns:
-
-- Execution: run benchmark adapters through a unified runner with checkpointing, retry, cache policy, and budget guards.
-- Evaluation: compare systems on the same GoldenSet and re-score predictions with a shared benchmark judge.
-- Governance: distinguish exploration runs from frozen evaluation runs and prevent test-set tuning from entering publication claims.
-- Reporting: generate metric-first tables and reports only from machine-readable artifacts, with validator gates for missing provenance or unfair comparisons.
-
-For paper experiments, use official task metrics as the primary evidence. For HotpotQA, official exact match and token F1 are the main answer-quality metrics. LLM-based semantic judging is allowed only as an explicitly marked auxiliary analysis and must not replace the official metrics in the main result table.
-
-## Directory Structure
-
-```text
-benchmarks/
-  framework/              # ResearchOps execution, protocol, artifact, queue, and analysis layer
-  evaluation/             # GoldenSet, baseline evaluation, statistics, tables, reports, validation
-  baselines/              # BaselineAdapter implementations and imported-prediction adapters
-  hotpotqa/               # HotpotQA adapter, judge, evidence, metrics, env examples
-  setup_cost/             # Mechanism benchmark: setup cost
-  freshness/              # Mechanism benchmark: dynamic data freshness
-  storage_overhead/       # Mechanism benchmark: storage overhead
-  source_fidelity/        # Mechanism benchmark: raw-source traceability
-  warm_reuse/             # Mechanism benchmark: warm cache / reuse behavior
-  run_quickstart.py       # Benchmark-agnostic smoke + optional baseline evaluation CLI
-  run_sampling.py         # Auditable GoldenSet sampling protocol CLI
-  run_queue.py            # P3 queue and unattended execution CLI
-  run_evaluation.py       # Baseline comparison and paper table CLI
-  run_lifecycle_eval.py   # Full-corpus baseline build/index feasibility CLI
-  run_scaling_study.py    # Multi-scale feasibility and amortized-cost CLI
-  run_report.py           # Metric-first report generation CLI
-  run_research_loop.py    # Exploration and research-loop CLI
-```
-
-Supported benchmark names are resolved through `framework/registry.py`. Current names include `hotpotqa`, `setup_cost`, `freshness`, `storage_overhead`, `source_fidelity`, and `warm_reuse`.
-
-## Advanced Paper Workflow
-
-Use this workflow after the Quickstart passes. These stages are intentionally separated to prevent exploratory optimization from contaminating frozen paper evaluation.
-
-### Stage 0: Prepare Environment And Data
-
-Create private runtime env files from the provided examples. Do not commit secrets.
+Create private env files from examples and never commit secrets:
 
 ```bash
 cp benchmarks/.env.global.example benchmarks/.env.global
 cp benchmarks/hotpotqa/env.hotpotqa.base.example benchmarks/hotpotqa/.env.hotpotqa.base
 cp benchmarks/hotpotqa/env.hotpotqa.exploration.example benchmarks/hotpotqa/.env.hotpotqa.exploration
 cp benchmarks/hotpotqa/env.hotpotqa.frozen.example benchmarks/hotpotqa/.env.hotpotqa.frozen
-# Then edit benchmarks/.env.global and set LLM_API_KEY=<your-api-key>.
+```
+
+Set the real provider credentials in `benchmarks/.env.global`:
+
+```text
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_MODEL_NAME=qwen3.7-plus
+LLM_API_KEY=<your-api-key>
 ```
 
 HotpotQA uses layered configuration:
@@ -129,7 +71,7 @@ benchmarks/hotpotqa/.env.hotpotqa.base
 --env benchmarks/hotpotqa/.env.hotpotqa.frozen
   frozen-evaluation-only differences
 os.environ
-  highest-priority runtime overrides, such as LLM_API_KEY
+  highest-priority runtime overrides
 ```
 
 Loading priority is:
@@ -138,96 +80,341 @@ Loading priority is:
 .env.global < .env.hotpotqa.base < profile env < os.environ
 ```
 
-HotpotQA LLM judge uses the explicit `HOTPOT_JUDGE_MODEL_NAME` from `.env.hotpotqa.base` and inherits `LLM_BASE_URL` / `LLM_API_KEY` from `benchmarks/.env.global`. `LLM_MODEL_NAME` remains the shared search/generation model setting and is not used as a judge-model fallback.
-
-For HotpotQA fullwiki, configure the dataset and corpus paths in `.env.hotpotqa.base`. `HOTPOT_DATASET_DIR` can point either to the dataset root or directly to the `fullwiki/` parquet directory. When it points directly to `fullwiki/`, set `HOTPOT_WIKI_CORPUS_DIR` to the raw Wikipedia corpus directory explicitly.
+For HotpotQA fullwiki, configure dataset and raw corpus paths in `.env.hotpotqa.base`:
 
 ```text
-# Option A: dataset root
 HOTPOT_DATASET_DIR=/path/to/hotpotqa_dataset
 HOTPOT_WIKI_CORPUS_DIRNAME=enwiki-20171001-pages-meta-current-withlinks-abstracts
+```
 
-# Option B: direct fullwiki parquet directory
+or, if `HOTPOT_DATASET_DIR` points directly to the `fullwiki/` parquet directory:
+
+```text
 HOTPOT_DATASET_DIR=/path/to/hotpotqa_dataset/fullwiki
 HOTPOT_WIKI_CORPUS_DIR=/path/to/hotpotqa_dataset/enwiki-20171001-pages-meta-current-withlinks-abstracts
 ```
 
-Expected dataset layout:
+## Step 1: Smoke And Tune
 
-```text
-/path/to/hotpotqa_dataset/
-  fullwiki/
-    validation-*.parquet
-    test-*.parquet
-    train-*.parquet
-  enwiki-20171001-pages-meta-current-withlinks-abstracts/
-    ... raw wiki files ...
-```
-
-Use the exploration profile for smoke tests and development subsets. Use the frozen profile for paper-grade evaluation only. The base env should contain shared settings; profile env files should only contain stage-specific overrides.
-
-For real LLM runs, set the real `LLM_API_KEY` in the private ignored `benchmarks/.env.global` file. Shell environment variables still work as temporary highest-priority overrides, but the recommended persistent setup is the private env file. Never commit real secrets.
-
-### Optional: Manual Smoke Test
-
-`run_quickstart.py` is the recommended entry point. If you need to debug the underlying commands manually, the equivalent smoke run is:
+Run the unified smoke path first. This validates env loading, data loading, retrieval, judging, artifact writing, and report generation. It is exploration-only and must not be used as a final paper claim.
 
 ```bash
-printf 'skip\n' | python benchmarks/run_research_loop.py \
+python benchmarks/run_benchmark.py smoke-tune \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.exploration \
-  --max-iter 1 \
-  --dry-run \
-  --log-level INFO
+  --limit 20 \
+  --context-corpus-mode sample
 ```
 
-Omit `--limit` to use the active profile's `HOTPOT_LIMIT`; pass `--limit <N>` only when you want a one-off override.
-
-Then generate the report manually:
+Optional baseline smoke after the same run:
 
 ```bash
-python benchmarks/run_report.py \
-  --run-dir benchmarks/hotpotqa/output/exploration/runs/<run_id> \
-  --output-dir benchmarks/hotpotqa/output/exploration/runs/<run_id>/reports \
-  --title "HotpotQA Quickstart Smoke Test Report"
-```
-
-### Stage 1: Exploration Or Smoke Runs
-
-Exploration is for debugging, integration checks, and candidate configuration search. It should use a limited sample size and must not be used as a final paper claim.
-
-```bash
-python benchmarks/run_queue.py add-matrix \
-  --queue-path benchmarks/hotpotqa/output/exploration_queue.json \
-  --registry-path benchmarks/hotpotqa/output/exploration_registry.jsonl \
-  --add-bm hotpotqa=benchmarks/hotpotqa/.env.hotpotqa.exploration \
-  --systems sirchmunk \
-  --seeds 42 \
-  --cache-modes warm \
-  --stage exploration \
-  --limit 100 \
-  --replace
-
-python benchmarks/run_queue.py run \
-  --queue-path benchmarks/hotpotqa/output/exploration_queue.json \
-  --registry-path benchmarks/hotpotqa/output/exploration_registry.jsonl \
-  --max-concurrent 1 \
-  --max-tasks 1
-```
-
-Exploration may use warm cache and auxiliary diagnostics, but it should keep eval feedback disabled unless the experiment is explicitly designed to study adaptive behavior. Exploration artifacts are useful for debugging and badcase analysis, not for final claims. Shared dataset and search defaults should remain in `.env.hotpotqa.base`; profile files should only override the stage-dependent keys.
-
-### Stage 1.5: Freeze The Sampling Protocol
-
-HotpotQA fullwiki validation contains 7,405 examples. When full evaluation is too expensive for iteration, do not use an ad hoc `limit` as a paper subset. First freeze a GoldenSet with an explicit sampling protocol, then run every system on the same sample IDs.
-
-The recommended main sampled evaluation is `n=2000`, stratified by `type + supporting_fact_bucket`. This preserves the bridge/comparison and multi-hop difficulty mix while avoiding sparse cells from over-stratifying on answer type. Use the full 7,405-example validation set for final confirmation when budget allows, and report any sampled result as sampled evaluation rather than full-validation performance.
-
-```bash
-python benchmarks/run_sampling.py describe \
+python benchmarks/run_benchmark.py smoke-tune \
   --benchmark hotpotqa \
-  --env benchmarks/hotpotqa/.env.hotpotqa.frozen
+  --env benchmarks/hotpotqa/.env.hotpotqa.exploration \
+  --limit 20 \
+  --run-evaluation \
+  --baselines bm25,naive_rag
+```
 
+Expected exploration outputs:
+
+```text
+benchmarks/hotpotqa/output/exploration/runs/<run_id>/results/metrics.json
+benchmarks/hotpotqa/output/exploration/runs/<run_id>/results/predictions.jsonl
+benchmarks/hotpotqa/output/exploration/runs/<run_id>/reports/report.md
+benchmarks/hotpotqa/output/exploration/runs/<run_id>/reports/validation.json
+```
+
+`quickstart_ok=True` means the local pipeline is healthy. `paper_ready=False` is expected because exploration artifacts are intentionally blocked from paper claims.
+
+## Step 2: Build Baseline Assets
+
+Baseline and competitor preprocessing belongs to the `assets` block. This includes indexing, embedding, graph construction, lifecycle feasibility, setup cost, storage cost, and structured failure reasons.
+
+```bash
+python benchmarks/run_benchmark.py assets \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --methods bm25,naive_rag \
+  --corpus-scale fullwiki \
+  --build-timeout 86400 \
+  --max-disk-bytes 500000000000 \
+  --stage frozen \
+  --strict
+```
+
+Outputs:
+
+```text
+benchmarks/hotpotqa/output/assets/
+  asset_registry.jsonl
+  asset_summary.json
+  lifecycle/
+    baseline_lifecycle.jsonl
+    <method>_latest.json
+  tables/
+    feasibility_table.json
+    feasibility_table.md
+    feasibility_table.tex
+```
+
+Inspect the registry:
+
+```bash
+python benchmarks/run_benchmark.py status \
+  --asset-registry benchmarks/hotpotqa/output/assets/asset_registry.jsonl \
+  --benchmark hotpotqa
+```
+
+The registry is append-only. Failed baselines stay visible with structured reasons such as `timeout`, `oom`, `disk_exceeded`, `api_budget_exceeded`, `dependency_missing`, `partial_index`, or `index_validation_failed`.
+
+## Step 3: Run The Frozen Main Experiment
+
+The main block owns the paper-facing path:
+
+```text
+sampling / fixed IDs
+→ optional frozen Sirchmunk run
+→ baseline comparison
+→ paper table
+→ report
+→ Gate 0-5 validation
+→ main_summary.json
+```
+
+If Sirchmunk results already exist, pass them directly:
+
+```bash
+python benchmarks/run_benchmark.py main \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --sirchmunk-results benchmarks/hotpotqa/output/main/runs/<run_id>/results/predictions.jsonl \
+  --run-artifact-dir benchmarks/hotpotqa/output/main/runs/<run_id> \
+  --baselines bm25,naive_rag \
+  --asset-registry benchmarks/hotpotqa/output/assets/asset_registry.jsonl \
+  --sampling-method stratified \
+  --golden-n 2000 \
+  --strata type,supporting_fact_bucket \
+  --cache-mode cold \
+  --generate-report \
+  --strict
+```
+
+To let the control layer run Sirchmunk first:
+
+```bash
+python benchmarks/run_benchmark.py main \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --run-sirchmunk \
+  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sample_ids.json \
+  --baselines bm25,naive_rag \
+  --asset-registry benchmarks/hotpotqa/output/assets/asset_registry.jsonl \
+  --cache-mode cold \
+  --generate-report \
+  --strict
+```
+
+Main outputs:
+
+```text
+benchmarks/hotpotqa/output/main/
+  sampling/
+    sampling_*_protocol.json
+    sampling_*_manifest.json
+    sampling_*_sample_ids.json
+  runs/<run_id>/
+  evaluation/
+    paper_table.json
+    paper_table.md
+    paper_table.tex
+  report/
+    report.md
+    report.tex
+    report_fragment.tex
+    validation.json
+  main_summary.json
+```
+
+Use `main_summary.json` as the single status artifact for the main run. `paper_ready=true` requires all blocking gates to pass.
+
+## Step 4: Run Ablations
+
+The ablation block creates frozen LENS/Sirchmunk mechanism variants and queues them through the P3 queue infrastructure.
+
+```bash
+python benchmarks/run_benchmark.py ablation \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sample_ids.json \
+  --cache-mode cold \
+  --max-combinations 16 \
+  --replace
+```
+
+To execute queued variants immediately:
+
+```bash
+python benchmarks/run_benchmark.py ablation \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sample_ids.json \
+  --cache-mode cold \
+  --max-combinations 16 \
+  --run \
+  --max-concurrent 1 \
+  --replace
+```
+
+Outputs:
+
+```text
+benchmarks/hotpotqa/output/ablation/
+  ablation_spec.json
+  variants.json
+  ablation_summary.json
+benchmarks/hotpotqa/output/queue/
+  ablation_queue.json
+  ablation_registry.jsonl
+```
+
+The default ablation matrix varies one mechanism at a time around the frozen baseline: search mode, knowledge reuse, position prior, intent modulation, and loop budget.
+
+## Step 5: Report And Status
+
+Regenerate a report from existing artifacts:
+
+```bash
+python benchmarks/run_benchmark.py report \
+  --run-dir benchmarks/hotpotqa/output/main/runs/<run_id> \
+  --table-json benchmarks/hotpotqa/output/main/evaluation/paper_table.json \
+  --output-dir benchmarks/hotpotqa/output/main/report \
+  --title "HotpotQA Fullwiki ResearchOps Report" \
+  --strict
+```
+
+Inspect a main summary:
+
+```bash
+python benchmarks/run_benchmark.py status \
+  --summary benchmarks/hotpotqa/output/main/main_summary.json
+```
+
+Inspect queue state:
+
+```bash
+python benchmarks/run_benchmark.py queue \
+  --queue-path benchmarks/hotpotqa/output/queue/ablation_queue.json \
+  status
+```
+
+## Quality Gates
+
+The control layer evaluates Gate 0-5:
+
+| Gate | Scope | Blocking evidence |
+|---|---|---|
+| Gate 0 | Parameters | benchmark, stage, cache mode, sampling args, asset args |
+| Gate 1 | Assets | registry readability, query-ready baseline assets, structured failures |
+| Gate 2 | Sampling | fixed sample IDs, GoldenSet, sampling protocol, checksum |
+| Gate 3 | Frozen run | `stage=frozen`, deterministic cache, protocol validity |
+| Gate 4 | Evaluation | sample count, systems, baseline comparison completeness |
+| Gate 5 | Report | academic validator, table/sample pairing, provenance |
+
+Frozen paper runs must satisfy:
+
+```text
+stage=frozen
+cache_mode in {cold, compiled}
+eval feedback disabled
+memory updates disabled
+sample_id_checksum recorded
+all non-published systems use the same sample IDs
+validator has no error-level issue
+```
+
+## Output Layout
+
+The unified control layer uses this canonical layout:
+
+```text
+benchmarks/{benchmark}/output/
+  assets/
+    asset_registry.jsonl
+    asset_summary.json
+    lifecycle/
+    tables/
+    update_readiness/
+  exploration/
+    runs/
+    candidates/
+    reports/
+  main/
+    sampling/
+    runs/
+    evaluation/
+    report/
+    main_summary.json
+  ablation/
+    ablation_spec.json
+    variants.json
+    ablation_summary.json
+  scaling/
+    scaling_study/
+  queue/
+    ablation_queue.json
+    ablation_registry.jsonl
+```
+
+## Scaling And Update Readiness
+
+Scaling is now reachable through the assets block:
+
+```bash
+python benchmarks/run_benchmark.py assets scaling \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --methods bm25,naive_rag \
+  --scales 10k:10000,100k:100000,fullwiki:0 \
+  --materialize symlink \
+  --build-timeout 86400 \
+  --q-values 1,10,100,1000
+```
+
+Update readiness is also part of assets lifecycle governance:
+
+```bash
+python benchmarks/run_benchmark.py assets update-readiness \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --methods bm25,naive_rag \
+  --base-corpus-dir /path/to/raw/wiki \
+  --operation mixed \
+  --delta-docs-dir /path/to/delta/docs \
+  --doc-ids doc_a.txt,doc_b.txt
+```
+
+Report scaling and update cost separately from warm-query accuracy. A system whose full-corpus index is not `READY` should not appear as a warm-query quality baseline without an explicit feasibility caveat.
+
+## Advanced Direct Scripts
+
+The direct scripts remain available for debugging and backward compatibility. Prefer `run_benchmark.py` for normal workflows.
+
+| Direct script | Preferred block | When to use directly |
+|---|---|---|
+| `run_quickstart.py` | `smoke-tune` | Debug quickstart internals |
+| `run_sampling.py` | `main` | Manually inspect sampling distributions |
+| `run_lifecycle_eval.py` | `assets` | Legacy lifecycle experiments |
+| `run_scaling_study.py` | `assets scaling` | Legacy scaling runs |
+| `run_evaluation.py` | `main` | Manual table assembly |
+| `run_report.py` | `report` | Manual report regeneration |
+| `run_queue.py` | `queue` | Low-level queue debugging |
+| `run_research_loop.py` | `smoke-tune` | Exploration and badcase tuning |
+
+Manual sampling example:
+
+```bash
 python benchmarks/run_sampling.py create \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
@@ -236,252 +423,10 @@ python benchmarks/run_sampling.py create \
   --seed 42 \
   --strata type,supporting_fact_bucket \
   --allocation proportional \
-  --output-dir benchmarks/hotpotqa
+  --output-dir benchmarks/hotpotqa/output/main/sampling
 ```
 
-The create command writes a GoldenSet JSON, a sampling protocol, a sampling manifest, and a `sampling_*_sample_ids.json` file. For the Sirchmunk frozen run, set `HOTPOT_SAMPLE_IDS_FILE` in the private frozen env profile to that sample ID file. The adapter will then load exactly the frozen IDs in file order, so Sirchmunk, BM25/NaiveRAG, and imported systems such as LightRAG are evaluated on the same paired samples.
-
-For error analysis, create the rare diagnostic subset separately:
-
-```bash
-python benchmarks/run_sampling.py create \
-  --benchmark hotpotqa \
-  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
-  --method diagnostic_rare \
-  --seed 42 \
-  --output-dir benchmarks/hotpotqa
-```
-
-This selects all validation examples with at least five supporting facts (`n=104`) and should be reported as diagnostic analysis, not as the main overall score.
-
-### Stage 2: Frozen Sirchmunk Evaluation
-
-Frozen evaluation produces the main Sirchmunk result. The runner and protocol validator enforce stricter constraints in this stage. For sampled paper evaluation, set `HOTPOT_SAMPLE_IDS_FILE` in `benchmarks/hotpotqa/.env.hotpotqa.frozen` to the `sampling_*_sample_ids.json` created in Stage 1.5; keep `--limit 0` so the fixed sample ID file, not an ad hoc limit, defines the evaluation set.
-
-```bash
-python benchmarks/run_queue.py add-matrix \
-  --queue-path benchmarks/hotpotqa/output/frozen_queue.json \
-  --registry-path benchmarks/hotpotqa/output/frozen_registry.jsonl \
-  --add-bm hotpotqa=benchmarks/hotpotqa/.env.hotpotqa.frozen \
-  --systems sirchmunk \
-  --seeds 42 \
-  --cache-modes cold \
-  --stage frozen \
-  --limit 0 \
-  --replace \
-  --config-json '{"sample_timeout_seconds":300,"benchmark_timeout_seconds":172800}'
-
-python benchmarks/run_queue.py run \
-  --queue-path benchmarks/hotpotqa/output/frozen_queue.json \
-  --registry-path benchmarks/hotpotqa/output/frozen_registry.jsonl \
-  --max-concurrent 1
-```
-
-Frozen evaluation requirements:
-
-- `stage` must be `frozen`.
-- Cache mode must be `cold` or `compiled`; `warm`, `none`, and dry-run cache are rejected.
-- Eval feedback must be disabled.
-- Adaptive memory updates must be disabled. If memory is enabled, it must be versioned and read-only.
-- LLM judge must be disabled for the main table unless explicitly marked as auxiliary.
-- The run artifact must record sample count, sample ID checksum, config hash, git snapshot, system specs, dataset manifest, cache report, predictions, and per-sample evaluation.
-
-A successful frozen run writes artifacts under the benchmark output directory, for example:
-
-```text
-benchmarks/hotpotqa/output/frozen/runs/<run_id>/
-  protocol.yaml
-  manifest.json
-  config_snapshot.json
-  git_snapshot.json
-  system_specs.json
-  dataset_manifest.json
-  cache_report.json
-  results/
-    metrics.json
-    predictions.jsonl
-    per_sample_eval.jsonl
-  checkpoints/
-    samples.jsonl
-```
-
-### Stage 3: Baseline Comparison
-
-Use `run_evaluation.py` to compare Sirchmunk with baselines on the same GoldenSet. The framework enforces sample ID consistency, records the sampling manifest, and records setup cost for fair comparison.
-
-For local baselines:
-
-```bash
-python benchmarks/run_evaluation.py \
-  --benchmark hotpotqa \
-  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
-  --sirchmunk-results benchmarks/hotpotqa/output/frozen/results_YYYYMMDD_HHMMSS.jsonl \
-  --baselines bm25,naive_rag \
-  --sampling-method stratified \
-  --golden-n 2000 \
-  --golden-seed 42 \
-  --strata type,supporting_fact_bucket \
-  --sampling-report-dir benchmarks/hotpotqa/output/paper_table/sampling \
-  --baseline-sample-timeout 300 \
-  --baseline-max-runtime 172800 \
-  --output-dir benchmarks/hotpotqa/output/paper_table
-```
-
-For imported baselines such as LightRAG or GraphRAG, provide both predictions and setup metrics:
-
-```bash
-python benchmarks/run_evaluation.py \
-  --benchmark hotpotqa \
-  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
-  --sirchmunk-results benchmarks/hotpotqa/output/frozen/results_YYYYMMDD_HHMMSS.jsonl \
-  --import-baseline "LightRAG v1=outputs/lightrag_hotpotqa_predictions.jsonl" \
-  --import-baseline-setup "LightRAG v1=outputs/lightrag_hotpotqa_setup_metrics.json" \
-  --sampling-method stratified \
-  --golden-n 2000 \
-  --golden-seed 42 \
-  --strata type,supporting_fact_bucket \
-  --output-dir benchmarks/hotpotqa/output/paper_table
-```
-
-The imported prediction JSONL should contain one prediction per sample ID:
-
-```json
-{"sample_id":"example-id","prediction":"answer text","elapsed":3.2,"tokens_used":1024}
-```
-
-The setup metrics JSON should report preprocessing and indexing cost:
-
-```json
-{
-  "setup_seconds": 3600.0,
-  "preprocessing_seconds": 1200.0,
-  "index_build_seconds": 2400.0,
-  "storage_bytes": 123456789,
-  "indexed_documents": 5233329
-}
-```
-
-Publication-grade baseline comparison requires:
-
-- identical sample ID sets for all non-published systems;
-- a recorded sampling protocol and sampling manifest for any non-full evaluation;
-- setup metrics for every baseline;
-- imported baseline prediction coverage of at least 95%;
-- classified baseline failures below the validator threshold;
-- paired statistical tests where raw per-sample predictions are available.
-
-### Stage 3.5: Full-Corpus Feasibility Evaluation
-
-For HotpotQA fullwiki and other large corpora, index-heavy baselines such as LightRAG, GraphRAG, or RAPTOR must be evaluated as lifecycle systems. A baseline that cannot finish preprocessing under the declared resource budget should remain in the feasibility table with a structured failure reason instead of being silently removed.
-
-```bash
-python benchmarks/run_lifecycle_eval.py \
-  --benchmark hotpotqa \
-  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
-  --baselines bm25,naive_rag \
-  --corpus-scale fullwiki \
-  --build-timeout 86400 \
-  --max-disk-bytes 500000000000
-```
-
-The command writes lifecycle artifacts under `lifecycle_eval/`, including:
-
-```text
-baseline_lifecycle.jsonl
-<baseline>_latest.json
-tables/feasibility_table.{md,tex,json}
-lifecycle_summary.json
-```
-
-Use `module:factory` baseline specs to plug in real index-heavy competitors in both `run_evaluation.py` and lifecycle/scaling CLIs:
-
-```bash
---baselines bm25,my_lightrag_adapter:create_lightrag_v1
-```
-
-The factory must return a `BaselineAdapter`, usually an `IndexingSdkBaseline`, whose `prepare_fn` builds the external index and whose `validate_fn` verifies full-corpus readiness.
-
-### Stage 3.6: Multi-Scale Scaling Study And Amortized Cost
-
-To diagnose whether a competitor fails because of corpus scale rather than implementation error, run the same lifecycle protocol over increasing corpus sizes.
-
-```bash
-python benchmarks/run_scaling_study.py \
-  --benchmark hotpotqa \
-  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
-  --baselines bm25,naive_rag \
-  --scales 10k:10000,100k:100000,fullwiki:0 \
-  --materialize symlink \
-  --build-timeout 86400 \
-  --q-values 1,10,100,1000
-```
-
-Outputs are written under `scaling_study/`:
-
-```text
-corpus_subsets/                 # deterministic subset manifests / symlink dirs
-<scale>/lifecycle/              # per-scale lifecycle records
-scaling_lifecycle_records.jsonl
-scaling_metrics.json            # seconds_per_doc / bytes_per_doc / failure reason
-amortized_cost_curves.json      # C_avg(Q) curves
-scaling_study_summary.json
-```
-
-The amortized lifecycle cost is defined as:
-
-$$C_{\text{avg}}(Q) = \frac{C_{\text{build}} + C_{\text{update}}}{Q} + C_{\text{query}}$$
-
-Report full-corpus feasibility and warm-query quality separately. Warm-query metrics should only be reported for systems whose full-corpus index is `READY`.
-
-### Stage 3.7: Dynamic Update And Ablation Planning
-
-P2 utilities expose the raw building blocks for dynamic-document experiments and LENS mechanism ablations:
-
-- `framework.dynamic_update.DynamicUpdateManager`: creates mutated corpus versions and records update cost / rebuild-required outcomes.
-- `framework.ablation_matrix.default_lens_ablation_spec()`: generates conservative one-axis-at-a-time LENS ablation variants for search mode, knowledge reuse, position prior, intent modulation, and loop budget.
-
-These utilities are intended to feed future frozen runs and paper ablations. Dynamic update experiments should report update time, whether a full rebuild is required, freshness accuracy, and post-update query quality.
-
-### Stage 4: Report Generation And Validation
-
-Generate a metric-first report from the frozen run artifact and paper table JSON:
-
-```bash
-python benchmarks/run_report.py \
-  --run-dir benchmarks/hotpotqa/output/frozen/runs/<run_id> \
-  --table-json benchmarks/hotpotqa/output/paper_table/paper_table.json \
-  --output-dir benchmarks/hotpotqa/output/paper_table/report \
-  --title "HotpotQA Fullwiki ResearchOps Report"
-```
-
-The report generator produces:
-
-```text
-report.md
-report.tex
-validation.json
-figures/
-  accuracy_latency.svg
-  setup_cost.svg
-  storage_overhead.svg
-```
-
-The validator returns `passed=true` only when the package is suitable as a publication-ready evidence bundle. A `BLOCKED` report should not be used for paper claims until all error-level issues are resolved.
-
-## Quality Gates
-
-The validator checks the following classes of evidence:
-
-- Artifact completeness: protocol, manifest, config snapshot, git snapshot, system specs, dataset manifest, metrics, predictions, and per-sample evaluation.
-- Frozen-stage integrity: stage is frozen, cache policy is deterministic, eval feedback is off, memory is not adaptive, and LLM judge is auxiliary if enabled.
-- Sample pairing: all non-published systems share the same sample ID checksum.
-- Baseline fairness: setup metrics are present and baseline failures are classified.
-- Imported baseline coverage: prediction coverage is reported and must meet the minimum threshold.
-- Failure governance: timeout, budget-exceeded, prediction, judge, and import-missing failures are surfaced rather than silently folded into answer quality.
-
-## Research Loop Usage
-
-`run_research_loop.py` is for exploration, badcase analysis, and configuration search. It is not the recommended entry point for final frozen claims.
+Manual research loop example:
 
 ```bash
 python benchmarks/run_research_loop.py \
@@ -492,57 +437,67 @@ python benchmarks/run_research_loop.py \
   --dry-run
 ```
 
-For multi-benchmark exploration:
+Use direct-script outputs as inputs to the unified blocks only when their artifacts preserve stage, sample IDs, checksum, config hash, and manifest provenance.
 
-```bash
-python benchmarks/run_research_loop.py \
-  --multi \
-  --add-bm hotpotqa=benchmarks/hotpotqa/.env.hotpotqa.exploration \
-  --add-bm setup_cost=benchmarks/setup_cost/.env.setup_cost \
-  --limit 30 \
-  --shadow-fraction 0.10 \
-  --dry-run
+## Supported Benchmarks
+
+Supported benchmark names are resolved through `framework/registry.py`:
+
+```text
+hotpotqa
+setup_cost
+freshness
+storage_overhead
+source_fidelity
+warm_reuse
 ```
 
-Use outputs from research-loop runs to understand failure modes and candidate configurations. Promote a configuration to frozen evaluation only after the protocol, seed, sample policy, cache policy, and metric hierarchy are fixed.
+Mechanism benchmarks test claims not captured by QA accuracy alone:
 
-## Mechanism Benchmarks
+| Benchmark | Claim |
+|---|---|
+| `setup_cost` | Startup and preprocessing cost |
+| `freshness` | Dynamic corpus freshness |
+| `storage_overhead` | Extra storage artifacts |
+| `source_fidelity` | Traceability to raw sources |
+| `warm_reuse` | Cache and reuse behavior |
 
-The mechanism benchmarks are intended to test claims that are not captured by QA accuracy alone:
-
-- `setup_cost`: startup and preprocessing cost.
-- `freshness`: ability to reflect dynamic corpus updates.
-- `storage_overhead`: extra artifacts required by each method.
-- `source_fidelity`: traceability to raw source files.
-- `warm_reuse`: behavior under cache reuse.
-
-Example smoke run:
+Example mechanism smoke:
 
 ```bash
-python benchmarks/run_queue.py add-matrix \
-  --add-bm setup_cost=benchmarks/setup_cost/.env.setup_cost \
-  --systems sirchmunk \
-  --seeds 42 \
-  --cache-modes cold \
-  --stage frozen \
+python benchmarks/run_benchmark.py smoke-tune \
+  --benchmark setup_cost \
+  --env benchmarks/setup_cost/.env.setup_cost \
   --limit 1 \
-  --replace
-
-python benchmarks/run_queue.py run --max-concurrent 1 --max-tasks 1
+  --skip-report
 ```
 
-These mechanism benchmarks should be reported alongside QA metrics when the paper claim concerns dynamic raw-data retrieval, setup cost, freshness, or source fidelity.
+## Interpreting Sampled Evaluation
 
-## Interpretation Guidelines
+For HotpotQA fullwiki, the validation split has 7,405 examples. If full evaluation is too expensive, use a frozen stratified subset instead of an ad hoc `--limit`.
 
-Do not interpret a single aggregate accuracy number as sufficient evidence. For research use, inspect at least:
+Recommended main sampled evaluation:
 
-- official EM and token F1;
-- evidence recall and source grounding;
-- latency distribution and token usage;
-- setup time, preprocessing time, index build time, and storage bytes;
-- failure counts by category;
-- sample ID checksum and GoldenSet configuration;
-- validator status and artifact provenance.
+```text
+n = 2000
+strata = type + supporting_fact_bucket
+answer_type = monitored distribution, not primary strata
+```
 
-This framing is intentionally conservative. It treats an experiment as an auditable evidence package rather than a one-off script execution.
+Recommended wording:
+
+```text
+We evaluate on a fixed stratified subset of the HotpotQA fullwiki validation split under an end-to-end raw-corpus protocol. All systems use the same sample IDs and sample-ID checksum, enabling paired uncertainty estimates.
+```
+
+Do not write sampled results as full benchmark results. Published full-benchmark numbers can be included as separate reference rows, but they are not paired comparisons unless raw predictions on the same sample IDs are available.
+
+## Troubleshooting
+
+- `paper_ready=false`: inspect `main_summary.json` and `report/validation.json` for failed gates.
+- `Gate 1` fails: build or validate assets with `run_benchmark.py assets` and check `asset_registry.jsonl`.
+- `Gate 2` fails: provide `--sample-ids-file`, `--sampling-protocol`, or a GoldenSet generated from a frozen protocol.
+- `Gate 3` fails: verify `stage=frozen`, `cache-mode cold|compiled`, and disabled eval feedback/memory updates.
+- `Gate 5` fails: regenerate the report with `run_benchmark.py report` and inspect validator errors.
+- Env file missing: create the private profile from examples and keep secrets in ignored files.
+- Imported baseline coverage low: ensure the JSONL contains one prediction for every frozen sample ID.

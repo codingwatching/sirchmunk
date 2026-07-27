@@ -420,6 +420,7 @@ class UnifiedExperimentRunner:
                     metrics[key] = benchmark_metrics[key]
         metrics["checkpoint"] = checkpoint_summary
         metrics["cache"] = cache_report
+        self._save_analysis_artifacts(artifact, results, metrics)
         artifact.save_metrics(metrics)
         failed_count = sum(1 for r in results if r.error)
         retry_count = sum(
@@ -610,6 +611,44 @@ class UnifiedExperimentRunner:
         )
 
     @staticmethod
+    def _save_analysis_artifacts(artifact: RunArtifactManager, results: List[PredictionResult], metrics: Dict[str, Any]) -> None:
+        try:
+            from evaluation.badcase_analysis import (
+                build_answer_type_consistency,
+                build_badcase_outputs,
+                quality_gate,
+            )
+        except Exception as exc:
+            logger.warning("[Runner] Failed to import analysis builders: %s", exc)
+            return
+        rows = [getattr(result, "raw", None) for result in results]
+        rows = [row for row in rows if isinstance(row, dict)]
+        if not rows:
+            return
+        try:
+            badcase_rows, taxonomy = build_badcase_outputs(rows)
+            answer_type = build_answer_type_consistency(rows)
+            target_slot_checks: List[bool] = []
+            for row in rows:
+                telemetry = row.get("telemetry", {}) or {}
+                if isinstance(telemetry, dict) and telemetry.get("target_slot"):
+                    target_slot_checks.append(bool(telemetry.get("target_slot_verified")))
+            if target_slot_checks:
+                metrics["target_slot_verification_rate"] = round(
+                    sum(1 for ok in target_slot_checks if ok) / len(target_slot_checks) * 100,
+                    2,
+                )
+                metrics["target_slot_checked_samples"] = len(target_slot_checks)
+            quality = quality_gate(metrics)
+            metrics["quality_gate"] = quality
+            artifact.save_analysis_jsonl("badcases.jsonl", badcase_rows)
+            artifact.save_analysis_json("failure_taxonomy.json", taxonomy)
+            artifact.save_analysis_json("answer_type_consistency.json", answer_type)
+            artifact.save_analysis_json("quality_gate.json", quality)
+        except Exception as exc:
+            logger.warning("[Runner] Failed to save analysis artifacts: %s", exc)
+
+    @staticmethod
     def _result_to_row(result: PredictionResult, sample, adapter) -> dict:
         """将 PredictionResult + 样本 metadata 合并为 JSONL 行。"""
         row = {
@@ -648,7 +687,18 @@ class UnifiedExperimentRunner:
             "supporting_fact_hit": telemetry.get("supporting_fact_hit", False),
             "supporting_fact_title_recall": telemetry.get("supporting_fact_title_recall"),
             "supporting_sentence_recall": telemetry.get("supporting_sentence_recall"),
+            "supporting_sentence_completion_rate": telemetry.get("supporting_sentence_completion_rate"),
+            "supporting_sentence_completion_complete": telemetry.get("supporting_sentence_completion_complete"),
+            "evidence_completion_needed": telemetry.get("evidence_completion_needed"),
+            "missing_supporting_fact_titles": telemetry.get("missing_supporting_fact_titles", []),
+            "missing_supporting_sentences": telemetry.get("missing_supporting_sentences", []),
             "answer_source_grounded": telemetry.get("answer_source_grounded", False),
+            "target_slot_verified": telemetry.get("target_slot_verified"),
+            "target_slot_failure_reason": telemetry.get("target_slot_failure_reason", ""),
+            "target_slot": telemetry.get("target_slot", ""),
+            "target_slot_expected_type": telemetry.get("target_slot_expected_type", ""),
+            "evidence_reranking_applied": telemetry.get("evidence_reranking_applied", False),
+            "evidence_reranking_scores": telemetry.get("evidence_reranking_scores", {}),
             "search_mode": telemetry.get("search_mode", ""),
             "num_files_read": telemetry.get("num_files_read", 0),
             "loop_count": telemetry.get("loop_count", 0),
@@ -695,6 +745,9 @@ def _extract_evidence_snippets(cluster: Any) -> List[str]:
     snippets: List[str] = []
     if cluster is None:
         return snippets
+    content = getattr(cluster, "content", None)
+    if isinstance(content, str) and content.strip():
+        snippets.append(content)
     for ev in getattr(cluster, "evidences", []) or []:
         for snippet in getattr(ev, "snippets", []) or []:
             if isinstance(snippet, str):

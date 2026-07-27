@@ -49,6 +49,10 @@ class BaselineSetupResult:
     preprocess_llm_tokens: int = 0
     api_cost_usd: float = 0.0
     artifact_dir: str = ""
+    index_required: bool = True
+    rebuild_required: bool = False
+    query_ready_immediately: bool = False
+    partial_index: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -77,7 +81,8 @@ class BaselineResult:
     prediction: str
     judge_correct: bool
     coverage: bool
-    elapsed: float
+    evidence_recall: float = 0.0
+    elapsed: float = 0.0
     tokens_used: int = 0
     judge_tokens: int = 0
     question_type: str = ""             # 从 sample metadata 提取，用于分类统计
@@ -213,6 +218,14 @@ class BaselineAdapter(ABC):
         from entering warm-query quality tables.
         """
         return True
+
+    def is_index_required(self) -> bool:
+        """Return whether this baseline requires a built index before queries."""
+        return True
+
+    def is_query_ready_immediately(self) -> bool:
+        """Return whether corpus changes are query-ready without index rebuild."""
+        return False
 
     def validate_index(self, corpus_manifest: Optional[Dict[str, Any]] = None) -> Any:
         """Validate that the built index covers the declared corpus.

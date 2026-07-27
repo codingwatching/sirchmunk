@@ -168,6 +168,9 @@ class BaselineLifecycleManager:
         record.build_completed = bool(getattr(setup, "build_completed", True))
         record.index_ready = bool(getattr(setup, "index_ready", True))
         record.query_eligible = record.index_ready
+        record.rebuild_required = bool(getattr(setup, "rebuild_required", False))
+        record.query_ready_immediately = bool(getattr(setup, "query_ready_immediately", False))
+        record.partial_index = bool(getattr(setup, "partial_index", False))
         record.build_time_seconds = float(getattr(setup, "setup_seconds", 0.0) or 0.0)
         record.preprocessing_seconds = float(getattr(setup, "preprocessing_seconds", 0.0) or 0.0)
         record.index_build_seconds = float(getattr(setup, "index_build_seconds", 0.0) or 0.0)

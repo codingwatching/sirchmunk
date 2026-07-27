@@ -105,7 +105,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sirchmunk-results", default=None, dest="sirchmunk_results",
                    help="本文系统（LENS/Sirchmunk）的结果 JSONL 文件路径")
     p.add_argument("--baselines", default="",
-                   help="运行的竞品列表（逗号分隔）: bm25, naive_rag, lightrag_v1, graphrag, or module:factory")
+                   help=(
+                       "运行的竞品列表（逗号分隔）: "
+                       "bm25, bm25_rag, react, naive_rag, lightrag_v1, graphrag, "
+                       "lens_full, lens_no_prior, lens_no_seq, lens_no_reuse, or module:factory"
+                   ))
     p.add_argument("--import-baseline", action="append", dest="import_baseline",
                    metavar="NAME=PATH",
                    help="导入预计算预测并重新 Judge（可多次）")
@@ -277,7 +281,7 @@ async def _main() -> int:
             if not raw_bname:
                 continue
             try:
-                baseline_list.append(_load_baseline_spec(raw_bname, args))
+                baseline_list.append(_load_baseline_spec(raw_bname, args, bm_adapter=bm_adapter))
             except Exception as exc:
                 logger.error("加载竞品 '%s' 失败: %s", raw_bname, exc)
                 return 1
@@ -406,13 +410,24 @@ def _parse_named_paths(specs: list[str]) -> dict[str, str]:
     return out
 
 
-def _load_baseline_spec(raw_name: str, args: argparse.Namespace):
-    from baselines import GraphRAGBaseline, LightRAGV1Baseline, LocalBM25Baseline, NaiveRAGBaseline
+def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None):
+    from baselines import (
+        BM25RAGBaseline,
+        GraphRAGBaseline,
+        LightRAGV1Baseline,
+        LocalBM25Baseline,
+        NaiveRAGBaseline,
+        ReActSearchBaseline,
+    )
     from baselines.base_adapter import BaselineAdapter
 
-    lower = raw_name.strip().lower()
+    lower = raw_name.strip().lower().replace("-", "_")
     if lower in ("bm25", "bm25_local"):
         return LocalBM25Baseline(max_files=args.bm25_max_files)
+    if lower in ("bm25_rag", "rag_bm25"):
+        return BM25RAGBaseline(max_files=args.bm25_max_files)
+    if lower in ("react", "react_search"):
+        return ReActSearchBaseline()
     if lower in ("naive_rag", "naive_rag_local"):
         return NaiveRAGBaseline(max_files=args.naive_rag_max_files)
     if lower in ("lightrag", "lightrag_v1"):
@@ -425,6 +440,24 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace):
             predictions_path=args.graphrag_predictions,
             setup_metrics_path=args.graphrag_setup_metrics,
         )
+    if lower in ("lens_full", "full", "lens_no_prior", "no_prior",
+                 "lens_no_seq", "no_seq", "lens_no_reuse", "no_reuse",
+                 "no_multi_signal_prior", "no_sequential_exploration",
+                 "no_knowledge_reuse"):
+        if bm_adapter is None:
+            raise ValueError("LENS ablation baseline requires bm_adapter")
+        from ablations import build_single_lens_ablation
+        run_cfg = {}
+        try:
+            run_cfg = bm_adapter.get_run_config()
+        except Exception:
+            pass
+        return build_single_lens_ablation(
+            bm_adapter=bm_adapter,
+            profile_name=lower,
+            max_token_budget=int(run_cfg.get("max_token_budget", 128000) or 128000),
+            top_k_files=int(run_cfg.get("top_k_files", 5) or 5),
+        )
     if ":" in raw_name:
         module_name, _, factory_name = raw_name.partition(":")
         module = importlib.import_module(module_name)
@@ -433,7 +466,10 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace):
         if not isinstance(baseline, BaselineAdapter):
             raise TypeError(f"Factory {raw_name} did not return BaselineAdapter")
         return baseline
-    raise ValueError("Unknown baseline. Use bm25, naive_rag, lightrag_v1, graphrag, or module:factory.")
+    raise ValueError(
+        "Unknown baseline. Use bm25, bm25_rag, react, naive_rag, lightrag_v1, "
+        "graphrag, lens_no_prior, lens_no_seq, lens_no_reuse, or module:factory."
+    )
 
 
 def _build_sampling_protocol(args: argparse.Namespace, bm_adapter) -> object:

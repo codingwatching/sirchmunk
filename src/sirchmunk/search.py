@@ -1120,7 +1120,12 @@ class AgenticSearch(BaseSearch):
             )
             if _answer_match:
                 _answer_val = _answer_match.group(1).strip()
-                if _answer_val and not cls._is_refusal_answer(_answer_val):
+                if (
+                    _answer_val
+                    and not cls._is_reserved_answer_span(_answer_val)
+                    and not cls._is_no_answer_value(_answer_val)
+                    and not cls._is_refusal_answer(_answer_val)
+                ):
                     should_answer = True
                     should_save = True
                     if not precise:
@@ -2220,11 +2225,27 @@ class AgenticSearch(BaseSearch):
             dir_scan_files=dir_scan_files,
             knowledge_hits=extra_knowledge_files,
         )
+        merged_files, reranking_scores = self._rerank_files_for_evidence_coverage(
+            merged_files,
+            query,
+            data_reqs,
+        )
+        if reranking_scores:
+            self._record_context_telemetry(
+                context,
+                evidence_reranking_applied=True,
+                evidence_reranking_scores=reranking_scores,
+                evidence_reranking_terms=sorted(self._evidence_coverage_terms(query, data_reqs))[:50],
+            )
         target_files = self._select_target_files(
             merged_files,
             _scope,
             artifacts,
             max_files=top_k_files,
+        )
+        self._record_context_telemetry(
+            context,
+            evidence_reranking_selected_files=target_files,
         )
 
         await self._logger.info(
@@ -2253,6 +2274,7 @@ class AgenticSearch(BaseSearch):
             formula=data_reqs.formula,
             background_context=spec_context,
             data_reqs=data_reqs,
+            context=context,
         )
 
         # ==============================================================
@@ -2269,6 +2291,8 @@ class AgenticSearch(BaseSearch):
                         query, _query_intent, sc_retrieval, merged_files,
                         formula=data_reqs.formula,
                         background_context=spec_context,
+                        data_reqs=data_reqs,
+                        context=context,
                     )
                 )
 
@@ -6880,14 +6904,24 @@ class AgenticSearch(BaseSearch):
         short = cls._extract_answer_span(answer)
         if not short:
             return answer
-        if re.sub(r"[\s_:\-=]+", "", short.lower()) in {"shouldanswerfalse", "false", "noanswer"}:
+        if cls._is_no_answer_value(short):
             return _NO_RESULTS_MESSAGE
+        if cls._is_reserved_answer_span(short):
+            extracted = cls._extract_marked_answer_value(answer, "Extracted value")
+            if extracted and not cls._is_reserved_answer_span(extracted) and not cls._is_no_answer_value(extracted):
+                short = extracted
+            else:
+                return _NO_RESULTS_MESSAGE
         if expected == "yes_no" or cls._looks_yes_no_question(query):
             yes_no = cls._extract_yes_no(short)
             if yes_no:
                 short = yes_no
-        elif expected in {"single_entity", "person", "organization", "location", "work_title"}:
+        elif expected in {"location", "list", "phrase"}:
+            short = cls._expand_composite_answer(short, answer, expected)
+        elif expected in {"single_entity", "person", "organization", "work_title"}:
             short = cls._trim_single_entity_answer(short, expected)
+        if cls._is_no_answer_value(short) or cls._is_reserved_answer_span(short):
+            return _NO_RESULTS_MESSAGE
         if answer.startswith("**Answer:"):
             return re.sub(
                 r"^\*\*Answer:\s*.*?\*\*",
@@ -6898,20 +6932,127 @@ class AgenticSearch(BaseSearch):
             )
         return f"**Answer: {short}**\n\n{answer}"
 
-    @staticmethod
-    def _extract_answer_span(answer: str) -> str:
+    @classmethod
+    def _extract_answer_span(cls, answer: str) -> str:
+        no_answer_candidate = ""
+        precise = cls._extract_marked_answer_value(answer, "PRECISE_ANSWER", xml_tag=True)
+        if precise:
+            if cls._is_no_answer_value(precise):
+                no_answer_candidate = precise
+            elif not cls._is_reserved_answer_span(precise):
+                return precise
         patterns = [
             r"^\*\*Answer:\s*(.+?)\*\*",
-            r"<PRECISE_ANSWER>(.*?)</PRECISE_ANSWER>",
             r"(?:^|\n)Answer\s*:\s*(.+?)(?:\n|$)",
             r"(?:^|\n)Final answer\s*:\s*(.+?)(?:\n|$)",
         ]
         for pattern in patterns:
             match = re.search(pattern, answer, flags=re.IGNORECASE | re.DOTALL)
-            if match:
-                return match.group(1).strip()
+            if not match:
+                continue
+            candidate = cls._clean_answer_candidate(match.group(1))
+            if not candidate:
+                continue
+            if cls._is_no_answer_value(candidate):
+                no_answer_candidate = candidate
+                continue
+            if not cls._is_reserved_answer_span(candidate):
+                return candidate
+        extracted = cls._extract_marked_answer_value(answer, "Extracted value")
+        if extracted:
+            if cls._is_no_answer_value(extracted):
+                no_answer_candidate = extracted
+            elif not cls._is_reserved_answer_span(extracted):
+                return extracted
+        if no_answer_candidate:
+            return no_answer_candidate
         first = next((line.strip() for line in answer.splitlines() if line.strip()), "")
-        return first[:500]
+        return cls._clean_answer_candidate(first[:500])
+
+    @classmethod
+    def _extract_marked_answer_value(cls, text: str, label: str, *, xml_tag: bool = False) -> str:
+        if not text:
+            return ""
+        if xml_tag:
+            match = re.search(
+                rf"<{re.escape(label)}>\s*(.*?)\s*</{re.escape(label)}>",
+                text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            return cls._clean_answer_candidate(match.group(1)) if match else ""
+        match = re.search(
+            rf"(?:^|\n)\s*\**{re.escape(label)}\**\s*:\s*(.+?)(?=\n\s*\n|\n\s*\**[A-Z][^:\n]{{0,80}}\**\s*:|\Z)",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return cls._clean_answer_candidate(match.group(1)) if match else ""
+
+    @staticmethod
+    def _clean_answer_candidate(text: str) -> str:
+        value = re.sub(r"\s+", " ", str(text or "")).strip()
+        value = value.strip().strip("` ").strip()
+        value = re.sub(r"^\*+", "", value).strip()
+        value = re.sub(r"\*+$", "", value).strip()
+        value = value.strip('"').strip("'").strip()
+        return value
+
+    @staticmethod
+    def _is_reserved_answer_span(text: str) -> bool:
+        cleaned = re.sub(r"\s+", " ", str(text or "")).strip().strip("*:： ").lower()
+        cleaned = re.sub(r"[^a-z0-9 ]+", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        reserved = {
+            "answer",
+            "source",
+            "source passage",
+            "evidence",
+            "extracted value",
+            "precise answer",
+            "summary",
+            "not found in evidence",
+        }
+        return cleaned in reserved or any(cleaned.startswith(f"{label} ") for label in reserved)
+
+    @staticmethod
+    def _is_no_answer_value(text: str) -> bool:
+        cleaned = re.sub(r"\s+", " ", str(text or "")).strip().strip("*:： ").lower()
+        norm = re.sub(r"[\s_:\-=]+", "", cleaned)
+        if norm in {"shouldanswerfalse", "false", "noanswer", "notfound", "na", "n/a", "unknown"}:
+            return True
+        no_answer_phrases = (
+            "not found",
+            "not provided",
+            "not stated",
+            "not available",
+            "not mentioned",
+            "does not provide",
+            "does not mention",
+            "does not state",
+            "does not contain",
+            "no such",
+            "specific value requested is not found",
+        )
+        return any(phrase in cleaned for phrase in no_answer_phrases)
+
+    @classmethod
+    def _expand_composite_answer(cls, short: str, answer: str, expected: str) -> str:
+        if expected not in {"location", "list", "phrase"}:
+            return short
+        extracted = cls._extract_marked_answer_value(answer, "Extracted value")
+        if not extracted or cls._is_no_answer_value(extracted) or cls._is_reserved_answer_span(extracted):
+            return short
+        if len(extracted) > 240:
+            return short
+        composite = bool(re.search(r"\b(?:and|or)\b|[,;]", extracted, flags=re.IGNORECASE))
+        if not composite:
+            return short
+        short_norm = re.sub(r"\W+", " ", short.lower()).strip()
+        extracted_norm = re.sub(r"\W+", " ", extracted.lower()).strip()
+        if short_norm and short_norm in extracted_norm:
+            return extracted
+        if expected == "list":
+            return extracted
+        return short
 
     @staticmethod
     def _looks_yes_no_question(query: str) -> bool:
@@ -6925,11 +7066,80 @@ class AgenticSearch(BaseSearch):
     @staticmethod
     def _trim_single_entity_answer(text: str, expected: str = "") -> str:
         cleaned = re.sub(r"\s+", " ", text).strip()
-        if expected != "location":
-            split = re.split(r"\s*(?:,|;|\n|\band\b|\bor\b)\s*", cleaned, maxsplit=1, flags=re.I)
-            return split[0].strip() if split and split[0].strip() else cleaned
-        split = re.split(r"\s*(?:;|\n|\band\b|\bor\b)\s*", cleaned, maxsplit=1, flags=re.I)
+        split = re.split(r"\s*(?:,|;|\n|\band\b|\bor\b)\s*", cleaned, maxsplit=1, flags=re.I)
         return split[0].strip() if split and split[0].strip() else cleaned
+
+    @classmethod
+    def _verify_target_slot_answer(
+        cls,
+        query: str,
+        answer: str,
+        evidence: str,
+        data_reqs: Optional[DataRequirements],
+    ) -> Dict[str, Any]:
+        target_slot = (data_reqs.target_slot if data_reqs else "") or ""
+        expected = ((data_reqs.expected_answer_type if data_reqs else "") or "").lower()
+        short = cls._extract_answer_span(answer)
+        record: Dict[str, Any] = {
+            "target_slot": target_slot,
+            "target_slot_expected_type": expected,
+            "target_slot_answer": short,
+            "target_slot_verified": True,
+            "target_slot_failure_reason": "",
+        }
+        if not target_slot and not expected:
+            record["target_slot_failure_reason"] = "no_target_slot"
+            return record
+        if not short or answer == _NO_RESULTS_MESSAGE or cls._is_no_answer_value(short):
+            record["target_slot_verified"] = False
+            record["target_slot_failure_reason"] = "no_answer"
+            return record
+        if cls._is_reserved_answer_span(short):
+            record["target_slot_verified"] = False
+            record["target_slot_failure_reason"] = "reserved_label_answer"
+            return record
+        type_ok, reason = cls._answer_matches_expected_type(short, expected, query)
+        if not type_ok:
+            record["target_slot_verified"] = False
+            record["target_slot_failure_reason"] = reason
+            return record
+        if expected in {"single_entity", "person", "organization", "work_title"} and cls._is_overlong_entity_answer(short):
+            record["target_slot_verified"] = False
+            record["target_slot_failure_reason"] = "overlong_entity_answer"
+            return record
+        if expected not in {"yes_no", ""}:
+            answer_norm = re.sub(r"\W+", " ", short.lower()).strip()
+            evidence_norm = re.sub(r"\W+", " ", (evidence or "").lower()).strip()
+            record["target_slot_answer_in_evidence"] = bool(answer_norm and answer_norm in evidence_norm)
+        return record
+
+    @classmethod
+    def _answer_matches_expected_type(cls, answer: str, expected: str, query: str) -> Tuple[bool, str]:
+        if not expected:
+            return True, ""
+        text = answer.strip()
+        lower = text.lower()
+        if expected == "yes_no" or cls._looks_yes_no_question(query):
+            return (bool(cls._extract_yes_no(text)), "expected_yes_no")
+        if expected == "year":
+            return (bool(re.fullmatch(r"(?:18|19|20)\d{2}", lower)), "expected_year")
+        if expected == "date":
+            has_date = bool(re.search(r"\b(?:18|19|20)\d{2}\b", lower) or re.search(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", lower))
+            return (has_date, "expected_date")
+        if expected == "number":
+            return (bool(re.search(r"\d", lower)), "expected_number")
+        if expected == "list":
+            return (bool(re.search(r"\b(?:and|or)\b|[,;]", text, flags=re.I)), "expected_list")
+        if expected in {"single_entity", "person", "organization", "location", "work_title"}:
+            if cls._is_reserved_answer_span(text) or cls._is_no_answer_value(text):
+                return False, f"expected_{expected}"
+            return True, ""
+        return True, ""
+
+    @staticmethod
+    def _is_overlong_entity_answer(answer: str) -> bool:
+        cleaned = re.sub(r"\s+", " ", answer).strip()
+        return len(cleaned.split()) > 16 or len(cleaned) > 160
 
     async def _summarise_fast_fallback(
         self, query: str, context: "SearchContext",
@@ -7015,6 +7225,71 @@ class AgenticSearch(BaseSearch):
         ranked = with_tree + without_tree
         limit = max_files if max_files and max_files > 0 else self._AGENTIC_MAX_FILES
         return ranked[:limit]
+
+    @staticmethod
+    def _record_context_telemetry(context: Optional["SearchContext"], **fields: Any) -> None:
+        if context is None:
+            return
+        telemetry = getattr(context, "telemetry", None)
+        if not isinstance(telemetry, dict):
+            telemetry = {}
+            setattr(context, "telemetry", telemetry)
+        telemetry.update({key: value for key, value in fields.items() if value is not None})
+
+    @classmethod
+    def _evidence_coverage_terms(cls, query: str, data_reqs: Optional[DataRequirements]) -> set[str]:
+        parts: List[str] = [query]
+        if data_reqs is not None:
+            parts.extend(str(item) for item in data_reqs.data_points or [])
+            parts.extend(str(item) for item in data_reqs.likely_sources or [])
+            parts.append(str(data_reqs.target_slot or ""))
+            parts.extend(str(item) for item in data_reqs.answer_constraints or [])
+        text = " ".join(parts).lower()
+        stop = {
+            "the", "and", "for", "that", "this", "with", "from", "what", "which", "where", "when",
+            "who", "was", "were", "are", "is", "has", "have", "had", "does", "did", "its", "his",
+            "her", "their", "about", "after", "before", "current", "specific", "answer", "return",
+        }
+        return {
+            tok for tok in re.findall(r"[a-z0-9]{3,}", text)
+            if tok not in stop
+        }
+
+    @classmethod
+    def _file_requirement_coverage_score(cls, file_path: str, terms: set[str]) -> float:
+        if not terms:
+            return 0.0
+        path = Path(file_path)
+        title = re.sub(r"^\d+_", "", path.stem).replace("_", " ")
+        text = " ".join([title, path.name, " ".join(path.parts[-3:])]).lower()
+        file_tokens = set(re.findall(r"[a-z0-9]{3,}", text))
+        if not file_tokens:
+            return 0.0
+        hits = terms & file_tokens
+        substring_hits = {term for term in terms if term in text}
+        score = len(hits) + 0.5 * len(substring_hits - hits)
+        return round(score / max(len(terms), 1), 4)
+
+    @classmethod
+    def _rerank_files_for_evidence_coverage(
+        cls,
+        merged_files: List[str],
+        query: str,
+        data_reqs: Optional[DataRequirements],
+    ) -> Tuple[List[str], Dict[str, float]]:
+        terms = cls._evidence_coverage_terms(query, data_reqs)
+        if not merged_files or not terms:
+            return merged_files, {}
+        order = {fp: idx for idx, fp in enumerate(merged_files)}
+        scores = {fp: cls._file_requirement_coverage_score(fp, terms) for fp in merged_files}
+        if not any(score > 0 for score in scores.values()):
+            return merged_files, {}
+        ranked = sorted(
+            merged_files,
+            key=lambda fp: (-scores.get(fp, 0.0), order.get(fp, 0)),
+        )
+        nonzero_scores = {fp: score for fp, score in scores.items() if score > 0}
+        return ranked, dict(sorted(nonzero_scores.items(), key=lambda item: (-item[1], order.get(item[0], 0)))[:50])
 
     async def _select_pages_for_data(
         self,
@@ -7736,6 +8011,7 @@ class AgenticSearch(BaseSearch):
         formula: Optional[str] = None,
         background_context: str = "",
         data_reqs: Optional[DataRequirements] = None,
+        context: Optional["SearchContext"] = None,
     ) -> Tuple[str, bool, Optional["KnowledgeCluster"]]:
         """Synthesize final answer from agentic retrieval evidence."""
         if not retrieval.evidence.strip():
@@ -7774,6 +8050,8 @@ class AgenticSearch(BaseSearch):
         raw = resp.content or ""
         answer, should_save, should_answer = self._parse_summary_response(raw)
         answer = self._finalize_answer(query, answer, data_reqs)
+        target_slot_check = self._verify_target_slot_answer(query, answer, evidence, data_reqs)
+        self._record_context_telemetry(context, **target_slot_check)
         if not should_answer and self._is_refusal_answer(answer):
             return _NO_RESULTS_MESSAGE, False, None
 

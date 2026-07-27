@@ -34,6 +34,15 @@ def evaluate_supporting_facts(
             "supporting_fact_titles": [],
             "retrieved_titles": sorted(retrieved_titles),
             "supporting_fact_hit": False,
+            "supporting_fact_count": 0,
+            "supporting_sentence_count": 0,
+            "matched_supporting_sentence_count": 0,
+            "missing_supporting_fact_titles": [],
+            "missing_supporting_facts": [],
+            "missing_supporting_sentences": [],
+            "supporting_sentence_completion_rate": None,
+            "supporting_sentence_completion_complete": False,
+            "evidence_completion_needed": False,
             "evidence_recall": 0.0,
             "answer_source_grounded": False,
         }
@@ -53,6 +62,11 @@ def evaluate_supporting_facts(
     sentence_recall = len(sentence_hits) / max(len(sentence_facts), 1) if sentence_facts else None
     effective_recall = sentence_recall if sentence_recall is not None and evidence_texts else fact_recall
     answer_source_grounded = (bool(title_hits) or bool(sentence_hits)) and bool((prediction or "").strip())
+    missing_titles = sorted(title for title in gold_titles if title not in title_hits)
+    missing_facts = [fact for fact in gold_facts if fact not in fact_hits]
+    missing_sentences = [fact for fact in sentence_facts if fact not in sentence_hits]
+    completion_rate = round(sentence_recall, 4) if sentence_recall is not None else None
+    completion_complete = bool(sentence_facts) and len(sentence_hits) == len(sentence_facts)
 
     return {
         "supporting_facts": gold_facts,
@@ -61,9 +75,18 @@ def evaluate_supporting_facts(
         "matched_supporting_fact_titles": sorted(title_hits),
         "matched_supporting_facts": fact_hits,
         "matched_supporting_sentences": sentence_hits,
+        "missing_supporting_fact_titles": missing_titles,
+        "missing_supporting_facts": missing_facts,
+        "missing_supporting_sentences": missing_sentences,
         "supporting_fact_hit": bool(title_hits) or bool(sentence_hits),
+        "supporting_fact_count": len(gold_facts),
+        "supporting_sentence_count": len(sentence_facts),
+        "matched_supporting_sentence_count": len(sentence_hits),
         "supporting_fact_title_recall": round(title_recall, 4),
-        "supporting_sentence_recall": round(sentence_recall, 4) if sentence_recall is not None else None,
+        "supporting_sentence_recall": completion_rate,
+        "supporting_sentence_completion_rate": completion_rate,
+        "supporting_sentence_completion_complete": completion_complete,
+        "evidence_completion_needed": bool(missing_titles or missing_sentences),
         "evidence_recall": round(effective_recall, 4),
         "answer_source_grounded": answer_source_grounded,
     }

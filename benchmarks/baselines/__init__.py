@@ -10,8 +10,10 @@
     from baselines import ManualImportAdapter
 """
 from .base_adapter import BaselineAdapter, BaselinePrediction, BaselineResult, BaselineSetupResult
+from .bm25_rag import BM25RAGBaseline
 from .external import ExternalPredictionBaseline, GraphRAGBaseline, LightRAGV1Baseline
 from .lexical import LocalBM25Baseline, NaiveRAGBaseline
+from .react_search import ReActSearchBaseline
 from .sdk_baseline import ManualImportAdapter, SdkBaseline
 from .indexing_sdk_baseline import IndexingSdkBaseline
 
@@ -23,7 +25,9 @@ __all__ = [
     "BaselineSetupResult",
     # 本地/外部基线
     "LocalBM25Baseline",
+    "BM25RAGBaseline",
     "NaiveRAGBaseline",
+    "ReActSearchBaseline",
     "ExternalPredictionBaseline",
     "LightRAGV1Baseline",
     "GraphRAGBaseline",

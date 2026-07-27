@@ -377,6 +377,8 @@ def _print_summary(
     print(f"official_f1: {metrics.get('f1', 'N/A')}")
     print(f"coverage  : {metrics.get('coverage', 'N/A')}")
     print(f"evidence_recall: {metrics.get('evidence_recall', 'N/A')}")
+    if "target_slot_verification_rate" in metrics:
+        print(f"target_slot_verify: {metrics.get('target_slot_verification_rate')}")
     print(f"source_grounding: {metrics.get('source_grounding_accuracy', 'N/A')}")
     failure = metrics.get("failure_classification", {}) if isinstance(metrics, dict) else {}
     system_failures = failure.get("system_failures", 0)
@@ -390,6 +392,16 @@ def _print_summary(
         and coverage_value > 0
     ) if metrics else "N/A"
     print(f"sys_fail  : {system_failures}")
+    qgate = metrics.get("quality_gate") if isinstance(metrics.get("quality_gate"), dict) else {}
+    if qgate:
+        print(f"pipeline_ok: {qgate.get('pipeline_ok', qgate.get('quality_ok'))}")
+        print(f"quality_ok: {qgate.get('quality_ok')}")
+        if qgate.get("failed_pipeline_checks"):
+            print(f"pipeline_failed: {qgate.get('failed_pipeline_checks')}")
+        if qgate.get("failed_quality_checks"):
+            print(f"quality_failed: {qgate.get('failed_quality_checks')}")
+        elif qgate.get("failed_checks"):
+            print(f"quality_failed: {qgate.get('failed_checks')}")
     print(f"quickstart_ok: {quickstart_ok}")
     if report_paths:
         print(f"report.md : {report_paths['report_md']}")

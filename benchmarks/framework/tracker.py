@@ -231,13 +231,37 @@ class ExperimentTracker:
         if not records:
             print("  (no experiments recorded yet)")
             return
-        header = (
-            f"\n{'Run ID':<35} {'Samples':>7} {'Acc%':>6} {'EM%':>6} "
-            f"{'F1%':>6} {'Cov%':>6} {'Evid%':>6} {'Avg':>8} {'P95':>8} "
-            f"{'Tok/Q':>8} {'Fail':>5} {'Git':>12}  Notes"
-        )
-        print(header)
-        print("─" * 130)
+        columns = [
+            ("Run ID", 25, "<"),
+            ("N", 5, ">"),
+            ("Acc", 5, ">"),
+            ("EM", 5, ">"),
+            ("F1", 5, ">"),
+            ("Cov", 5, ">"),
+            ("Evd", 5, ">"),
+            ("Avg", 6, ">"),
+            ("P95", 6, ">"),
+            ("Tok/Q", 7, ">"),
+            ("Fail", 4, ">"),
+            ("Git", 12, ">"),
+        ]
+
+        def _cell(value, width: int, align: str) -> str:
+            text = str(value)
+            if len(text) > width:
+                text = text[: max(width - 1, 0)] + "~"
+            return f"{text:<{width}}" if align == "<" else f"{text:>{width}}"
+
+        def _row(values) -> str:
+            return " | ".join(
+                _cell(value, width, align)
+                for value, (_, width, align) in zip(values, columns)
+            )
+
+        header = _row(label for label, _, _ in columns) + " | Notes"
+        separator = "-+-".join("-" * width for _, width, _ in columns) + "-+------"
+        print(f"\n{header}")
+        print(separator)
         for r in records:
             metrics = r.metrics or {}
             samples = self._metric_number(metrics, "n", default=0, as_int=True)
@@ -250,13 +274,27 @@ class ExperimentTracker:
             p95_latency = self._latency_metric(metrics, "p95")
             avg_tokens = self._avg_tokens_per_question(metrics)
             failures = self._system_failures(metrics)
-            reg_tag = " ⚠️" if r.is_regression else ""
-            note = r.notes[:30] if r.notes else ""
+            note_parts = []
+            if r.notes:
+                note_parts.append(r.notes[:30])
+            if r.is_regression:
+                note_parts.append("REGRESSION")
             print(
-                f"  {r.run_id:<33} {samples:>7} {acc:>5.1f} {em:>5.1f} "
-                f"{f1:>5.1f} {cov:>5.1f} {evidence:>5.1f} "
-                f"{avg_latency:>7.1f}s {p95_latency:>7.1f}s {avg_tokens:>7.1f} "
-                f"{failures:>5} {r.git_commit:>12}  {note}{reg_tag}"
+                _row([
+                    r.run_id,
+                    samples,
+                    f"{acc:.1f}",
+                    f"{em:.1f}",
+                    f"{f1:.1f}",
+                    f"{cov:.1f}",
+                    f"{evidence:.1f}",
+                    f"{avg_latency:.1f}s",
+                    f"{p95_latency:.1f}s",
+                    f"{avg_tokens:.1f}",
+                    failures,
+                    r.git_commit,
+                ])
+                + f" | {'; '.join(note_parts)}"
             )
         print()
 

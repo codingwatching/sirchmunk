@@ -69,6 +69,7 @@ class DynamicUpdateResult:
     update_completed: bool
     rebuild_required: bool
     update_time_seconds: float
+    query_ready_immediately: bool = False
     failure_reason: str = "none"
     failure_message: str = ""
     freshness_before: Optional[float] = None
@@ -144,6 +145,7 @@ class DynamicUpdateManager:
                 update_completed=False,
                 rebuild_required=True,
                 update_time_seconds=0.0,
+                query_ready_immediately=False,
                 failure_reason="update_not_supported",
                 failure_message="Baseline does not implement update_index(); full rebuild required.",
                 metadata=getattr(baseline, "extra_metadata", lambda: {})(),
@@ -162,6 +164,7 @@ class DynamicUpdateManager:
                     update_completed=False,
                     rebuild_required=True,
                     update_time_seconds=elapsed,
+                    query_ready_immediately=bool(metadata.get("query_ready_immediately", False)),
                     failure_reason=str(metadata.get("failure_reason") or "update_not_supported"),
                     failure_message="Baseline does not support incremental update; full rebuild required.",
                     metadata=metadata,
@@ -173,6 +176,7 @@ class DynamicUpdateManager:
                 update_completed=True,
                 rebuild_required=bool(metadata.get("rebuild_required", False)),
                 update_time_seconds=elapsed,
+                query_ready_immediately=bool(metadata.get("query_ready_immediately", False)),
                 metadata=metadata,
             )
         except Exception as exc:
@@ -183,6 +187,7 @@ class DynamicUpdateManager:
                 update_completed=False,
                 rebuild_required=True,
                 update_time_seconds=time.monotonic() - t0,
+                query_ready_immediately=False,
                 failure_reason=_classify_update_failure(exc),
                 failure_message=str(exc),
             )

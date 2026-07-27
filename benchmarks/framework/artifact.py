@@ -117,6 +117,22 @@ class RunArtifactManager:
         self.metrics_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
         return str(self.metrics_path)
 
+    def save_analysis_json(self, name: str, payload: Dict[str, Any]) -> str:
+        """Save a structured analysis artifact under analysis/."""
+        self.create()
+        path = self.analysis_dir / name
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        return str(path)
+
+    def save_analysis_jsonl(self, name: str, rows: list[Dict[str, Any]]) -> str:
+        """Save line-delimited structured analysis rows under analysis/."""
+        self.create()
+        path = self.analysis_dir / name
+        with path.open("w", encoding="utf-8") as fp:
+            for row in rows:
+                fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return str(path)
+
     def save_cache_report(self, cache_report: Dict[str, Any]) -> str:
         self.create()
         path = self.run_dir / "cache_report.json"

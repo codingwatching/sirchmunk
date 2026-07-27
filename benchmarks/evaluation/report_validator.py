@@ -105,6 +105,14 @@ class AcademicReportValidator:
             path = run_path / rel
             if not path.exists():
                 issues.append(ValidationIssue("error", "artifact_file", f"Missing required artifact file: {rel}", str(path)))
+        for rel in (
+            "analysis/failure_taxonomy.json",
+            "analysis/answer_type_consistency.json",
+            "analysis/quality_gate.json",
+        ):
+            path = run_path / rel
+            if not path.exists():
+                issues.append(ValidationIssue("warning", "analysis_artifact", f"Missing optional analysis artifact: {rel}", str(path)))
         return issues
 
     def _validate_manifest(self, run_path: Path, manifest: Dict[str, Any]) -> List[ValidationIssue]:
@@ -261,6 +269,21 @@ class AcademicReportValidator:
         elif budget_failures:
             issues.append(ValidationIssue("warning", "budget_failure_rate", f"Budget failures present: {budget_failures}/{total}."))
         checkpoint = metrics.get("checkpoint", {}) or {}
+        quality = metrics.get("quality_gate", {}) or {}
+        if isinstance(quality, dict) and quality.get("pipeline_ok") is False:
+            issues.append(ValidationIssue(
+                "warning",
+                "pipeline_gate",
+                f"Quickstart pipeline gate failed: {quality.get('failed_pipeline_checks', quality.get('failed_checks', []))}",
+                str(run_path / "results" / "metrics.json"),
+            ))
+        if isinstance(quality, dict) and quality.get("quality_ok") is False:
+            issues.append(ValidationIssue(
+                "warning",
+                "quality_gate",
+                f"Quickstart quality gate failed: {quality.get('failed_quality_checks', quality.get('failed_checks', []))}",
+                str(run_path / "results" / "metrics.json"),
+            ))
         if int(checkpoint.get("pending", 0) or 0) > 0:
             issues.append(ValidationIssue("error", "checkpoint", "Run has pending samples in checkpoint summary."))
         return issues

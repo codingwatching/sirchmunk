@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from .experiment_registry import ExperimentRegistry
 from .guards import TimeoutGuard
@@ -330,34 +331,40 @@ class QueueExecutor:
         return task
 
     async def _run_sirchmunk(self, task: QueueTask) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        adapter = load_benchmark_adapter(task.benchmark, task.env_file)
         overrides = dict(task.config_overrides)
-        overrides.update({
-            "cache_mode": task.cache_mode,
-            "stage": task.stage,
-            "frozen_evaluation": task.stage == "frozen",
-        })
-        runner = UnifiedExperimentRunner(adapter)
-        run_coro = runner.run(
-            limit=task.limit,
-            seed=task.seed,
-            run_id=task.run_id or task.task_id,
-            resume=self.resume,
-            config_overrides=overrides,
-            stage=task.stage,
-            system_name=task.system,
-        )
-        timeout_seconds = _safe_float(overrides.get("system_timeout_seconds") or overrides.get("SYSTEM_TIMEOUT_SECONDS"))
-        if timeout_seconds:
-            results, meta = await TimeoutGuard().run_system(run_coro, timeout_seconds)
-        else:
-            results, meta = await run_coro
-        meta["seed"] = task.seed
-        meta["cache_mode"] = task.cache_mode
-        meta["task_id"] = task.task_id
-        metrics = _read_json(meta.get("metrics_path", ""))
-        metrics.setdefault("n", len(results))
-        return meta, metrics
+        env_overrides = _env_overrides(overrides)
+        previous_env = {key: os.environ.get(key) for key in env_overrides}
+        try:
+            os.environ.update(env_overrides)
+            adapter = load_benchmark_adapter(task.benchmark, task.env_file)
+            overrides.update({
+                "cache_mode": task.cache_mode,
+                "stage": task.stage,
+                "frozen_evaluation": task.stage == "frozen",
+            })
+            runner = UnifiedExperimentRunner(adapter)
+            run_coro = runner.run(
+                limit=task.limit,
+                seed=task.seed,
+                run_id=task.run_id or task.task_id,
+                resume=self.resume,
+                config_overrides=overrides,
+                stage=task.stage,
+                system_name=task.system,
+            )
+            timeout_seconds = _safe_float(overrides.get("system_timeout_seconds") or overrides.get("SYSTEM_TIMEOUT_SECONDS"))
+            if timeout_seconds:
+                results, meta = await TimeoutGuard().run_system(run_coro, timeout_seconds)
+            else:
+                results, meta = await run_coro
+            meta["seed"] = task.seed
+            meta["cache_mode"] = task.cache_mode
+            meta["task_id"] = task.task_id
+            metrics = _read_json(meta.get("metrics_path", ""))
+            metrics.setdefault("n", len(results))
+            return meta, metrics
+        finally:
+            _restore_env(previous_env, env_overrides)
 
     @staticmethod
     async def _run_external(task: QueueTask) -> Dict[str, Any]:
@@ -416,6 +423,25 @@ def _run_id(benchmark: str, system: str, seed: int, cache_mode: str, stage: str)
 
 def _now() -> str:
     return now_local_iso()
+
+
+def _env_overrides(overrides: Dict[str, Any]) -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    for key, value in overrides.items():
+        if not isinstance(key, str) or not key.isupper():
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            env[key] = str(value).lower() if isinstance(value, bool) else str(value)
+    return env
+
+
+def _restore_env(previous: Dict[str, Optional[str]], applied: Dict[str, str]) -> None:
+    for key in applied:
+        old_value = previous.get(key)
+        if old_value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old_value
 
 
 def _safe_float(value: Any) -> float:
