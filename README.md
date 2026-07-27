@@ -480,6 +480,11 @@ The web UI is built for fast, transparent workflows: chat, knowledge analytics, 
   <p><sub>Monitor — System health, chat activity, knowledge analytics, and LLM usage.</sub></p>
 </div>
 
+<div align="center">
+  <img src="assets/pic/Sirchmunk_Knowledge_Graph.png" alt="Sirchmunk Knowledge Graph" width="85%">
+  <p><sub>Knowledge Graph — Interactive visualization of knowledge clusters with lifecycle stages.</sub></p>
+</div>
+
 ### Option 1: Single-Port Mode (Recommended)
 
 Build the frontend once, then serve everything from a single port — no Node.js needed at runtime.
