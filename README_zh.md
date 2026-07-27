@@ -479,6 +479,11 @@ Web UI 专为快速、透明的工作流设计：对话、知识分析、系统�
   <p><sub>Monitor — 系统健康、聊天活动、知识分析与 LLM 用量。</sub></p>
 </div>
 
+<div align="center">
+  <img src="assets/pic/Sirchmunk_Knowledge_Graph.png" alt="Sirchmunk Knowledge Graph" width="85%">
+  <p><sub>Knowledge Graph — 知识簇交互式可视化与生命周期阶段。</sub></p>
+</div>
+
 ### 方式一：单端口模式（推荐）
 
 一次构建前端，随后通过单端口同时提供 API 和 WebUI — 运行时无需 Node.js。
