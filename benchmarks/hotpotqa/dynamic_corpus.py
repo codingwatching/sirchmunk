@@ -1,4 +1,4 @@
-"""Dynamic G_n/D_n corpus snapshot utilities for HotpotQA v4 experiments."""
+"""Dynamic G_n/D_n corpus snapshot utilities for HotpotQA experiments."""
 from __future__ import annotations
 
 import hashlib

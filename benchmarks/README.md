@@ -2,7 +2,7 @@
 
 # Benchmarks ResearchOps Guide
 
-This README is the end-to-end operating guide for the `benchmarks/` module. Read it as a user journey: start with a mock/smoke experiment, freeze the evaluation sample IDs, build baseline lifecycle evidence, run the frozen main experiment, and regenerate the final report.
+This README is the end-to-end operating guide for the `benchmarks/` module. Read it as a user journey: start with a mock/smoke experiment, freeze the evaluation sample IDs, build baseline lifecycle evidence, construct dynamic `G_n/D_n` artifacts, run the frozen main experiment, and regenerate the final report.
 
 The normal command surface is:
 
@@ -19,9 +19,10 @@ Direct scripts still exist for debugging and special workflows. They are listed 
 mock/smoke exploration
 → frozen sample IDs
 → baseline assets
+→ dynamic G_n/D_n artifacts
 → frozen main experiment
 → report/status
-→ optional ablation or dynamic lifecycle appendix
+→ optional ablation appendix
 ```
 
 | Stage | Command | Purpose | Paper claim? |
@@ -29,9 +30,10 @@ mock/smoke exploration
 | Mock/smoke | `run_benchmark.py smoke-tune` | Small exploration run, env check, report smoke, optional baseline comparison | No |
 | Freeze samples | `run_sampling.py create` | Create fixed stratified sample IDs and checksum | Sampling evidence only |
 | Assets | `run_benchmark.py assets` | Build/validate baseline preprocessing, indexing, storage, and lifecycle evidence | Setup/lifecycle evidence |
+| Dynamic G/D | `run_benchmark.py dynamic` | Build nested `G_n/D_n` sample/corpus bindings and optional dynamic baselines | Yes, if stage checks pass |
 | Frozen main | `run_benchmark.py main` | Run or assemble Sirchmunk results, run main baselines, generate tables/reports | Yes, if gates pass |
 | Report/status | `run_benchmark.py report/status` | Regenerate reports and inspect gate state | Yes, if tied to frozen artifacts |
-| Optional appendix | `run_benchmark.py ablation`, `run_dynamic_evaluation.py` | Mechanism ablation and dynamic `G_n/D_n` lifecycle studies | Appendix/ablation |
+| Optional appendix | `run_benchmark.py ablation` | Mechanism ablation | Appendix/ablation |
 
 The core discipline is simple: exploration can be small and iterative, but paper-facing results must use frozen sample IDs, deterministic frozen settings, and the same sample IDs across systems.
 
@@ -427,10 +429,10 @@ Install LightRAG v1.3.6 only for SDK-backed related-work lifecycle rows:
 pip install git+https://github.com/HKUDS/LightRAG.git@v1.3.6
 ```
 
-Run the default LightRAG lifecycle mode:
+Run the default LightRAG lifecycle mode through the dynamic task:
 
 ```bash
-python benchmarks/run_dynamic_evaluation.py \
+python benchmarks/run_benchmark.py dynamic \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --golden-n 2000 \
@@ -450,7 +452,7 @@ python benchmarks/run_dynamic_evaluation.py \
 Run all LightRAG query modes for appendix sensitivity:
 
 ```bash
-python benchmarks/run_dynamic_evaluation.py \
+python benchmarks/run_benchmark.py dynamic \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --golden-n 2000 \
@@ -468,6 +470,16 @@ python benchmarks/run_dynamic_evaluation.py \
 
 Report scaling and update cost separately from warm-query accuracy. A full-corpus index that is not `READY` should not appear as a warm-query baseline without a feasibility caveat.
 
+Dynamic task outputs include:
+
+```text
+benchmarks/hotpotqa/output/dynamic_eval/tables/dynamic_main_results.*
+benchmarks/hotpotqa/output/dynamic_eval/tables/lifecycle_main.*
+benchmarks/hotpotqa/output/dynamic_eval/tables/budget_quality.*
+benchmarks/hotpotqa/output/dynamic_eval/tables/update_readiness.*
+benchmarks/hotpotqa/output/dynamic_eval/tables/snapshot_audit.*
+```
+
 </details>
 
 <details>
@@ -481,7 +493,7 @@ Prefer `run_benchmark.py` for normal workflows. Use direct scripts when debuggin
 | `run_sampling.py` | Freeze samples | Create/validate explicit sampling artifacts |
 | `run_baseline_assets.py` | `assets` | Debug asset registry and lifecycle records |
 | `run_evaluation.py` | `main` | Manual table assembly or non-default evaluation flags |
-| `run_dynamic_evaluation.py` | Dynamic appendix | Build `G_n/D_n` snapshots and dynamic baselines |
+| `run_dynamic_evaluation.py` | `dynamic` | Debug `G_n/D_n` snapshots and dynamic baselines |
 | `run_report.py` | `report` | Manual report regeneration |
 | `run_queue.py` | `queue` | Low-level queue debugging |
 | `run_research_loop.py` | Exploration | Badcase tuning and dry-run analysis |

@@ -119,7 +119,7 @@ from .schema import (
 )
 from .shadow import BmShadowResult, ShadowEvaluator, ShadowImpactMatrix
 from .tracker import ExperimentTracker
-from .v4_stage_runner import StageExecutionRecord, V4StageBinding, build_stage_bindings, validate_result_reuse
+from .dynamic_stage_runner import DynamicStageBinding, StageExecutionRecord, build_stage_bindings, validate_result_reuse
 
 __all__ = [
     "BenchmarkAdapter",
@@ -220,9 +220,9 @@ __all__ = [
     "BmShadowResult",
     "ShadowEvaluator",
     "ShadowImpactMatrix",
-    # v4 dynamic evaluation
+    # dynamic evaluation
     "StageExecutionRecord",
-    "V4StageBinding",
+    "DynamicStageBinding",
     "build_stage_bindings",
     "validate_result_reuse",
     # schema

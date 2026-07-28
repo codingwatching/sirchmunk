@@ -78,7 +78,7 @@ Key local artifacts:
 | Core algorithm note | `temp/papers/lens_core_algo/lens_core_algorithm_zh_v1.md` | Mathematical framing of latent evidence space, budgeted sequential inference, and LENS mechanisms |
 | AAAI writing plan | `temp/papers/overleaf_version/lens_paper_writing_plan_v0.md` | Section-level writing plan, story line, terminology, and AAAI 2027 constraints |
 | Overleaf draft | `temp/papers/overleaf_version/lens_submission/` | AAAI-style LaTeX draft and bibliography |
-| Dynamic experiment design | `temp/papers/sirchmunk_experiment_design_v4_20260727.md` | HotpotQA fullwiki dynamic raw-corpus protocol and paper-facing experiment plan |
+| Dynamic experiment design | `temp/papers/` | HotpotQA fullwiki dynamic raw-corpus protocol and paper-facing experiment plan |
 
 For reproducible experiments, see [`benchmarks/README.md`](benchmarks/README.md). It documents the frozen sampled evaluation workflow, dynamic `G_n/D_n` corpus snapshots, lifecycle-cost accounting, and LENS ablation variants used to support paper claims.
 

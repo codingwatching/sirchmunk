@@ -343,6 +343,18 @@ class BaselineEvaluationSuite:
                     "error_type": error_type,
                     "failure_phase": failure_phase,
                 })
+                evidence_traces = _normalize_evidence_traces(telemetry, base_metadata, context_paths)
+                query_budget = _normalize_query_budget(
+                    telemetry,
+                    elapsed=pred_elapsed,
+                    tokens=pred_tokens,
+                    judge_tokens=judge_tokens,
+                    guard_config=self._guard_config,
+                )
+                telemetry["evidence_traces"] = evidence_traces
+                telemetry["query_budget"] = query_budget
+                base_metadata["evidence_traces"] = evidence_traces
+                base_metadata["query_budget"] = query_budget
                 base_metadata.update(judge_payload)
                 if failure_reason:
                     base_metadata["failure_reason"] = failure_reason
@@ -540,6 +552,123 @@ def _merge_prediction_telemetry(telemetry: Dict[str, Any], metadata: Dict[str, A
             telemetry.setdefault("read_file_ids", paths)
             telemetry.setdefault("evidence_sources", paths)
 
+
+def _normalize_evidence_traces(
+    telemetry: Dict[str, Any],
+    metadata: Dict[str, Any],
+    context_paths: List[str],
+) -> List[Dict[str, Any]]:
+    """Return a compact, JSON-safe evidence trace list shared by all baselines."""
+    traces: List[Dict[str, Any]] = []
+    seen = set()
+
+    def _append(trace: Dict[str, Any]) -> None:
+        source_path = str(trace.get("source_path") or trace.get("path") or trace.get("file") or "")
+        title = str(trace.get("title") or trace.get("source_title") or "")
+        snippet = str(trace.get("snippet") or trace.get("text") or trace.get("evidence") or "")
+        key = (source_path, title, snippet[:120])
+        if not any(key) or key in seen:
+            return
+        seen.add(key)
+        traces.append({
+            "source_path": source_path,
+            "title": title,
+            "span_start": _safe_int(trace.get("span_start", trace.get("start", -1)), -1),
+            "span_end": _safe_int(trace.get("span_end", trace.get("end", -1)), -1),
+            "snippet": snippet[:2000],
+            "score": _safe_float(trace.get("score", trace.get("fused_score", 0.0))),
+            "metadata": trace.get("metadata", {}) if isinstance(trace.get("metadata"), dict) else {},
+        })
+
+    for source in (telemetry, metadata):
+        raw = source.get("evidence_traces") if isinstance(source, dict) else None
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    _append(item)
+                elif item:
+                    _append({"source_path": str(item)})
+
+    for source in (telemetry, metadata):
+        if not isinstance(source, dict):
+            continue
+        snippets = source.get("evidence_snippets") if isinstance(source.get("evidence_snippets"), list) else []
+        for key in ("evidence_sources", "read_file_ids"):
+            values = source.get(key)
+            if not isinstance(values, list):
+                continue
+            for index, value in enumerate(values):
+                if isinstance(value, dict):
+                    _append(value)
+                elif value:
+                    snippet = snippets[index] if index < len(snippets) else ""
+                    _append({"source_path": str(value), "snippet": str(snippet)})
+        for key in ("top_chunks", "top_docs"):
+            values = source.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    if isinstance(value, dict):
+                        _append(value)
+
+    if not traces:
+        for path in context_paths or []:
+            _append({"source_path": str(path), "metadata": {"role": "context_path"}})
+    return traces
+
+
+def _normalize_query_budget(
+    telemetry: Dict[str, Any],
+    *,
+    elapsed: float,
+    tokens: int,
+    judge_tokens: int,
+    guard_config: GuardConfig,
+) -> Dict[str, Any]:
+    """Normalize query-time budget telemetry across baseline implementations."""
+    existing = telemetry.get("query_budget") if isinstance(telemetry.get("query_budget"), dict) else {}
+    read_items = telemetry.get("read_file_ids") if isinstance(telemetry.get("read_file_ids"), list) else []
+    search_history = telemetry.get("search_history") if isinstance(telemetry.get("search_history"), list) else []
+    retrieval_logs = telemetry.get("retrieval_logs") if isinstance(telemetry.get("retrieval_logs"), list) else []
+    llm_calls = _first_number(existing, telemetry, "llm_calls", "oracle_calls", "loop_count")
+    return {
+        "latency_seconds": _safe_float(existing.get("latency_seconds", elapsed)),
+        "total_tokens": _safe_int(existing.get("total_tokens", tokens + judge_tokens)),
+        "search_tokens": _safe_int(existing.get("search_tokens", tokens)),
+        "judge_tokens": _safe_int(existing.get("judge_tokens", judge_tokens)),
+        "oracle_calls": _safe_int(existing.get("oracle_calls", llm_calls)),
+        "llm_calls": _safe_int(existing.get("llm_calls", llm_calls)),
+        "search_calls": _safe_int(existing.get("search_calls", len(search_history) or len(retrieval_logs))),
+        "read_calls": _safe_int(existing.get("read_calls", len(read_items))),
+        "sample_timeout_seconds": _safe_float(existing.get("sample_timeout_seconds", guard_config.sample_timeout_seconds)),
+        "max_runtime_seconds": _safe_float(existing.get("max_runtime_seconds", guard_config.max_runtime_seconds)),
+        "max_total_tokens": _safe_int(existing.get("max_total_tokens", guard_config.max_total_tokens)),
+        "budget_exceeded": str(telemetry.get("failure_reason") or "") == "budget_exceeded",
+    }
+
+
+def _first_number(*sources: Dict[str, Any], default: float = 0.0) -> float:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("oracle_calls", "llm_calls", "total_llm_calls", "loop_count"):
+            value = source.get(key)
+            if value not in (None, ""):
+                return _safe_float(value, default)
+    return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 def _coerce_guard_config(value: Optional[GuardConfig | Dict[str, Any]]) -> GuardConfig:
     if value is None:
         return GuardConfig()

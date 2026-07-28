@@ -7,6 +7,7 @@ monolithic experiment engine:
 - assets      -> run_baseline_assets.py prepare/validate/status
 - smoke-tune  -> run_quickstart.py
 - main        -> run_paper_experiment.py main
+- dynamic     -> run_dynamic_evaluation.py
 - ablation    -> run_paper_experiment.py ablation
 - queue       -> run_queue.py
 - report      -> run_paper_experiment.py report
@@ -23,7 +24,7 @@ from typing import List
 
 _SCRIPT_DIR = Path(__file__).parent.resolve()
 
-_TASKS = {"assets", "smoke-tune", "main", "ablation", "report", "status", "queue"}
+_TASKS = {"assets", "smoke-tune", "main", "dynamic", "ablation", "report", "status", "queue"}
 _ASSET_SUBCOMMANDS = {"prepare", "validate", "status", "scaling", "update-readiness"}
 
 
@@ -36,6 +37,7 @@ Tasks:
   assets      Build/validate baseline assets and asset_registry.jsonl
   smoke-tune  Run quickstart smoke/tuning flow
   main        Run/assemble formal main experiment artifacts
+  dynamic     Build and run dynamic G_n/D_n raw-corpus artifacts
   ablation    Queue/run frozen ablation variants
   queue       Access the lower-level experiment queue
   report      Generate report/table artifacts from existing outputs
@@ -44,6 +46,7 @@ Tasks:
 Examples:
   python benchmarks/run_benchmark.py assets --benchmark hotpotqa --env benchmarks/hotpotqa/.env.hotpotqa.frozen --methods bm25_rag
   python benchmarks/run_benchmark.py smoke-tune --benchmark hotpotqa --env benchmarks/hotpotqa/.env.hotpotqa.exploration --limit 20
+  python benchmarks/run_benchmark.py dynamic --benchmark hotpotqa --env benchmarks/hotpotqa/.env.hotpotqa.frozen --golden-n 2000
   python benchmarks/run_benchmark.py main --benchmark hotpotqa --env benchmarks/hotpotqa/.env.hotpotqa.frozen --sirchmunk-results output/results.jsonl --generate-report
 """
 
@@ -134,6 +137,8 @@ def _command_for(task: str, rest: List[str]) -> List[str]:
         return [sys.executable, str(_SCRIPT_DIR / "run_quickstart.py"), *rest]
     if task == "main":
         return [sys.executable, str(_SCRIPT_DIR / "run_paper_experiment.py"), "main", *rest]
+    if task == "dynamic":
+        return [sys.executable, str(_SCRIPT_DIR / "run_dynamic_evaluation.py"), *rest]
     if task == "ablation":
         if rest and rest[0] in {"ablation", "ablation-spec"}:
             return [sys.executable, str(_SCRIPT_DIR / "run_paper_experiment.py"), *rest]

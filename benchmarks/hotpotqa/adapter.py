@@ -376,16 +376,16 @@ class HotpotQAAdapter(BenchmarkAdapter):
         return manifest
 
     def get_title_resolver(self):
-        """Return a HotpotQA raw wiki title resolver for v4 dynamic snapshots."""
+        """Return a HotpotQA raw wiki title resolver for dynamic snapshots."""
         from hotpotqa.title_resolver import HotpotQATitleResolver
         return HotpotQATitleResolver(self._wiki_dir())
 
-    def derive_v4_sample_sets(self, golden_set: Any, *, stages: List[int], output_dir: str | Path):
+    def derive_dynamic_sample_sets(self, golden_set: Any, *, stages: List[int], output_dir: str | Path):
         """Derive nested G_n sample-id artifacts from a parent GoldenSet."""
         from hotpotqa.dynamic_corpus import derive_nested_sample_sets
         return derive_nested_sample_sets(golden_set, stages=stages, output_dir=output_dir)
 
-    def build_v4_corpus_snapshot(
+    def build_dynamic_corpus_snapshot_for_stage(
         self,
         samples: List[BenchmarkSample],
         *,

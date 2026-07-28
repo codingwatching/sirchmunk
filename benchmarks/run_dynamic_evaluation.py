@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Create v4 dynamic G_n/D_n artifacts for HotpotQA evaluation.
+"""Create dynamic G_n/D_n artifacts for HotpotQA evaluation.
 
-This CLI prepares the publication protocol artifacts described in
-sirchmunk_experiment_design_v4_20260727.md. It intentionally focuses on
-creating auditable sample/corpus stage bindings; system execution can then use
-those bindings through run_evaluation.py or queue-based frozen runs.
+This CLI prepares publication protocol artifacts around auditable sample/corpus
+stage bindings. System execution can then use those bindings through
+run_evaluation.py or queue-based frozen runs.
 """
 from __future__ import annotations
 
@@ -14,6 +13,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -30,7 +30,7 @@ from evaluation.sampling_protocol import (  # noqa: E402
     create_sampling_protocol,
 )
 from framework.registry import load_benchmark_adapter, supported_benchmarks  # noqa: E402
-from framework.v4_stage_runner import (  # noqa: E402
+from framework.dynamic_stage_runner import (  # noqa: E402
     StageExecutionRecord,
     build_stage_bindings,
     save_stage_bindings,
@@ -41,10 +41,10 @@ from hotpotqa.title_resolver import HotpotQATitleResolver  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build v4 dynamic G_n/D_n artifacts")
+    parser = argparse.ArgumentParser(description="Build dynamic G_n/D_n artifacts")
     parser.add_argument("--benchmark", default="hotpotqa", choices=supported_benchmarks())
     parser.add_argument("--env", required=True, help="Benchmark env file")
-    parser.add_argument("--output-dir", default="", help="Default: benchmarks/{benchmark}/output/dynamic_eval_v4")
+    parser.add_argument("--output-dir", default="", help="Default: benchmarks/{benchmark}/output/dynamic_eval")
     parser.add_argument("--golden-n", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--stages", default="500,1000,2000", help="Comma separated nested stage sizes")
@@ -55,7 +55,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-missing-evidence", action="store_true", help="Allow snapshots with unresolved evidence titles; not for main-table runs")
     parser.add_argument("--force-recreate-golden", action="store_true")
     parser.add_argument("--run-baselines", action="store_true", help="Run built-in baselines for each G/D stage")
-    parser.add_argument("--baselines", default="bm25_rag,react", help="Comma separated: bm25_rag,react,lens_full,lens_no_prior,lens_no_seq,lightrag_v136")
+    parser.add_argument("--baselines", default="bm25_rag,react", help="Comma separated: bm25_rag,react,lens_full,lens_no_prior,lens_no_seq,lightrag_v136,lightrag_v136_<mode>")
     parser.add_argument("--lightrag-query-mode", default="hybrid", choices=["naive", "local", "global", "hybrid", "mix"], help="Default LightRAG v1.3.6 query mode")
     parser.add_argument("--lightrag-max-files", type=int, default=0, help="LightRAG v1.3.6 max indexed files, 0=unlimited")
     parser.add_argument("--lightrag-max-file-chars", type=int, default=300000, help="LightRAG v1.3.6 max chars per indexed file")
@@ -66,11 +66,11 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     if args.benchmark != "hotpotqa":
-        raise ValueError("v4 dynamic G_n/D_n artifacts are currently defined for HotpotQA only")
+        raise ValueError("Dynamic G_n/D_n artifacts are currently defined for HotpotQA only")
 
     env_file = str(Path(args.env).expanduser().resolve())
     adapter = load_benchmark_adapter(args.benchmark, env_file)
-    output_dir = Path(args.output_dir or (_SCRIPT_DIR / args.benchmark / "output" / "dynamic_eval_v4")).resolve()
+    output_dir = Path(args.output_dir or (_SCRIPT_DIR / args.benchmark / "output" / "dynamic_eval")).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     stages = [int(part.strip()) for part in args.stages.split(",") if part.strip()]
@@ -185,17 +185,28 @@ def _load_sample_ids(path: str | Path) -> list[str]:
 
 async def _run_baselines_for_bindings(args, base_adapter, golden_set, bindings, output_dir: Path) -> dict:
     from evaluation.suite import BaselineEvaluationSuite
-    from evaluation.v4_table_generator import V4PaperTableGenerator
+    from evaluation.dynamic_table_generator import DynamicPaperTableGenerator
 
     baseline_specs = [spec.strip() for spec in args.baselines.split(",") if spec.strip()]
     runs = {}
     dynamic_rows = []
     update_rows = []
+    previous_binding = None
+    previous_baselines = {}
+    previous_stage_adapter = None
     for binding in bindings:
         stage_adapter = _StageAdapter(base_adapter, binding)
         stage_samples = _select_sample_dicts(golden_set.samples, _load_sample_ids(binding.sample_ids_file))
         stage_golden = _StageGoldenSet(stage_samples, binding)
         baselines = [_baseline_by_name(spec, stage_adapter, args) for spec in baseline_specs]
+        if previous_binding is not None and previous_baselines:
+            for baseline in previous_baselines.values():
+                update_rows.append(await _measure_transition_cost(
+                    from_binding=previous_binding,
+                    to_binding=binding,
+                    baseline=baseline,
+                    to_stage_adapter=stage_adapter,
+                ))
         baseline_dir = Path(binding.output_dir) / "baselines"
         records_dir = Path(binding.output_dir) / "stage_records"
         records_dir.mkdir(parents=True, exist_ok=True)
@@ -216,7 +227,9 @@ async def _run_baselines_for_bindings(args, base_adapter, golden_set, bindings, 
             record_path.write_text(json.dumps(record_payload, indent=2, ensure_ascii=False), encoding="utf-8")
             stage_records[baseline.name] = str(record_path)
             dynamic_rows.append(_dynamic_result_row(binding, baseline, results))
-            update_rows.append(_update_readiness_row(binding, baseline))
+        previous_binding = binding
+        previous_stage_adapter = stage_adapter
+        previous_baselines = {baseline.name: baseline for baseline in baselines}
         runs[binding.stage_name] = {
             "output_dir": binding.output_dir,
             "corpus_checksum": binding.corpus_checksum,
@@ -225,9 +238,11 @@ async def _run_baselines_for_bindings(args, base_adapter, golden_set, bindings, 
             "systems": {name: len(results) for name, results in result_map.items()},
         }
     tables_dir = output_dir / "tables"
-    generator = V4PaperTableGenerator()
+    generator = DynamicPaperTableGenerator()
     runs["tables"] = {}
     runs["tables"].update({f"dynamic_{k}": v for k, v in generator.generate_dynamic_main_table(dynamic_rows, tables_dir).items()})
+    runs["tables"].update({f"lifecycle_{k}": v for k, v in generator.generate_lifecycle_main_table(dynamic_rows, tables_dir).items()})
+    runs["tables"].update({f"budget_{k}": v for k, v in generator.generate_budget_quality_table(dynamic_rows, tables_dir).items()})
     runs["tables"].update({f"update_{k}": v for k, v in generator.generate_update_readiness_table(update_rows, tables_dir).items()})
     return runs
 
@@ -279,7 +294,7 @@ class _StageAdapter:
     def get_run_config(self) -> dict:
         config = dict(self._base.get_run_config())
         config.update({
-            "v4_stage_name": self._binding.stage_name,
+            "dynamic_stage_name": self._binding.stage_name,
             "sample_id_checksum": self._binding.sample_id_checksum,
             "frozen_order_checksum": self._binding.frozen_order_checksum,
             "corpus_checksum": self._binding.corpus_checksum,
@@ -291,7 +306,7 @@ class _StageAdapter:
     def get_dataset_manifest(self) -> dict:
         manifest = dict(self._base.get_dataset_manifest())
         manifest.update({
-            "v4_stage_name": self._binding.stage_name,
+            "dynamic_stage_name": self._binding.stage_name,
             "wiki_dir": self._binding.search_corpus_dir,
             "corpus_snapshot_dir": self._binding.corpus_snapshot_dir,
             "search_corpus_dir": self._binding.search_corpus_dir,
@@ -348,7 +363,7 @@ def _baseline_by_name(spec: str, bm_adapter, args=None):
             max_files=getattr(args, "lightrag_max_files", 0) if args is not None else 0,
             max_file_chars=getattr(args, "lightrag_max_file_chars", 300000) if args is not None else 300000,
         )
-    raise ValueError(f"Unsupported v4 baseline: {spec}")
+    raise ValueError(f"Unsupported dynamic baseline: {spec}")
 
 
 def _select_sample_dicts(samples: list[dict], sample_ids: list[str]) -> list[dict]:
@@ -360,8 +375,8 @@ def _select_sample_dicts(samples: list[dict], sample_ids: list[str]) -> list[dic
 
 
 def _generate_snapshot_table(corpus_manifests: list[dict], output_dir: Path) -> dict:
-    from evaluation.v4_table_generator import V4PaperTableGenerator
-    return {f"snapshot_{k}": v for k, v in V4PaperTableGenerator().generate_snapshot_audit_table(corpus_manifests, output_dir / "tables").items()}
+    from evaluation.dynamic_table_generator import DynamicPaperTableGenerator
+    return {f"snapshot_{k}": v for k, v in DynamicPaperTableGenerator().generate_snapshot_audit_table(corpus_manifests, output_dir / "tables").items()}
 
 
 def _prepare_reuse_gate(args, binding, stage_adapter, baselines, baseline_dir: Path, records_dir: Path) -> None:
@@ -437,33 +452,161 @@ def _dynamic_result_row(binding, baseline, results: list) -> dict:
     n = len(results)
     metric_payloads = [getattr(result, "telemetry", {}) or {} for result in results]
     setup = baseline.collect_setup_metrics()
+    query_budgets = [_query_budget_of_result(result) for result in results]
+    query_budget_summary = _summarize_query_budgets(query_budgets)
+    evidence_trace_count = sum(1 for result in results if _evidence_traces_of_result(result))
     return {
         "system_name": baseline.citation_name,
         "stage_name": binding.stage_name,
         "official_em": _avg_metric(metric_payloads, "official_em") * 100,
         "official_f1": _avg_metric(metric_payloads, "official_f1") * 100,
         "evidence_recall": _avg_metric(metric_payloads, "evidence_recall") * 100,
+        "evidence_trace_coverage": evidence_trace_count / max(n, 1) * 100,
+        "evidence_trace_count": sum(len(_evidence_traces_of_result(result)) for result in results),
         "avg_latency": sum(float(getattr(result, "elapsed", 0.0) or 0.0) for result in results) / max(n, 1),
         "avg_tokens": sum(int(getattr(result, "tokens_used", 0) or 0) + int(getattr(result, "judge_tokens", 0) or 0) for result in results) / max(n, 1),
+        "avg_oracle_calls": query_budget_summary.get("avg_oracle_calls", 0.0),
         "setup_update": setup.get("setup_seconds", 0.0),
         "sample_id_checksum": binding.sample_id_checksum,
         "frozen_order_checksum": binding.frozen_order_checksum,
         "corpus_checksum": binding.corpus_checksum,
         "setup_metrics": setup,
+        "query_budget_summary": query_budget_summary,
     }
 
 
-def _update_readiness_row(binding, baseline) -> dict:
-    setup = baseline.collect_setup_metrics()
+async def _measure_transition_cost(from_binding, to_binding, baseline, to_stage_adapter) -> dict:
+    try:
+        from framework.dynamic_update import CorpusMutation, UpdateOperation
+        mutation = CorpusMutation(
+            mutation_id=f"{from_binding.d_stage}_to_{to_binding.d_stage}",
+            operation=UpdateOperation.MIXED,
+            metadata={
+                "from_stage": from_binding.to_dict(),
+                "to_stage": to_binding.to_dict(),
+                "transition": f"{from_binding.stage_name}->{to_binding.stage_name}",
+            },
+        )
+        started = time.monotonic()
+        result = baseline.update_index(mutation, bm_adapter=to_stage_adapter)
+        if asyncio.iscoroutine(result):
+            result = await result
+        elapsed = time.monotonic() - started
+        metadata = result if isinstance(result, dict) else {}
+        update_supported = bool(metadata.get("update_supported", True))
+        rebuild_required = bool(metadata.get("rebuild_required", not update_supported))
+        return {
+            "system_name": baseline.citation_name,
+            "baseline_name": baseline.name,
+            "transition": f"{from_binding.stage_name}->{to_binding.stage_name}",
+            "from_stage": from_binding.stage_name,
+            "to_stage": to_binding.stage_name,
+            "update_completed": update_supported and not rebuild_required,
+            "update_time_seconds": elapsed,
+            "rebuild_required": rebuild_required,
+            "query_ready_immediately": bool(metadata.get("query_ready_immediately", False)),
+            "failure_reason": str(metadata.get("failure_reason") or ("full_rebuild_required" if rebuild_required else "none")),
+            "from_corpus_checksum": from_binding.corpus_checksum,
+            "to_corpus_checksum": to_binding.corpus_checksum,
+            "corpus_checksum": to_binding.corpus_checksum,
+            "sample_id_checksum": to_binding.sample_id_checksum,
+            "frozen_order_checksum": to_binding.frozen_order_checksum,
+            "metadata": metadata,
+        }
+    except Exception as exc:
+        return {
+            "system_name": getattr(baseline, "citation_name", getattr(baseline, "name", "unknown")),
+            "baseline_name": getattr(baseline, "name", "unknown"),
+            "transition": f"{from_binding.stage_name}->{to_binding.stage_name}",
+            "from_stage": from_binding.stage_name,
+            "to_stage": to_binding.stage_name,
+            "update_completed": False,
+            "update_time_seconds": 0.0,
+            "rebuild_required": True,
+            "query_ready_immediately": False,
+            "failure_reason": "update_error",
+            "failure_message": str(exc),
+            "from_corpus_checksum": from_binding.corpus_checksum,
+            "to_corpus_checksum": to_binding.corpus_checksum,
+            "corpus_checksum": to_binding.corpus_checksum,
+            "sample_id_checksum": to_binding.sample_id_checksum,
+            "frozen_order_checksum": to_binding.frozen_order_checksum,
+        }
+
+
+def _query_budget_of_result(result) -> dict:
+    telemetry = getattr(result, "telemetry", {}) or {}
+    metadata = getattr(result, "metadata", {}) or {}
+    query_budget = telemetry.get("query_budget") if isinstance(telemetry.get("query_budget"), dict) else {}
+    if not query_budget and isinstance(metadata.get("query_budget"), dict):
+        query_budget = metadata.get("query_budget", {})
     return {
-        "system_name": baseline.citation_name,
-        "baseline_name": baseline.name,
-        "transition": binding.stage_name,
-        "update_time_seconds": setup.get("index_build_seconds", 0.0) if setup.get("rebuild_required") else 0.0,
-        "rebuild_required": bool(setup.get("rebuild_required", False)),
-        "query_ready_immediately": bool(setup.get("query_ready_immediately", False)),
-        "corpus_checksum": binding.corpus_checksum,
+        "oracle_calls": _num(query_budget.get("oracle_calls", telemetry.get("oracle_calls", telemetry.get("loop_count", 0.0)))),
+        "llm_calls": _num(query_budget.get("llm_calls", telemetry.get("llm_calls", telemetry.get("total_llm_calls", 0.0)))),
+        "search_calls": _num(query_budget.get("search_calls", telemetry.get("search_calls", len(telemetry.get("search_history", []) or [])))),
+        "read_calls": _num(query_budget.get("read_calls", telemetry.get("read_calls", len(telemetry.get("read_file_ids", []) or [])))),
+        "total_tokens": _num(query_budget.get("total_tokens", getattr(result, "tokens_used", 0))),
+        "latency_seconds": _num(query_budget.get("latency_seconds", getattr(result, "elapsed", 0.0))),
+        "budget_exceeded": bool(query_budget.get("budget_exceeded") or telemetry.get("failure_reason") == "budget_exceeded"),
     }
+
+
+def _summarize_query_budgets(query_budgets: list[dict]) -> dict:
+    oracle_calls = [_num(row.get("oracle_calls")) for row in query_budgets]
+    llm_calls = [_num(row.get("llm_calls")) for row in query_budgets]
+    search_calls = [_num(row.get("search_calls")) for row in query_budgets]
+    read_calls = [_num(row.get("read_calls")) for row in query_budgets]
+    total_tokens = [_num(row.get("total_tokens")) for row in query_budgets]
+    latency_seconds = [_num(row.get("latency_seconds")) for row in query_budgets]
+    return {
+        "avg_oracle_calls": _avg(oracle_calls),
+        "std_oracle_calls": _std(oracle_calls),
+        "max_oracle_calls": max(oracle_calls, default=0.0),
+        "avg_llm_calls": _avg(llm_calls),
+        "avg_search_calls": _avg(search_calls),
+        "avg_read_calls": _avg(read_calls),
+        "avg_total_tokens": _avg(total_tokens),
+        "std_total_tokens": _std(total_tokens),
+        "max_total_tokens": max(total_tokens, default=0.0),
+        "avg_latency_seconds": _avg(latency_seconds),
+        "std_latency_seconds": _std(latency_seconds),
+        "max_latency_seconds": max(latency_seconds, default=0.0),
+        "budget_exceeded_count": sum(1 for row in query_budgets if row.get("budget_exceeded")),
+    }
+
+
+def _evidence_traces_of_result(result) -> list:
+    telemetry = getattr(result, "telemetry", {}) or {}
+    metadata = getattr(result, "metadata", {}) or {}
+    for source in (telemetry, metadata):
+        if not isinstance(source, dict):
+            continue
+        traces = source.get("evidence_traces")
+        if isinstance(traces, list) and traces:
+            return traces
+        for key in ("evidence_sources", "read_file_ids", "retrieval_logs"):
+            values = source.get(key)
+            if isinstance(values, list) and values:
+                return values
+    return []
+
+
+def _avg(values: list[float]) -> float:
+    return sum(values) / max(len(values), 1)
+
+
+def _std(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    mean = _avg(values)
+    return (sum((value - mean) ** 2 for value in values) / len(values)) ** 0.5
+
+
+def _num(value, default: float = 0.0) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return default
 
 
 def _avg_metric(payloads: list[dict], key: str) -> float:

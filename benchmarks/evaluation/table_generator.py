@@ -53,6 +53,11 @@ class SystemEntry:
     coverage: float = 0.0
     avg_latency: float = 0.0  # 秒
     avg_tokens: float = 0.0
+    avg_oracle_calls: float = 0.0
+    avg_llm_calls: float = 0.0
+    avg_search_calls: float = 0.0
+    avg_read_calls: float = 0.0
+    evidence_trace_coverage: float = 0.0
     evidence_recall: float = 0.0
     supporting_fact_title_recall: float = 0.0
     source_grounding_accuracy: float = 0.0
@@ -65,6 +70,7 @@ class SystemEntry:
     sample_ids: List[str] = field(default_factory=list)
     sample_id_checksum: str = ""
     setup_metrics: Dict[str, Any] = field(default_factory=dict)
+    query_budget_summary: Dict[str, Any] = field(default_factory=dict)
     failure_counts: Dict[str, int] = field(default_factory=dict)
     failure_rate: float = 0.0
     imported_baseline: bool = False
@@ -168,6 +174,10 @@ class PaperTableGenerator:
             else:
                 tokens.append(int(getattr(r, "tokens_used", 0)) + int(getattr(r, "judge_tokens", 0)))
 
+        query_budgets = [_query_budget_of(r) for r in ordered_results]
+        query_budget_summary = _summarize_query_budgets(query_budgets)
+        evidence_trace_count = sum(1 for r in ordered_results if _evidence_traces_of(r))
+
         accuracy, ci_lower, ci_upper = bootstrap_ci(correct_list)
         metric_payloads = [_metric_payload_of(r) for r in ordered_results]
         official_em_values = [float(p.get("official_em", p.get("em", 0.0)) or 0.0) for p in metric_payloads]
@@ -219,6 +229,8 @@ class PaperTableGenerator:
         sampling_protocol = self._sampling_metadata.get("sampling_protocol", {}) if isinstance(self._sampling_metadata, dict) else {}
         sampling_manifest = self._sampling_metadata.get("sampling_manifest", {}) if isinstance(self._sampling_metadata, dict) else {}
         corpus_metadata = self._sampling_metadata.get("corpus_snapshot", {}) if isinstance(self._sampling_metadata, dict) else {}
+        result_corpus_checksum = _first_metric_value(ordered_results, "corpus_checksum")
+        result_frozen_order_checksum = _first_metric_value(ordered_results, "frozen_order_checksum")
         entry = SystemEntry(
             system_name=system_name,
             n=n,
@@ -231,11 +243,16 @@ class PaperTableGenerator:
             coverage=round(sum(coverage_list) / n * 100, 1),
             avg_latency=round(sum(latencies) / n, 1) if latencies else 0.0,
             avg_tokens=round(sum(tokens) / n, 1) if tokens else 0.0,
+            avg_oracle_calls=round(query_budget_summary.get("avg_oracle_calls", 0.0), 3),
+            avg_llm_calls=round(query_budget_summary.get("avg_llm_calls", 0.0), 3),
+            avg_search_calls=round(query_budget_summary.get("avg_search_calls", 0.0), 3),
+            avg_read_calls=round(query_budget_summary.get("avg_read_calls", 0.0), 3),
+            evidence_trace_coverage=round(evidence_trace_count / n * 100, 1) if n else 0.0,
             evidence_recall=round(sum(evidence_recall_values) / n * 100, 1) if n else 0.0,
             supporting_fact_title_recall=round(sum(title_recall_values) / n * 100, 1) if n else 0.0,
             source_grounding_accuracy=round(sum(grounded_values) / n * 100, 1) if n else 0.0,
-            corpus_checksum=str(corpus_metadata.get("corpus_checksum", "")),
-            frozen_order_checksum=str(corpus_metadata.get("frozen_order_checksum", "")),
+            corpus_checksum=str(result_corpus_checksum or corpus_metadata.get("corpus_checksum", "")),
+            frozen_order_checksum=str(result_frozen_order_checksum or corpus_metadata.get("frozen_order_checksum", "")),
             by_question_type=by_qt_final,
             is_ours=bool(is_ours or (self._our_name and system_name == self._our_name)),
             is_published_only=False,
@@ -243,6 +260,7 @@ class PaperTableGenerator:
             sample_ids=sample_ids,
             sample_id_checksum=compute_sample_id_checksum(sample_ids),
             setup_metrics=collect_setup_metrics(ordered_results),
+            query_budget_summary=query_budget_summary,
             failure_counts=dict(sorted(failure_counts.items())),
             failure_rate=round(total_failures / n * 100, 1) if n else 0.0,
             imported_baseline=imported_baseline,
@@ -672,6 +690,11 @@ class PaperTableGenerator:
                     "source_grounding_accuracy": e.source_grounding_accuracy,
                     "avg_latency":       e.avg_latency,
                     "avg_tokens":        e.avg_tokens,
+                    "avg_oracle_calls":  e.avg_oracle_calls,
+                    "avg_llm_calls":     e.avg_llm_calls,
+                    "avg_search_calls":  e.avg_search_calls,
+                    "avg_read_calls":    e.avg_read_calls,
+                    "evidence_trace_coverage": e.evidence_trace_coverage,
                     "is_ours":           e.is_ours,
                     "is_published_only": e.is_published_only,
                     "p_value":           e.p_value,
@@ -682,6 +705,7 @@ class PaperTableGenerator:
                     "corpus_checksum":    e.corpus_checksum,
                     "sample_ids":         e.sample_ids,
                     "setup_metrics":      e.setup_metrics,
+                    "query_budget_summary": e.query_budget_summary,
                     "failure_counts":     e.failure_counts,
                     "failure_rate":       e.failure_rate,
                     "imported_baseline":  e.imported_baseline,
@@ -793,6 +817,94 @@ def _metric_payload_of(result: Any) -> Dict[str, Any]:
     if isinstance(telemetry, dict):
         payload.update(telemetry)
     return payload
+
+
+def _first_metric_value(results: List[Any], key: str) -> Any:
+    for result in results:
+        payload = _metric_payload_of(result)
+        value = payload.get(key)
+        if value not in (None, ""):
+            return value
+    return ""
+
+
+def _query_budget_of(result: Any) -> Dict[str, Any]:
+    telemetry = _telemetry_of(result)
+    metadata = _metadata_of(result)
+    query_budget = telemetry.get("query_budget") if isinstance(telemetry.get("query_budget"), dict) else {}
+    if not query_budget and isinstance(metadata.get("query_budget"), dict):
+        query_budget = metadata.get("query_budget", {})
+    return {
+        "oracle_calls": _number(query_budget.get("oracle_calls", telemetry.get("oracle_calls", telemetry.get("loop_count", 0.0)))),
+        "llm_calls": _number(query_budget.get("llm_calls", telemetry.get("llm_calls", telemetry.get("total_llm_calls", 0.0)))),
+        "search_calls": _number(query_budget.get("search_calls", telemetry.get("search_calls", len(telemetry.get("search_history", []) or [])))),
+        "read_calls": _number(query_budget.get("read_calls", telemetry.get("read_calls", len(telemetry.get("read_file_ids", []) or [])))),
+        "total_tokens": _number(query_budget.get("total_tokens", telemetry.get("total_tokens", getattr(result, "tokens_used", 0)))),
+        "judge_tokens": _number(query_budget.get("judge_tokens", telemetry.get("judge_tokens", getattr(result, "judge_tokens", 0)))),
+        "latency_seconds": _number(query_budget.get("latency_seconds", getattr(result, "elapsed", 0.0))),
+        "budget_exceeded": bool(query_budget.get("budget_exceeded") or telemetry.get("failure_reason") == "budget_exceeded"),
+    }
+
+
+def _summarize_query_budgets(query_budgets: List[Dict[str, Any]]) -> Dict[str, Any]:
+    oracle_calls = [_number(row.get("oracle_calls")) for row in query_budgets]
+    llm_calls = [_number(row.get("llm_calls")) for row in query_budgets]
+    search_calls = [_number(row.get("search_calls")) for row in query_budgets]
+    read_calls = [_number(row.get("read_calls")) for row in query_budgets]
+    total_tokens = [_number(row.get("total_tokens")) for row in query_budgets]
+    judge_tokens = [_number(row.get("judge_tokens")) for row in query_budgets]
+    latency_seconds = [_number(row.get("latency_seconds")) for row in query_budgets]
+    return {
+        "avg_oracle_calls": _avg(oracle_calls),
+        "std_oracle_calls": _std(oracle_calls),
+        "max_oracle_calls": max(oracle_calls, default=0.0),
+        "avg_llm_calls": _avg(llm_calls),
+        "avg_search_calls": _avg(search_calls),
+        "avg_read_calls": _avg(read_calls),
+        "avg_total_tokens": _avg(total_tokens),
+        "std_total_tokens": _std(total_tokens),
+        "max_total_tokens": max(total_tokens, default=0.0),
+        "avg_judge_tokens": _avg(judge_tokens),
+        "avg_latency_seconds": _avg(latency_seconds),
+        "std_latency_seconds": _std(latency_seconds),
+        "max_latency_seconds": max(latency_seconds, default=0.0),
+        "budget_exceeded_count": sum(1 for row in query_budgets if row.get("budget_exceeded")),
+    }
+
+
+def _avg(values: List[float]) -> float:
+    return sum(values) / max(len(values), 1)
+
+
+def _std(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    mean = _avg(values)
+    return (sum((value - mean) ** 2 for value in values) / len(values)) ** 0.5
+
+
+def _evidence_traces_of(result: Any) -> List[Any]:
+    telemetry = _telemetry_of(result)
+    metadata = _metadata_of(result)
+    for source in (telemetry, metadata):
+        traces = source.get("evidence_traces") if isinstance(source, dict) else None
+        if isinstance(traces, list) and traces:
+            return traces
+    for source in (telemetry, metadata):
+        if not isinstance(source, dict):
+            continue
+        for key in ("evidence_sources", "read_file_ids", "retrieval_logs"):
+            values = source.get(key)
+            if isinstance(values, list) and values:
+                return values
+    return []
+
+
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return default
 
 
 def _setup_seconds(entry: SystemEntry) -> float:

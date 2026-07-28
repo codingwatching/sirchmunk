@@ -316,7 +316,10 @@ class AcademicReportValidator:
         issues: List[ValidationIssue] = []
         systems = table.get("systems", []) if isinstance(table, dict) else []
         if not systems:
-            return [ValidationIssue("error", "table", "Paper table JSON has no systems.", str(table_path))]
+            rows = table.get("rows", []) if isinstance(table, dict) else []
+            if rows:
+                return self._validate_dynamic_table(table_path, table)
+            return [ValidationIssue("error", "table", "Paper table JSON has no systems or rows.", str(table_path))]
         ours = [s for s in systems if s.get("is_ours")]
         if not ours:
             issues.append(ValidationIssue("error", "table", "No system is marked as ours.", str(table_path)))
@@ -331,6 +334,8 @@ class AcademicReportValidator:
         checksums = {s.get("sample_id_checksum") for s in non_published if s.get("sample_id_checksum")}
         if len(checksums) > 1:
             issues.append(ValidationIssue("error", "paired_sample_ids", "Non-published systems do not share the same sample_id set.", str(table_path)))
+        issues.extend(self._validate_table_corpus_boundaries(table_path, table, non_published))
+        issues.extend(self._validate_table_budget_and_evidence(table_path, non_published))
         for system in systems:
             if system.get("is_ours") or system.get("is_published_only"):
                 continue
@@ -364,6 +369,101 @@ class AcademicReportValidator:
                 missing_samples = int(system.get("missing_samples", 0) or 0)
                 if missing_samples and not system.get("missing_sample_ids"):
                     issues.append(ValidationIssue("warning", "import_missing_samples", f"Imported baseline '{system.get('system_name')}' has missing samples without sample id details.", str(table_path)))
+        return issues
+
+    def _validate_dynamic_table(self, table_path: Path, table: Dict[str, Any]) -> List[ValidationIssue]:
+        issues: List[ValidationIssue] = []
+        headers = table.get("headers", []) if isinstance(table.get("headers"), list) else []
+        rows = table.get("rows", []) if isinstance(table.get("rows"), list) else []
+        if not rows:
+            return [ValidationIssue("error", "dynamic_table", "Dynamic table JSON has no rows.", str(table_path))]
+        if "G/D Stage" in headers:
+            by_stage: Dict[str, List[Dict[str, Any]]] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    issues.append(ValidationIssue("error", "dynamic_table", "Dynamic table row is not an object.", str(table_path)))
+                    continue
+                system = str(row.get("System") or "")
+                stage = str(row.get("G/D Stage") or "")
+                if not system:
+                    issues.append(ValidationIssue("error", "dynamic_system", "Dynamic row lacks System.", str(table_path)))
+                if not stage:
+                    issues.append(ValidationIssue("error", "dynamic_stage", f"Dynamic row for {system or '<unknown>'} lacks G/D Stage.", str(table_path)))
+                    continue
+                missing = [key for key in ("sample_id_checksum", "frozen_order_checksum", "corpus_checksum") if not row.get(key)]
+                if missing:
+                    issues.append(ValidationIssue("error", "dynamic_binding_checksum", f"Dynamic row {system}/{stage} lacks checksums: {missing}.", str(table_path)))
+                by_stage.setdefault(stage, []).append(row)
+            for stage, stage_rows in by_stage.items():
+                for key in ("sample_id_checksum", "frozen_order_checksum", "corpus_checksum"):
+                    values = {str(row.get(key) or "") for row in stage_rows if row.get(key)}
+                    if len(values) > 1:
+                        issues.append(ValidationIssue("error", "dynamic_binding_mismatch", f"Rows in {stage} do not share {key}.", str(table_path)))
+        elif "Transition" in headers:
+            by_transition: Dict[str, List[Dict[str, Any]]] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    issues.append(ValidationIssue("error", "dynamic_table", "Update-readiness row is not an object.", str(table_path)))
+                    continue
+                transition = str(row.get("Transition") or "")
+                if not row.get("corpus_checksum"):
+                    issues.append(ValidationIssue("error", "dynamic_update_corpus", f"Update-readiness row lacks corpus_checksum: {row.get('System')}", str(table_path)))
+                by_transition.setdefault(transition, []).append(row)
+            for transition, transition_rows in by_transition.items():
+                values = {str(row.get("corpus_checksum") or "") for row in transition_rows if row.get("corpus_checksum")}
+                if len(values) > 1:
+                    issues.append(ValidationIssue("error", "dynamic_update_corpus_mismatch", f"Rows in transition {transition or '<unknown>'} do not share corpus_checksum.", str(table_path)))
+        return issues
+
+    def _validate_table_corpus_boundaries(
+        self,
+        table_path: Path,
+        table: Dict[str, Any],
+        non_published: List[Dict[str, Any]],
+    ) -> List[ValidationIssue]:
+        issues: List[ValidationIssue] = []
+        if not non_published:
+            return issues
+        sampling = table.get("sampling") if isinstance(table.get("sampling"), dict) else {}
+        corpus_snapshot = sampling.get("corpus_snapshot") if isinstance(sampling.get("corpus_snapshot"), dict) else {}
+        requires_boundary = bool(corpus_snapshot) or any(
+            row.get("corpus_checksum") or row.get("frozen_order_checksum")
+            for row in non_published
+        )
+        if not requires_boundary:
+            return issues
+        missing_corpus = [row.get("system_name") for row in non_published if not row.get("corpus_checksum")]
+        missing_order = [row.get("system_name") for row in non_published if not row.get("frozen_order_checksum")]
+        if missing_corpus:
+            issues.append(ValidationIssue("error", "corpus_checksum", f"Systems lack corpus_checksum: {missing_corpus}", str(table_path)))
+        if missing_order:
+            issues.append(ValidationIssue("error", "frozen_order_checksum", f"Systems lack frozen_order_checksum: {missing_order}", str(table_path)))
+        corpus_values = {row.get("corpus_checksum") for row in non_published if row.get("corpus_checksum")}
+        order_values = {row.get("frozen_order_checksum") for row in non_published if row.get("frozen_order_checksum")}
+        if len(corpus_values) > 1:
+            issues.append(ValidationIssue("error", "paired_corpus_boundary", "Non-published systems do not share the same corpus_checksum.", str(table_path)))
+        if len(order_values) > 1:
+            issues.append(ValidationIssue("error", "paired_frozen_order", "Non-published systems do not share the same frozen_order_checksum.", str(table_path)))
+        expected_corpus = str(corpus_snapshot.get("corpus_checksum") or "")
+        expected_order = str(corpus_snapshot.get("frozen_order_checksum") or "")
+        if expected_corpus and corpus_values and corpus_values != {expected_corpus}:
+            issues.append(ValidationIssue("error", "corpus_snapshot_checksum", "System corpus_checksum does not match table sampling corpus_snapshot.", str(table_path)))
+        if expected_order and order_values and order_values != {expected_order}:
+            issues.append(ValidationIssue("error", "corpus_snapshot_order", "System frozen_order_checksum does not match table sampling corpus_snapshot.", str(table_path)))
+        return issues
+
+    def _validate_table_budget_and_evidence(
+        self,
+        table_path: Path,
+        non_published: List[Dict[str, Any]],
+    ) -> List[ValidationIssue]:
+        issues: List[ValidationIssue] = []
+        for system in non_published:
+            name = system.get("system_name")
+            if not isinstance(system.get("query_budget_summary"), dict):
+                issues.append(ValidationIssue("warning", "query_budget", f"System '{name}' lacks query_budget_summary.", str(table_path)))
+            if system.get("evidence_recall", 0) and system.get("evidence_trace_coverage") is None:
+                issues.append(ValidationIssue("warning", "evidence_trace", f"System '{name}' lacks evidence_trace_coverage.", str(table_path)))
         return issues
 
     def _validate_table_sampling(

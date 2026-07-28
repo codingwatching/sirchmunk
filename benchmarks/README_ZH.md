@@ -2,7 +2,7 @@
 
 # Benchmarks ResearchOps 指南
 
-本文档是 `benchmarks/` 模块的端到端操作指南。请把它读成一条用户旅程：先从 mock/smoke 实验开始，冻结评估 sample IDs，构建 baseline 生命周期证据，运行 frozen 主实验，最后重新生成正式报告。
+本文档是 `benchmarks/` 模块的端到端操作指南。请把它读成一条用户旅程：先从 mock/smoke 实验开始，冻结评估 sample IDs，构建 baseline 生命周期证据，构建动态 `G_n/D_n` artifacts，运行 frozen 主实验，最后重新生成正式报告。
 
 常规命令入口是：
 
@@ -19,9 +19,10 @@ Direct scripts 仍然保留，用于调试和特殊流程。它们放在文档�
 mock/smoke exploration
 → frozen sample IDs
 → baseline assets
+→ dynamic G_n/D_n artifacts
 → frozen main experiment
 → report/status
-→ optional ablation or dynamic lifecycle appendix
+→ optional ablation appendix
 ```
 
 | 阶段 | 命令 | 目的 | 能否作为论文结论？ |
@@ -29,9 +30,10 @@ mock/smoke exploration
 | Mock/smoke | `run_benchmark.py smoke-tune` | 小样本探索、环境检查、报告 smoke、可选 baseline 对比 | 否 |
 | 冻结样本 | `run_sampling.py create` | 创建固定分层 sample IDs 和 checksum | 仅作为抽样证据 |
 | Assets | `run_benchmark.py assets` | 构建/校验 baseline 预处理、索引、存储和生命周期证据 | setup/lifecycle 证据 |
+| Dynamic G/D | `run_benchmark.py dynamic` | 构建 nested `G_n/D_n` sample/corpus bindings 和可选 dynamic baselines | stage checks 通过后可以 |
 | Frozen main | `run_benchmark.py main` | 运行或组装 Sirchmunk 结果、运行主 baseline、生成表格/报告 | gate 通过后可以 |
 | Report/status | `run_benchmark.py report/status` | 重新生成报告并检查 gate 状态 | 若绑定 frozen artifacts 则可以 |
-| 可选 appendix | `run_benchmark.py ablation`、`run_dynamic_evaluation.py` | 机制消融与动态 `G_n/D_n` 生命周期实验 | appendix/ablation |
+| 可选 appendix | `run_benchmark.py ablation` | 机制消融 | appendix/ablation |
 
 核心纪律很简单：exploration 可以小样本、可迭代；面向论文的结果必须使用冻结 sample IDs、确定性 frozen 设置，并保证所有系统使用同一批 sample IDs。
 
@@ -427,10 +429,10 @@ python benchmarks/run_benchmark.py assets update-readiness \
 pip install git+https://github.com/HKUDS/LightRAG.git@v1.3.6
 ```
 
-运行默认 LightRAG lifecycle mode：
+通过 dynamic task 运行默认 LightRAG lifecycle mode：
 
 ```bash
-python benchmarks/run_dynamic_evaluation.py \
+python benchmarks/run_benchmark.py dynamic \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --golden-n 2000 \
@@ -450,7 +452,7 @@ python benchmarks/run_dynamic_evaluation.py \
 为 appendix sensitivity 跑全量 LightRAG query modes：
 
 ```bash
-python benchmarks/run_dynamic_evaluation.py \
+python benchmarks/run_benchmark.py dynamic \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --golden-n 2000 \
@@ -468,6 +470,16 @@ python benchmarks/run_dynamic_evaluation.py \
 
 Scaling 和 update cost 应与 warm-query accuracy 分开报告。full-corpus index 未达到 `READY` 的系统，不应在没有 feasibility caveat 的情况下进入 warm-query baseline。
 
+Dynamic task 输出包括：
+
+```text
+benchmarks/hotpotqa/output/dynamic_eval/tables/dynamic_main_results.*
+benchmarks/hotpotqa/output/dynamic_eval/tables/lifecycle_main.*
+benchmarks/hotpotqa/output/dynamic_eval/tables/budget_quality.*
+benchmarks/hotpotqa/output/dynamic_eval/tables/update_readiness.*
+benchmarks/hotpotqa/output/dynamic_eval/tables/snapshot_audit.*
+```
+
 </details>
 
 <details>
@@ -481,7 +493,7 @@ Scaling 和 update cost 应与 warm-query accuracy 分开报告。full-corpus in
 | `run_sampling.py` | 冻结样本 | 创建/校验显式 sampling artifacts |
 | `run_baseline_assets.py` | `assets` | 调试 asset registry 与 lifecycle records |
 | `run_evaluation.py` | `main` | 手动组装表格或使用非默认 evaluation flags |
-| `run_dynamic_evaluation.py` | Dynamic appendix | 构建 `G_n/D_n` snapshots 和 dynamic baselines |
+| `run_dynamic_evaluation.py` | `dynamic` | 调试 `G_n/D_n` snapshots 和 dynamic baselines |
 | `run_report.py` | `report` | 手动重新生成报告 |
 | `run_queue.py` | `queue` | 低层队列调试 |
 | `run_research_loop.py` | Exploration | Badcase tuning 和 dry-run 分析 |

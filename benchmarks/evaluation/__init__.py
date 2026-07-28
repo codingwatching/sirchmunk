@@ -23,14 +23,14 @@ from .statistics import (
 )
 from .suite import BaselineEvaluationSuite
 from .table_generator import PaperTableGenerator, SystemEntry
-from .v4_table_generator import V4PaperTableGenerator
+from .dynamic_table_generator import DynamicPaperTableGenerator
 
 __all__ = [
     "GoldenSet",
     "GoldenSetManager",
     "BaselineEvaluationSuite",
     "PaperTableGenerator",
-    "V4PaperTableGenerator",
+    "DynamicPaperTableGenerator",
     "SystemEntry",
     "ReportGenerator",
     "AcademicReportValidator",

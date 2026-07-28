@@ -1,6 +1,6 @@
 """ablations/matrix.py — LENS 核心消融矩阵
 
-v4 论文主消融只保留两项核心机制消融，避免细碎工程消融：
+动态raw-corpus主消融只保留两项核心机制消融，避免细碎工程消融：
   - w/o Multi-signal Prior
   - w/o Sequential Exploration
 
