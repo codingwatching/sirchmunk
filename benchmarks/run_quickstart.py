@@ -51,7 +51,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sampling-protocol", default="", help="Frozen sampling protocol JSON for run_evaluation.py.")
     parser.add_argument("--sample-ids-file", default="", help="Existing sample IDs JSON. If omitted, quickstart writes one from the smoke results.")
     parser.add_argument("--strata", default="type,supporting_fact_bucket")
-    parser.add_argument("--baselines", default="", help="Comma-separated smoke baselines passed to run_evaluation.py. bm25/naive_rag are quickstart-local baselines; use bm25_rag,react for paper-oriented checks. Long-context is intentionally unsupported in the current scope.")
+    parser.add_argument("--baselines", default="", help="Comma-separated smoke baselines passed to run_evaluation.py. bm25/naive_rag are quickstart-local baselines; use bm25_rag,hybrid_rag,react for paper-oriented checks. Long-context is intentionally unsupported in the current scope.")
     parser.add_argument("--import-baseline", action="append", dest="import_baseline", metavar="NAME=PATH")
     parser.add_argument("--import-baseline-setup", action="append", dest="import_baseline_setup", metavar="NAME=PATH")
     parser.add_argument("--import-published", action="append", dest="import_published", metavar="'Name:acc=XX,cov=XX,lat=XX'")
