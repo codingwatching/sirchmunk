@@ -22,6 +22,8 @@ smoke-tune
 
 该流程的目标是将探索、baseline 资产构建、冻结评估、消融、报告和状态检查拆分为互相隔离、可审计的阶段，同时对用户暴露统一命令入口。
 
+当前 LENS 论文初稿使用该流程支撑 AAAI 风格主张：动态原始文档集合上的 in-context search 应被评估为 latent evidence space 上的 Budgeted Evidence Localization。因此，面向论文的 run 需要同时报告答案质量、证据定位、查询预算、更新就绪性和生命周期成本，而不是只看 accuracy。
+
 | Block | Command | 作用 | 可作为论文结论？ |
 |---|---|---|---|
 | `smoke-tune` | `run_benchmark.py smoke-tune` | 小样本 smoke run、集成检查、调参 | 否 |
@@ -36,9 +38,9 @@ smoke-tune
 
 Phase 0 只校准 baseline 语义和缓存复用安全，不新增新的检索家族。`bm25` / `bm25_local` 与 `naive_rag` / `naive_rag_local` 只用于 quickstart/local smoke baseline，可用于回归检查，但不代表论文主表中的 BM25-RAG。
 
-面向论文主实验时，使用 `bm25_rag` 表示 fixed-chunk sparse RAG，使用 `hybrid_rag` 表示 BM25+dense reciprocal-rank fusion RAG，使用 `react` / `react_search` 表示普通 tool-use agent baseline。已有 baseline JSONL 只有在缓存中的 `baseline_name`、`citation_name`、adapter class、schema version 和 config hash 与当前 adapter 完全匹配时才允许复用，避免用新表格名称包装旧预测结果。
+面向论文主实验时，使用 `bm25_rag` 表示 fixed-chunk sparse RAG；当实验范围包含 hybrid retrieval 时，使用 `hybrid_rag` 表示 BM25+dense reciprocal-rank fusion RAG；使用 `react` / `react_search` 表示普通 tool-use agent baseline。已有 baseline JSONL 只有在缓存中的 `baseline_name`、`citation_name`、adapter class、schema version 和 config hash 与当前 adapter 完全匹配时才允许复用，避免用新表格名称包装旧预测结果。
 
-剩余计划保持克制：可选暴露 `dense_rag` 到 appendix/sensitivity；LightRAG v1.3.6 保持在 lifecycle/related-work 表。Long-context baseline 明确排除在当前计划之外。
+剩余计划保持克制：可选将 `dense_rag` 和 long-context baselines 放入 appendix/sensitivity；LightRAG v1.3.6 保持在 lifecycle/related-work 表。最小主论文表仍聚焦 dynamic raw-corpus 行为、update readiness 和 source-grounded evidence localization。
 
 `hybrid_rag` 默认使用 deterministic hashed dense backend，保证 smoke 和 lifecycle 检查不依赖模型下载。若要运行更强的 embedding-backed 设置，可传入 `--hybrid-dense-backend sirchmunk_embedding` 并配置 `EMBEDDING_MODEL_ID`；backend 选择会写入 baseline metadata 和 cache identity。
 
@@ -303,7 +305,15 @@ benchmarks/hotpotqa/output/queue/
   ablation_registry.jsonl
 ```
 
-默认消融矩阵围绕 frozen baseline 一次改变一个机制：search mode、knowledge reuse、position prior、intent modulation 和 loop budget。
+面向论文的主消融矩阵保持最小，并与当前 LENS 初稿一致：
+
+| Variant | 变化内容 | 论文角色 |
+|---|---|---|
+| `lens_full` | 完整 LENS pipeline | 主方法 |
+| `lens_no_prior` | 关闭 multi-signal prior 通道，保留 sequential exploration | 验证先验形成 |
+| `lens_no_seq` | 保留 prior formation，但用 one-shot evidence extraction 替代 iterative exploration | 验证序贯探索 |
+
+`lens_no_reuse` 保留为 appendix-only，用于 follow-up / warm-start amortization study，默认不进入 core ablation table。
 
 ## Step 5: Report And Status
 

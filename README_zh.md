@@ -17,7 +17,7 @@
 
 📖 **[官方文档](https://modelscope.github.io/sirchmunk-web/zh/)** 
 
-[**快速开始**](#-快速开始) · [**核心特性**](#-核心特性) · [**MCP 服务器**](#-mcp-服务器) · [**Web UI**](#️-web-ui) · [**Docker 部署**](#-docker-部署) · [**工作原理**](#️-工作原理) · [**FAQ**](#-faq)
+[**快速开始**](#-快速开始) · [**核心特性**](#-核心特性) · [**论文与实验**](#-论文与实验) · [**MCP 服务器**](#-mcp-服务器) · [**Web UI**](#️-web-ui) · [**Docker 部署**](#-docker-部署) · [**工作原理**](#️-工作原理) · [**FAQ**](#-faq)
 
 
 </div>
@@ -62,6 +62,21 @@
 
 
 > 更多技术细节，参考 [Sirchmunk blog](https://modelscope.github.io/sirchmunk-web/zh/blog/).
+
+## 🔬 论文与实验
+
+当前研究初稿将 Sirchmunk/LENS 的核心搜索路径形式化为 **LENS: In-Context Search via Latent Evidence Exploration over Dynamic Raw Documents**。论文将 in-context search 表述为动态原始文档诱导的 latent evidence space 上的 **Budgeted Evidence Localization**，强调与索引中心检索范式的互补性权衡，而不是替代性或终结性主张。
+
+关键本地材料：
+
+| 材料 | 路径 | 用途 |
+|---|---|---|
+| 核心算法文档 | `temp/papers/lens_core_algo/lens_core_algorithm_zh_v1.md` | latent evidence space、预算约束序贯推断和 LENS 机制的数学化表述 |
+| AAAI 写作计划 | `temp/papers/overleaf_version/lens_paper_writing_plan_v0.md` | 章节级写作计划、故事线、术语和 AAAI 2027 约束 |
+| Overleaf 初稿 | `temp/papers/overleaf_version/lens_submission/` | AAAI 风格 LaTeX 初稿和参考文献 |
+| 动态实验设计 | `temp/papers/sirchmunk_experiment_design_v4_20260727.md` | HotpotQA fullwiki dynamic raw-corpus protocol 和论文主实验计划 |
+
+可复现实验请参考 [`benchmarks/README_ZH.md`](benchmarks/README_ZH.md)。该文档说明 frozen sampled evaluation 工作流、动态 `G_n/D_n` 语料快照、生命周期成本计量，以及支撑论文结论的 LENS 消融变体。
 
 
 ---

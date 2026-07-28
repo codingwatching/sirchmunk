@@ -22,6 +22,8 @@ smoke-tune
 
 The purpose is to keep exploration, baseline asset construction, frozen evaluation, ablation, reporting, and status inspection in separate, auditable stages while exposing one user-facing command surface.
 
+The current LENS paper draft uses this workflow to support the AAAI-style claim that in-context search over dynamic raw-document collections should be evaluated as Budgeted Evidence Localization over a latent evidence space. Paper-facing runs must therefore report answer quality, evidence localization, query budget, update readiness, and lifecycle cost together rather than treating accuracy as the only outcome.
+
 | Block | Command | Role | Paper claim? |
 |---|---|---|---|
 | `smoke-tune` | `run_benchmark.py smoke-tune` | Small smoke run, integration check, tuning | No |
@@ -36,9 +38,9 @@ The purpose is to keep exploration, baseline asset construction, frozen evaluati
 
 Phase 0 only clarifies baseline semantics and cache safety; it does not add new retrieval families. Use `bm25` / `bm25_local` and `naive_rag` / `naive_rag_local` only as quickstart/local smoke baselines. They are useful for regression checks but are not the paper-facing BM25-RAG row.
 
-For paper-oriented main comparisons, use `bm25_rag` for fixed-chunk sparse RAG, `hybrid_rag` for BM25+dense reciprocal-rank fusion RAG, and `react` / `react_search` for the ordinary tool-use agent baseline. Existing baseline JSONL files are reusable only when the cached `baseline_name`, `citation_name`, adapter class, schema version, and config hash match the current adapter, preventing new table labels from wrapping stale predictions.
+For paper-oriented main comparisons, use `bm25_rag` for fixed-chunk sparse RAG, `hybrid_rag` for BM25+dense reciprocal-rank fusion RAG when the experiment scope includes hybrid retrieval, and `react` / `react_search` for the ordinary tool-use agent baseline. Existing baseline JSONL files are reusable only when the cached `baseline_name`, `citation_name`, adapter class, schema version, and config hash match the current adapter, preventing new table labels from wrapping stale predictions.
 
-Remaining planned work is deliberately narrow: optionally expose `dense_rag` for appendix/sensitivity and keep LightRAG v1.3.6 in lifecycle/related-work tables. Long-context baselines are explicitly out of scope for the current plan.
+Remaining planned work is deliberately narrow: optionally expose `dense_rag` and long-context baselines for appendix/sensitivity, and keep LightRAG v1.3.6 in lifecycle/related-work tables. The minimal main paper table remains focused on dynamic raw-corpus behavior, update readiness, and source-grounded evidence localization.
 
 `hybrid_rag` defaults to a deterministic hashed dense backend so smoke and lifecycle checks do not require model downloads. For stronger embedding-backed runs, pass `--hybrid-dense-backend sirchmunk_embedding` and configure `EMBEDDING_MODEL_ID`; the backend choice is recorded in baseline metadata and cache identity.
 
@@ -303,7 +305,15 @@ benchmarks/hotpotqa/output/queue/
   ablation_registry.jsonl
 ```
 
-The default ablation matrix varies one mechanism at a time around the frozen baseline: search mode, knowledge reuse, position prior, intent modulation, and loop budget.
+The paper-facing ablation matrix is intentionally minimal and mirrors the current LENS draft:
+
+| Variant | What changes | Paper role |
+|---|---|---|
+| `lens_full` | Full LENS pipeline | Main method |
+| `lens_no_prior` | Disable multi-signal prior channels while keeping sequential exploration | Tests prior formation |
+| `lens_no_seq` | Keep prior formation but replace iterative exploration with one-shot evidence extraction | Tests sequential exploration |
+
+`lens_no_reuse` remains appendix-only for follow-up / warm-start amortization studies and should not be included in the core ablation table by default.
 
 ## Step 5: Report And Status
 
