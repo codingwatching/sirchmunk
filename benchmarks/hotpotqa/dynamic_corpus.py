@@ -282,7 +282,6 @@ def build_dynamic_corpus_snapshot(
     resolution = title_resolver.resolve_many(target_titles, materialized_dir=resolution_dir)
 
     evidence_resolved = [resolution.get(title) for title in sorted(evidence_titles)]
-    context_resolved = [resolution.get(title) for title in sorted(context_distractors)]
     missing_evidence = [r.title for r in evidence_resolved if r is not None and not r.resolved]
 
     selected_sources: List[tuple[str, Path, str]] = []

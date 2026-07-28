@@ -114,9 +114,37 @@ def describe_hotpotqa_split(
 
 
 def validate_hotpotqa_corpus(wiki_dir: Path) -> Tuple[int, List[str]]:
-    if wiki_dir.exists():
-        return 1, []
-    return 0, [str(wiki_dir)]
+    """Validate the raw wiki dump inventory.
+
+    Returns ``(shard_count, problems)``. The count is the real number of dump
+    shards rather than a placeholder, so the runner's corpus log reflects what is
+    on disk. Title-level closure against a split is a heavier check and lives in
+    ``hotpotqa.corpus_index.evaluate_corpus_sync``.
+    """
+    from hotpotqa.corpus_index import list_wiki_shards
+
+    if not wiki_dir.exists():
+        return 0, [f"wiki_dir_missing:{wiki_dir}"]
+    shards = list_wiki_shards(wiki_dir)
+    if not shards:
+        return 0, [f"wiki_dir_empty:{wiki_dir}"]
+    return len(shards), []
+
+
+def compute_split_checksum(dataset_dir: Path, *, setting: str, split: str) -> str:
+    """Checksum of the parquet files backing one split.
+
+    Cheaper than ``build_dataset_manifest`` when only the split identity is
+    needed: it hashes the parquet files without loading or describing any rows.
+    """
+    parquet_dir = _resolve_parquet_dir(dataset_dir, setting)
+    files = sorted(parquet_dir.glob(f"{split}*.parquet")) if parquet_dir.exists() else []
+    if not files:
+        return ""
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(f"{path.name}:{_hash_file(path)}\n".encode("utf-8"))
+    return digest.hexdigest()[:32]
 
 
 def build_dataset_manifest(dataset_dir: Path, wiki_dir: Path, *, setting: str, split: str) -> Dict[str, Any]:
@@ -133,7 +161,7 @@ def build_dataset_manifest(dataset_dir: Path, wiki_dir: Path, *, setting: str, s
         "parquet_total_bytes": sum(_file_size(p) for p in parquet_files),
         "wiki_exists": wiki_dir.exists(),
         "parquet_checksum": _hash_file(parquet_files[0]) if parquet_files else "",
-        "manifest_version": 3,
+        "manifest_version": 4,
     }
     if parquet_files:
         try:
@@ -141,13 +169,14 @@ def build_dataset_manifest(dataset_dir: Path, wiki_dir: Path, *, setting: str, s
         except Exception as exc:
             manifest["dataset_distribution_error"] = str(exc)
     if wiki_dir.exists():
-        count, size = _summarize_dir(wiki_dir, max_files=5000)
+        from hotpotqa.corpus_index import compute_wiki_fingerprint
+
+        fingerprint = compute_wiki_fingerprint(wiki_dir)
         manifest.update({
-            "wiki_file_count_sampled": count,
-            "wiki_size_bytes_sampled": size,
-            "wiki_scan_truncated": count >= 5000,
-            "wiki_summary_sample_max_files": 5000,
-            "corpus_validation_level": "directory_exists_with_sampled_stats",
+            "wiki_corpus_fingerprint": fingerprint.to_dict(),
+            "wiki_shard_count": fingerprint.shard_count,
+            "wiki_size_bytes": fingerprint.total_bytes,
+            "corpus_validation_level": "shard_inventory_fingerprint",
         })
     return manifest
 
@@ -235,18 +264,3 @@ def _file_size(path: Path) -> int:
         return path.stat().st_size
     except OSError:
         return 0
-
-
-def _summarize_dir(path: Path, max_files: int = 5000) -> tuple[int, int]:
-    count = 0
-    size = 0
-    for child in path.rglob("*"):
-        if child.is_file():
-            count += 1
-            try:
-                size += child.stat().st_size
-            except OSError:
-                pass
-            if count >= max_files:
-                break
-    return count, size

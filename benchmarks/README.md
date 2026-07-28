@@ -177,6 +177,28 @@ Evaluation tables now record `corpus_provenance`, `corpus_risk`, and per-baselin
 
 After smoke passes, freeze the evaluation set. For HotpotQA fullwiki, the recommended main sampled protocol is stratified `n=500` over `type` and `supporting_fact_bucket`, with the default validation population size of 7,405. `n=500` is the recommended maximum: it already reproduces the population strata proportions to within 0.11 percentage points while keeping query cost tractable for every baseline.
 
+Sampling is gated on raw-corpus synchronization. The parquet split defines the questions and their `supporting_facts` titles, but the raw enwiki dump must actually contain those articles, and the parquet files do not record which dump they belong to. `create` therefore resolves every referenced article against the dump before freezing anything, and refuses to write sample IDs when a supporting-fact article is missing. Check it independently at any time:
+
+```bash
+python benchmarks/run_sampling.py check-corpus-sync \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen
+```
+
+On the official `enwiki-20171001-pages-meta-current-withlinks-abstracts` dump the validation split is fully closed:
+
+```text
+shard_count                   = 15517
+evidence_title_closure        = 100.0   (13781/13781, blocking)
+context_title_closure         = 100.0   (58293/58293, informational)
+question_closure              = 100.0   (7405/7405 resolvable)
+passed                        = True
+```
+
+Evidence closure is blocking because a question whose supporting-fact article is absent cannot be answered from a snapshot at all. Context-distractor closure is reported but non-blocking, since a missing distractor only makes a snapshot slightly easier. Use `--allow-corpus-desync` to freeze anyway when you accept that the run is not main-table eligible.
+
+The first check scans the dump once (about 30s) and caches a title index keyed by the dump fingerprint under `benchmarks/hotpotqa/.work/.cache/corpus_index/`; later checks and stage builds reuse it in about a second. `--rebuild-corpus-index` forces a rescan. The dump identity is recorded as `wiki_corpus_fingerprint` in the dataset manifest and as `wiki_corpus_fingerprint` in the sample-ids metadata, so replacing, truncating, or extending the dump changes the recorded fingerprint instead of silently passing.
+
 ```bash
 python benchmarks/run_sampling.py create \
   --benchmark hotpotqa \
@@ -583,6 +605,10 @@ Measured on the HotpotQA fullwiki validation population (7,405 questions, 8 stra
 | `G_500` | 0.11pp drift, 0 empty | 0.11pp drift, 0 empty |
 
 Every stage records `strata_distribution`, `proportion_delta_by_stratum`, `max_abs_proportion_delta`, and `empty_strata` in `nested_sample_manifest.json` and in its own sample-ids file, with `reference_scope` naming what the stage was compared against (`population` when the parent manifest recorded the population distribution). The academic validator warns above 5pp drift, so these values are directly checkable rather than assumed. Pass `balance_strata=False` to `derive_nested_sample_sets` only when an older parent-order artifact must be reproduced exactly.
+
+### Raw-corpus synchronization gate
+
+The dynamic task re-checks corpus synchronization against the frozen parent set before building any snapshot, and records the report as `corpus_sync` in `dynamic_eval_manifest.json`. A missing supporting-fact article aborts the run with an explicit sync error instead of failing later inside a snapshot build; `--allow-corpus-desync` downgrades it to a non-blocking warning and marks the run as not main-table eligible. `--rebuild-corpus-index` forces a dump rescan. Snapshot title resolution reuses the same cached index, so evidence articles are read from the one shard that holds them rather than by streaming the dump.
 
 </details>
 

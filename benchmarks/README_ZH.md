@@ -177,6 +177,28 @@ Evaluation tables 现在会记录 `corpus_provenance`、`corpus_risk` 和每个 
 
 Smoke 通过后，冻结评估集合。对于 HotpotQA fullwiki，推荐主 sampled protocol 是按 `type` 和 `supporting_fact_bucket` 分层的 `n=500`，validation population 默认规模为 7,405。`n=500` 是建议上限：它已能把总体分层比例复现到 0.11 个百分点以内，同时保持所有 baseline 的查询成本可控。
 
+抽样受 raw-corpus 同步性门控约束。parquet split 定义了问题及其 `supporting_facts` 标题，但 raw enwiki dump 必须真的包含这些文章，而 parquet 本身不记录它属于哪份 dump。因此 `create` 在冻结任何样本前，会先把每个被引用的文章对齐到 dump，当某个 supporting-fact 文章缺失时拒绝写出 sample IDs。任何时候都可以独立检查：
+
+```bash
+python benchmarks/run_sampling.py check-corpus-sync \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen
+```
+
+在官方 `enwiki-20171001-pages-meta-current-withlinks-abstracts` dump 上，validation split 完全闭合：
+
+```text
+shard_count                   = 15517
+evidence_title_closure        = 100.0   (13781/13781，阻断性)
+context_title_closure         = 100.0   (58293/58293，仅提示)
+question_closure              = 100.0   (7405/7405 可解析)
+passed                        = True
+```
+
+evidence 闭合是阻断性的，因为 supporting-fact 文章缺失的问题根本无法从快照中作答；context distractor 闭合会报告但不阻断，因为缺少 distractor 只会让快照略变简单。若接受“本次运行不具备主表资格”，可用 `--allow-corpus-desync` 强行冻结。
+
+首次检查会扫描 dump 一次（约 30s），并在 `benchmarks/hotpotqa/.work/.cache/corpus_index/` 下缓存一份以 dump fingerprint 为键的标题索引；后续检查与 stage 构建在约 1s 内复用它。`--rebuild-corpus-index` 强制重扫。dump 身份会以 `wiki_corpus_fingerprint` 记录在 dataset manifest 和 sample-ids metadata 中，因此替换、截断或扩展 dump 都会改变记录的 fingerprint，而不会静默通过。
+
 ```bash
 python benchmarks/run_sampling.py create \
   --benchmark hotpotqa \
@@ -583,6 +605,10 @@ benchmarks/hotpotqa/output/dynamic_eval/runs/<stage>/stage_records/<name>_stalen
 | `G_500` | 漂移 0.11pp，0 空层 | 漂移 0.11pp，0 空层 |
 
 每个 stage 都会在 `nested_sample_manifest.json` 和各自的 sample-ids 文件中记录 `strata_distribution`、`proportion_delta_by_stratum`、`max_abs_proportion_delta` 与 `empty_strata`，并用 `reference_scope` 标明对比基准（父 manifest 记录了总体分布时为 `population`）。学术 validator 在漂移超过 5pp 时告警，因此这些数值是可直接校验的，而不是假设。仅当需要精确复现旧的 parent-order 产物时，才向 `derive_nested_sample_sets` 传入 `balance_strata=False`。
+
+### Raw-corpus 同步性门控
+
+dynamic task 在构建任何快照前，会对已冻结的父集重新检查语料同步性，并将报告以 `corpus_sync` 记录在 `dynamic_eval_manifest.json` 中。supporting-fact 文章缺失会以显式同步错误中止运行，而不是在后续快照构建中才崩溃；`--allow-corpus-desync` 将其降级为非阻断告警，并标记本次运行不具备主表资格。`--rebuild-corpus-index` 强制重扫 dump。快照标题解析复用同一份缓存索引，因此 evidence 文章只从包含它的那一个 shard 读取，而不是流式扫描整个 dump。
 
 </details>
 

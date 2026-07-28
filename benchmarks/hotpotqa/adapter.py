@@ -41,6 +41,7 @@ from hotpotqa.evidence import evaluate_supporting_facts  # noqa: E402
 from hotpotqa.judge import HotpotQAJudge  # noqa: E402
 from hotpotqa.loader import (  # noqa: E402
     build_dataset_manifest,
+    compute_split_checksum,
     describe_hotpotqa_split,
     load_hotpotqa_samples,
     validate_hotpotqa_corpus,
@@ -184,8 +185,55 @@ class HotpotQAAdapter(BenchmarkAdapter):
         )
 
     def validate_corpus(self) -> Tuple[int, List[str]]:
-        """Validate HotpotQA wiki corpus availability."""
+        """Validate raw wiki dump inventory (shard count, not title closure)."""
         return validate_hotpotqa_corpus(Path(self._wiki_dir()))
+
+    def get_corpus_index_cache_dir(self) -> str:
+        """Directory holding cached raw-corpus title indexes."""
+        path = Path(self.get_work_path()) / ".cache" / "corpus_index"
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
+    def get_wiki_fingerprint(self) -> Dict[str, Any]:
+        """Return the raw wiki dump identity used to bind sampling artifacts."""
+        from hotpotqa.corpus_index import compute_wiki_fingerprint
+        return compute_wiki_fingerprint(self._wiki_dir()).to_dict()
+
+    def evaluate_corpus_sync(
+        self,
+        samples: Any = None,
+        *,
+        seed: int = 42,
+        force_rebuild: bool = False,
+    ):
+        """Check that every referenced article of *samples* exists in the dump.
+
+        Defaults to the full declared split so sampling entry points can gate on
+        closure before any sample IDs are frozen. The resulting report is cached
+        by dump fingerprint, so repeat calls cost a lookup instead of a scan.
+        """
+        from hotpotqa.corpus_index import evaluate_corpus_sync as _evaluate
+
+        rows = list(samples) if samples is not None else self.load_sampling_population(seed=seed)
+        setting = self._get("HOTPOT_SETTING", "fullwiki")
+        split = self._get("HOTPOT_SPLIT", "validation")
+        try:
+            dataset_checksum = compute_split_checksum(
+                Path(self._get("HOTPOT_DATASET_DIR", "")),
+                setting=setting,
+                split=split,
+            )
+        except Exception:
+            dataset_checksum = ""
+        return _evaluate(
+            rows,
+            self._wiki_dir(),
+            cache_dir=self.get_corpus_index_cache_dir(),
+            setting=setting,
+            split=split,
+            dataset_checksum=dataset_checksum,
+            force_rebuild=force_rebuild,
+        )
 
     def get_search_paths(self, sample: BenchmarkSample) -> List[str]:
         """Return search paths for this sample.
@@ -376,9 +424,12 @@ class HotpotQAAdapter(BenchmarkAdapter):
         return manifest
 
     def get_title_resolver(self):
-        """Return a HotpotQA raw wiki title resolver for dynamic snapshots."""
+        """Return a HotpotQA raw wiki title resolver backed by a cached index."""
         from hotpotqa.title_resolver import HotpotQATitleResolver
-        return HotpotQATitleResolver(self._wiki_dir())
+        return HotpotQATitleResolver(
+            self._wiki_dir(),
+            index_cache_dir=self.get_corpus_index_cache_dir(),
+        )
 
     def derive_dynamic_sample_sets(self, golden_set: Any, *, stages: List[int], output_dir: str | Path):
         """Derive nested G_n sample-id artifacts from a parent GoldenSet."""

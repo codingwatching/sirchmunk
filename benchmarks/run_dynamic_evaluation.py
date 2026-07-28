@@ -68,6 +68,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-existing", action="store_true", help="Reuse existing per-stage baseline JSONL when present")
     parser.add_argument("--stale-index-arm", action="store_true", help="Also answer newly added questions with the previous stage index to measure staleness cost")
     parser.add_argument("--staleness-max-samples", type=int, default=0, help="Cap delta questions per transition in the stale-index arm, 0=all newly added questions")
+    parser.add_argument("--allow-corpus-desync", action="store_true", help="Build stages even when referenced evidence articles are missing from the raw corpus")
+    parser.add_argument("--rebuild-corpus-index", action="store_true", help="Ignore the cached raw-corpus title index and rescan the dump")
     return parser.parse_args()
 
 
@@ -106,6 +108,11 @@ def main() -> int:
         sampling_protocol=protocol,
     )
 
+    # Gate before deriving stages or building snapshots: an unresolvable evidence
+    # article must surface here as an explicit sync failure, so no stage artifact
+    # is written for a parent set the raw corpus cannot support.
+    corpus_sync = _check_corpus_sync(args, adapter, golden_set)
+
     sampling_dir = output_dir / "sampling"
     nested = derive_nested_sample_sets(
         golden_set,
@@ -115,7 +122,10 @@ def main() -> int:
     )
 
     wiki_dir = _wiki_dir(adapter)
-    resolver = HotpotQATitleResolver(wiki_dir)
+    resolver = HotpotQATitleResolver(
+        wiki_dir,
+        index_cache_dir=_corpus_index_cache_dir(adapter),
+    )
     parent_samples = golden_set.to_benchmark_samples()
     corpus_manifests = []
     for stage in nested.stages:
@@ -162,6 +172,7 @@ def main() -> int:
         "table_paths": table_paths,
         "stale_index_arm": bool(args.stale_index_arm),
         "staleness_max_samples": int(args.staleness_max_samples),
+        "corpus_sync": corpus_sync,
         "baseline_runs": baseline_runs,
     }
     summary_path = output_dir / "dynamic_eval_manifest.json"
@@ -178,6 +189,44 @@ def _population_size(adapter) -> int:
         return int(adapter.describe_split().get("population_size", 0) or 0)
     except Exception:
         return 0
+
+
+def _corpus_index_cache_dir(adapter) -> str:
+    getter = getattr(adapter, "get_corpus_index_cache_dir", None)
+    if callable(getter):
+        try:
+            return str(getter())
+        except Exception:
+            return ""
+    return ""
+
+
+def _check_corpus_sync(args, adapter, golden_set) -> dict:
+    """Verify the frozen parent set is fully resolvable in the raw corpus.
+
+    Returns the report as a dict for the run manifest. Missing evidence articles
+    abort the run unless ``--allow-corpus-desync`` is set, in which case the
+    stages are still built but the manifest records that they are not
+    main-table eligible.
+    """
+    checker = getattr(adapter, "evaluate_corpus_sync", None)
+    if not callable(checker):
+        return {"corpus_sync": "unsupported"}
+    samples = golden_set.to_benchmark_samples() if hasattr(golden_set, "to_benchmark_samples") else golden_set.samples
+    report = checker(samples, force_rebuild=args.rebuild_corpus_index)
+    print(f"[corpus-sync] {report.summary_line()}", file=sys.stderr)
+    payload = report.to_dict()
+    payload["allow_corpus_desync"] = bool(args.allow_corpus_desync)
+    if not report.passed:
+        if not args.allow_corpus_desync:
+            raise SystemExit(
+                "Raw corpus is out of sync with the frozen sample set: "
+                f"missing_evidence_titles={report.missing_evidence_titles[:10]} "
+                f"unresolvable_questions={len(report.unresolvable_sample_ids)}. "
+                "Fix the wiki dump, or pass --allow-corpus-desync to proceed without main-table eligibility."
+            )
+        payload["accepted_for_main_table"] = False
+    return payload
 
 
 def _wiki_dir(adapter) -> str:

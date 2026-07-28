@@ -49,9 +49,11 @@ class HotpotQATitleResolver:
         wiki_dir: str | Path,
         *,
         max_json_line_chars: int = 2_000_000,
+        index_cache_dir: str | Path | None = None,
     ) -> None:
         self.wiki_dir = Path(wiki_dir).expanduser().resolve()
         self.max_json_line_chars = max_json_line_chars
+        self.index_cache_dir = str(index_cache_dir) if index_cache_dir else ""
         self._file_index: Optional[Dict[str, Path]] = None
         self._candidate_files: Optional[List[Path]] = None
 
@@ -98,6 +100,7 @@ class HotpotQATitleResolver:
                 unresolved=unresolved,
                 results=results,
                 materialized_dir=Path(materialized_dir).expanduser().resolve() if materialized_dir else None,
+                shard_hint=self._shard_hint(unresolved),
             )
 
         for normalized in unresolved:
@@ -118,6 +121,35 @@ class HotpotQATitleResolver:
             key=lambda p: str(p.relative_to(self.wiki_dir)),
         )
         return self._candidate_files
+
+    def _shard_hint(self, unresolved: Set[str]) -> Dict[str, Path]:
+        """Map still-unresolved titles to their shard using a cached corpus index.
+
+        Without a hint the resolver has to stream every shard until each title is
+        found, which dominates snapshot build time on a full dump. This only
+        consumes an index that some earlier sync check already produced; it never
+        builds one, so a narrow resolve call cannot trigger a full dump scan.
+        """
+        if not self.index_cache_dir or not unresolved:
+            return {}
+        try:
+            from hotpotqa.corpus_index import load_covering_index
+
+            index = load_covering_index(
+                self.wiki_dir,
+                sorted(unresolved),
+                cache_dir=self.index_cache_dir,
+            )
+        except Exception:
+            return {}
+        if index is None:
+            return {}
+        hint: Dict[str, Path] = {}
+        for normalized in unresolved:
+            shard = index.absolute_shard_for(normalized)
+            if shard is not None:
+                hint[normalized] = shard
+        return hint
 
     def _build_file_index(self) -> Dict[str, Path]:
         if self._file_index is not None:
@@ -141,10 +173,22 @@ class HotpotQATitleResolver:
         unresolved: Set[str],
         results: Dict[str, TitleResolutionResult],
         materialized_dir: Optional[Path],
+        shard_hint: Optional[Dict[str, Path]] = None,
     ) -> None:
         if materialized_dir is not None:
             materialized_dir.mkdir(parents=True, exist_ok=True)
-        for path in self.candidate_files():
+        hinted_shards: List[Path] = []
+        if shard_hint:
+            seen: Set[str] = set()
+            for path in shard_hint.values():
+                key = str(path)
+                if key not in seen:
+                    seen.add(key)
+                    hinted_shards.append(path)
+        scan_order = hinted_shards + [
+            path for path in self.candidate_files() if path not in set(hinted_shards)
+        ] if hinted_shards else self.candidate_files()
+        for path in scan_order:
             if not unresolved:
                 return
             if path.suffix.lower() not in _SCAN_SUFFIXES:
@@ -161,7 +205,7 @@ class HotpotQATitleResolver:
                     title=wanted[normalized],
                     normalized_title=normalized,
                     resolved=True,
-                    method="shard_record",
+                    method="indexed_shard_record" if shard_hint and normalized in shard_hint else "shard_record",
                     confidence=0.95,
                     source_path=str(path),
                     materialized_path=materialized_path,

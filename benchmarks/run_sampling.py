@@ -68,6 +68,14 @@ def _parse_args() -> argparse.Namespace:
     create.add_argument("--output-dir", default="", dest="output_dir")
     create.add_argument("--sample-ids-file", default="", dest="sample_ids_file", help="Existing sample IDs JSON for fixed_ids sampling")
     create.add_argument("--force", action="store_true", help="Regenerate even when GoldenSet already exists")
+    create.add_argument("--allow-corpus-desync", action="store_true", dest="allow_corpus_desync",
+                        help="Freeze samples even when referenced evidence articles are missing from the raw corpus")
+    create.add_argument("--rebuild-corpus-index", action="store_true", dest="rebuild_corpus_index",
+                        help="Ignore the cached raw-corpus title index and rescan the dump")
+
+    check = sub.add_parser("check-corpus-sync", help="Check raw-corpus closure for the declared split without sampling")
+    _add_common_benchmark_args(check)
+    check.add_argument("--rebuild-corpus-index", action="store_true", dest="rebuild_corpus_index")
 
     validate = sub.add_parser("validate", help="Validate a sampling manifest or GoldenSet JSON")
     validate.add_argument("--manifest", required=True, help="Sampling manifest or GoldenSet JSON path")
@@ -87,9 +95,29 @@ def main() -> int:
     adapter = load_benchmark_adapter(args.benchmark, str(Path(args.env).resolve()))
     if args.command == "describe":
         return _describe(adapter)
+    if args.command == "check-corpus-sync":
+        return _check_corpus_sync(args, adapter)
     if args.command == "create":
         return _create(args, adapter)
     raise ValueError(args.command)
+
+
+def _corpus_sync_report(adapter, samples, *, force_rebuild: bool = False):
+    """Return a raw-corpus closure report when the benchmark supports one."""
+    checker = getattr(adapter, "evaluate_corpus_sync", None)
+    if not callable(checker):
+        return None
+    return checker(samples, force_rebuild=force_rebuild)
+
+
+def _check_corpus_sync(args: argparse.Namespace, adapter) -> int:
+    samples = _load_sampling_population(adapter, seed=42)
+    report = _corpus_sync_report(adapter, samples, force_rebuild=args.rebuild_corpus_index)
+    if report is None:
+        print(json.dumps({"corpus_sync": "unsupported", "benchmark": args.benchmark}, indent=2))
+        return 0
+    print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+    return 0 if report.passed else 1
 
 
 def _describe(adapter) -> int:
@@ -103,6 +131,21 @@ def _describe(adapter) -> int:
 
 def _create(args: argparse.Namespace, adapter) -> int:
     samples = _load_sampling_population(adapter, seed=args.seed)
+
+    # Gate before freezing anything: a sample whose supporting-fact article is
+    # absent from the raw corpus cannot be answered from a snapshot, and finding
+    # that out during corpus build would mean discarding an already frozen set.
+    sync_report = _corpus_sync_report(adapter, samples, force_rebuild=args.rebuild_corpus_index)
+    if sync_report is not None:
+        print(f"[corpus-sync] {sync_report.summary_line()}", file=sys.stderr)
+        if not sync_report.passed and not args.allow_corpus_desync:
+            print(json.dumps({
+                "error": "raw corpus is out of sync with the declared split",
+                "corpus_sync": sync_report.to_dict(),
+                "hint": "fix the wiki dump, or pass --allow-corpus-desync to freeze anyway",
+            }, indent=2, ensure_ascii=False))
+            return 1
+
     population_size = len(samples)
     expected_population_size = args.expected_population_size
     if not expected_population_size and args.benchmark == "hotpotqa":
@@ -148,6 +191,8 @@ def _create(args: argparse.Namespace, adapter) -> int:
             "seed": protocol.seed,
             "target_n": protocol.target_n,
             "golden_set_checksum": golden.checksum,
+            "wiki_corpus_fingerprint": sync_report.wiki_fingerprint if sync_report else "",
+            "evidence_title_closure": sync_report.evidence_title_closure if sync_report else None,
         },
     )
 
@@ -162,6 +207,8 @@ def _create(args: argparse.Namespace, adapter) -> int:
         "sample_id_checksum": golden.sample_id_checksum(),
         "validation": validation,
     }
+    if sync_report is not None:
+        summary["corpus_sync"] = sync_report.to_dict()
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return 0 if validation["passed"] else 1
 
