@@ -470,7 +470,7 @@ python benchmarks/run_benchmark.py dynamic \
 
 Scaling 和 update cost 应与 warm-query accuracy 分开报告。full-corpus index 未达到 `READY` 的系统，不应在没有 feasibility caveat 的情况下进入 warm-query baseline。
 
-Dynamic task 输出包括：
+Dynamic task 默认包含 paper-facing baselines `bm25_rag,hybrid_rag,react`；显式传入 `--baselines` 时以 CLI 参数为准。输出包括：
 
 ```text
 benchmarks/hotpotqa/output/dynamic_eval/tables/dynamic_main_results.*

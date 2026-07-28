@@ -470,7 +470,7 @@ python benchmarks/run_benchmark.py dynamic \
 
 Report scaling and update cost separately from warm-query accuracy. A full-corpus index that is not `READY` should not appear as a warm-query baseline without a feasibility caveat.
 
-Dynamic task outputs include:
+Dynamic task outputs include the default paper-facing baselines `bm25_rag,hybrid_rag,react` unless `--baselines` is explicitly set:
 
 ```text
 benchmarks/hotpotqa/output/dynamic_eval/tables/dynamic_main_results.*

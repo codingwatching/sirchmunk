@@ -55,7 +55,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-missing-evidence", action="store_true", help="Allow snapshots with unresolved evidence titles; not for main-table runs")
     parser.add_argument("--force-recreate-golden", action="store_true")
     parser.add_argument("--run-baselines", action="store_true", help="Run built-in baselines for each G/D stage")
-    parser.add_argument("--baselines", default="bm25_rag,react", help="Comma separated: bm25_rag,react,lens_full,lens_no_prior,lens_no_seq,lightrag_v136,lightrag_v136_<mode>")
+    parser.add_argument("--baselines", default="bm25_rag,hybrid_rag,react", help="Comma separated: bm25_rag,hybrid_rag,react,lens_full,lens_no_prior,lens_no_seq,lightrag_v136,lightrag_v136_<mode>")
     parser.add_argument("--lightrag-query-mode", default="hybrid", choices=["naive", "local", "global", "hybrid", "mix"], help="Default LightRAG v1.3.6 query mode")
     parser.add_argument("--lightrag-max-files", type=int, default=0, help="LightRAG v1.3.6 max indexed files, 0=unlimited")
     parser.add_argument("--lightrag-max-file-chars", type=int, default=300000, help="LightRAG v1.3.6 max chars per indexed file")
@@ -128,7 +128,7 @@ def main() -> int:
         nested_sample_manifest=nested.to_dict(),
         corpus_manifests=corpus_manifests,
         base_work_path=adapter.get_work_path(),
-        base_output_dir=output_dir.parent,
+        base_output_dir=output_dir,
     )
     bindings_path = save_stage_bindings(bindings, output_dir / "stage_bindings.json")
     table_paths = _generate_snapshot_table(corpus_manifests, output_dir)
@@ -193,7 +193,6 @@ async def _run_baselines_for_bindings(args, base_adapter, golden_set, bindings, 
     update_rows = []
     previous_binding = None
     previous_baselines = {}
-    previous_stage_adapter = None
     for binding in bindings:
         stage_adapter = _StageAdapter(base_adapter, binding)
         stage_samples = _select_sample_dicts(golden_set.samples, _load_sample_ids(binding.sample_ids_file))
@@ -228,7 +227,6 @@ async def _run_baselines_for_bindings(args, base_adapter, golden_set, bindings, 
             stage_records[baseline.name] = str(record_path)
             dynamic_rows.append(_dynamic_result_row(binding, baseline, results))
         previous_binding = binding
-        previous_stage_adapter = stage_adapter
         previous_baselines = {baseline.name: baseline for baseline in baselines}
         runs[binding.stage_name] = {
             "output_dir": binding.output_dir,
@@ -344,6 +342,9 @@ def _baseline_by_name(spec: str, bm_adapter, args=None):
     if lower == "bm25_rag":
         from baselines import BM25RAGBaseline
         return BM25RAGBaseline()
+    if lower == "hybrid_rag":
+        from baselines import HybridRAGBaseline
+        return HybridRAGBaseline()
     if lower == "react":
         from baselines import ReActSearchBaseline
         return ReActSearchBaseline()

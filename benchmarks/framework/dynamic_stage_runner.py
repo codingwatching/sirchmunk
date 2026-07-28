@@ -99,7 +99,7 @@ def build_stage_bindings(
             frozen_order_checksum=str(corpus.get("frozen_order_checksum", "")),
             corpus_checksum=str(corpus.get("corpus_checksum", "")),
             work_path=str(Path(base_work_path) / "evaluation" / "dynamic" / d_stage),
-            output_dir=str(Path(base_output_dir) / "dynamic_eval" / "runs" / binding_name),
+            output_dir=str(Path(base_output_dir) / "runs" / binding_name),
             metadata={"corpus_manifest": corpus, "sample_stage": sample_stage},
         ))
     return bindings
