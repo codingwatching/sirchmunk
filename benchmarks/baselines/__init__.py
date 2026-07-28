@@ -13,6 +13,7 @@ from .base_adapter import BaselineAdapter, BaselinePrediction, BaselineResult, B
 from .bm25_rag import BM25RAGBaseline
 from .external import ExternalPredictionBaseline, GraphRAGBaseline, LightRAGV1Baseline
 from .lexical import LocalBM25Baseline, NaiveRAGBaseline
+from .hybrid_rag import HybridRAGBaseline
 from .lightrag_v136 import LightRAGV136Baseline
 from .react_search import ReActSearchBaseline
 from .sdk_baseline import ManualImportAdapter, SdkBaseline
@@ -27,6 +28,7 @@ __all__ = [
     # 本地/外部基线
     "LocalBM25Baseline",
     "BM25RAGBaseline",
+    "HybridRAGBaseline",
     "NaiveRAGBaseline",
     "ReActSearchBaseline",
     "ExternalPredictionBaseline",

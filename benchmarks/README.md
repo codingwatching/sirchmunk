@@ -36,9 +36,11 @@ The purpose is to keep exploration, baseline asset construction, frozen evaluati
 
 Phase 0 only clarifies baseline semantics and cache safety; it does not add new retrieval families. Use `bm25` / `bm25_local` and `naive_rag` / `naive_rag_local` only as quickstart/local smoke baselines. They are useful for regression checks but are not the paper-facing BM25-RAG row.
 
-For paper-oriented main comparisons, use `bm25_rag` for fixed-chunk sparse RAG and `react` / `react_search` for the ordinary tool-use agent baseline. Existing baseline JSONL files are reusable only when the cached `baseline_name`, `citation_name`, adapter class, schema version, and config hash match the current adapter, preventing new table labels from wrapping stale predictions.
+For paper-oriented main comparisons, use `bm25_rag` for fixed-chunk sparse RAG, `hybrid_rag` for BM25+dense reciprocal-rank fusion RAG, and `react` / `react_search` for the ordinary tool-use agent baseline. Existing baseline JSONL files are reusable only when the cached `baseline_name`, `citation_name`, adapter class, schema version, and config hash match the current adapter, preventing new table labels from wrapping stale predictions.
 
-Remaining planned work is deliberately narrow: add `hybrid_rag` as the next paper-facing RAG baseline, optionally expose `dense_rag` for appendix/sensitivity, and keep LightRAG v1.3.6 in lifecycle/related-work tables. Long-context baselines are explicitly out of scope for the current plan.
+Remaining planned work is deliberately narrow: optionally expose `dense_rag` for appendix/sensitivity and keep LightRAG v1.3.6 in lifecycle/related-work tables. Long-context baselines are explicitly out of scope for the current plan.
+
+`hybrid_rag` defaults to a deterministic hashed dense backend so smoke and lifecycle checks do not require model downloads. For stronger embedding-backed runs, pass `--hybrid-dense-backend sirchmunk_embedding` and configure `EMBEDDING_MODEL_ID`; the backend choice is recorded in baseline metadata and cache identity.
 
 ## Install Benchmark Dependencies
 
@@ -211,7 +213,7 @@ python benchmarks/run_benchmark.py main \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --sirchmunk-results benchmarks/hotpotqa/output/main/runs/<run_id>/results/predictions.jsonl \
   --run-artifact-dir benchmarks/hotpotqa/output/main/runs/<run_id> \
-  --baselines bm25_rag,react \
+  --baselines bm25_rag,hybrid_rag,react \
   --asset-registry benchmarks/hotpotqa/output/assets/asset_registry.jsonl \
   --sampling-method stratified \
   --golden-n 2000 \
@@ -229,7 +231,7 @@ python benchmarks/run_benchmark.py main \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --run-sirchmunk \
   --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sample_ids.json \
-  --baselines bm25_rag,react \
+  --baselines bm25_rag,hybrid_rag,react \
   --asset-registry benchmarks/hotpotqa/output/assets/asset_registry.jsonl \
   --cache-mode cold \
   --generate-report \

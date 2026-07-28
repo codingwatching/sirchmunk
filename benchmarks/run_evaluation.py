@@ -106,7 +106,7 @@ def _parse_args() -> argparse.Namespace:
                    help="本文系统（LENS/Sirchmunk）的结果 JSONL 文件路径")
     p.add_argument("--baselines", default="",
                    help=(
-                       "运行的竞品列表（逗号分隔）。Paper main 推荐 bm25_rag,react；"
+                       "运行的竞品列表（逗号分隔）。Paper main 推荐 bm25_rag,hybrid_rag,react；"
                        "Phase 0 后 bm25/bm25_local 与 naive_rag/naive_rag_local 仅表示 quickstart/local smoke baselines，"
                        "不等同于论文主表 BM25-RAG。可选 related-work/lifecycle: lightrag_v136；"
                        "imported: lightrag_v1, graphrag；ablation: lens_full,lens_no_prior,lens_no_seq,lens_no_reuse；"
@@ -176,6 +176,19 @@ def _parse_args() -> argparse.Namespace:
                    help="BM25本地索引最多读取文件数")
     p.add_argument("--naive-rag-max-files", type=int, default=5000, dest="naive_rag_max_files",
                    help="NaiveRAG本地索引最多读取文件数")
+    p.add_argument("--hybrid-max-files", type=int, default=5000, dest="hybrid_max_files",
+                   help="Hybrid-RAG最多读取文件数")
+    p.add_argument("--hybrid-bm25-top-k", type=int, default=20, dest="hybrid_bm25_top_k",
+                   help="Hybrid-RAG BM25候选chunk数")
+    p.add_argument("--hybrid-dense-top-k", type=int, default=20, dest="hybrid_dense_top_k",
+                   help="Hybrid-RAG dense候选chunk数")
+    p.add_argument("--hybrid-final-top-k", type=int, default=5, dest="hybrid_final_top_k",
+                   help="Hybrid-RAG最终送入LLM的chunk数")
+    p.add_argument("--hybrid-dense-backend", default="hash", dest="hybrid_dense_backend",
+                   choices=["hash", "sirchmunk", "sirchmunk_embedding", "embedding_util"],
+                   help="Hybrid-RAG dense backend；默认hash保持可复现，sirchmunk_embedding使用项目EmbeddingUtil")
+    p.add_argument("--hybrid-dense-dim", type=int, default=256, dest="hybrid_dense_dim",
+                   help="Hybrid-RAG hash dense backend维度")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                    dest="log_level")
@@ -581,6 +594,7 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None
     from baselines import (
         BM25RAGBaseline,
         GraphRAGBaseline,
+        HybridRAGBaseline,
         LightRAGV136Baseline,
         LightRAGV1Baseline,
         LocalBM25Baseline,
@@ -594,6 +608,15 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None
         return LocalBM25Baseline(max_files=args.bm25_max_files)
     if lower in ("bm25_rag", "rag_bm25"):
         return BM25RAGBaseline(max_files=args.bm25_max_files)
+    if lower in ("hybrid_rag", "rag_hybrid"):
+        return HybridRAGBaseline(
+            max_files=args.hybrid_max_files,
+            bm25_top_k=args.hybrid_bm25_top_k,
+            dense_top_k=args.hybrid_dense_top_k,
+            final_top_k=args.hybrid_final_top_k,
+            dense_backend=args.hybrid_dense_backend,
+            dense_dim=args.hybrid_dense_dim,
+        )
     if lower in ("react", "react_search"):
         return ReActSearchBaseline()
     if lower in ("naive_rag", "naive_rag_local"):
@@ -647,7 +670,7 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None
             raise TypeError(f"Factory {raw_name} did not return BaselineAdapter")
         return baseline
     raise ValueError(
-        "Unknown baseline. Use bm25_rag or react for paper main; "
+        "Unknown baseline. Use bm25_rag, hybrid_rag, or react for paper main; "
         "bm25/bm25_local and naive_rag/naive_rag_local are quickstart/local smoke baselines; "
         "related-work/lifecycle: lightrag_v136; imported: lightrag_v1, graphrag; "
         "ablation: lens_no_prior, lens_no_seq, lens_no_reuse; custom: module:factory. "

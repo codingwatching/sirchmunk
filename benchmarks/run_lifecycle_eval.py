@@ -24,7 +24,7 @@ for _p in (str(_SCRIPT_DIR), str(_SRC)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from baselines import LocalBM25Baseline, NaiveRAGBaseline  # noqa: E402
+from baselines import BM25RAGBaseline, HybridRAGBaseline, LocalBM25Baseline, NaiveRAGBaseline  # noqa: E402
 from baselines.base_adapter import BaselineAdapter  # noqa: E402
 from evaluation.table_generator import PaperTableGenerator  # noqa: E402
 from framework.baseline_lifecycle import BaselineLifecycleManager  # noqa: E402
@@ -51,7 +51,7 @@ def _parse_args() -> argparse.Namespace:
         default="bm25,naive_rag",
         help=(
             "Comma-separated baseline names or module:factory specs. "
-            "Built-ins: bm25, naive_rag."
+            "Built-ins: bm25, bm25_rag, hybrid_rag, naive_rag."
         ),
     )
     parser.add_argument("--limit", type=int, default=20, help="Samples used to infer corpus paths")
@@ -95,6 +95,10 @@ def _load_baselines(spec: str) -> List[BaselineAdapter]:
         lower = raw_name.lower()
         if lower in {"bm25", "bm25_local"}:
             baselines.append(LocalBM25Baseline())
+        elif lower in {"bm25_rag", "rag_bm25"}:
+            baselines.append(BM25RAGBaseline())
+        elif lower in {"hybrid_rag", "rag_hybrid"}:
+            baselines.append(HybridRAGBaseline())
         elif lower in {"naive_rag", "naive_rag_local"}:
             baselines.append(NaiveRAGBaseline())
         elif ":" in raw_name:
@@ -106,7 +110,7 @@ def _load_baselines(spec: str) -> List[BaselineAdapter]:
                 raise TypeError(f"Factory {raw_name} did not return BaselineAdapter")
             baselines.append(baseline)
         else:
-            raise ValueError(f"Unknown baseline '{raw_name}'. Use bm25, naive_rag, or module:factory.")
+            raise ValueError(f"Unknown baseline '{raw_name}'. Use bm25, bm25_rag, hybrid_rag, naive_rag, or module:factory.")
     return baselines
 
 
