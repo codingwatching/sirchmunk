@@ -122,7 +122,7 @@ def _parse_args() -> argparse.Namespace:
                    metavar="'Name:acc=XX,cov=XX,lat=XX'",
                    help="直接导入已发表数字（无需 Judge，可多次）")
     p.add_argument("--golden-n", type=int, default=150, dest="golden_n",
-                   help="GoldenSet 大小（默认 150，0=全量；stratified时推荐2000）")
+                   help="GoldenSet 大小（默认 150，0=全量；stratified 时推荐 500，也是采样协议的建议上限）")
     p.add_argument("--golden-seed", type=int, default=42, dest="golden_seed",
                    help="GoldenSet 随机种子（默认 42）")
     p.add_argument("--sampling-method", default="simple_random",
@@ -210,6 +210,10 @@ def _parse_args() -> argparse.Namespace:
                    help="Sirchmunk run artifact目录（包含protocol/manifest/results）")
     p.add_argument("--report-output-dir", default="", dest="report_output_dir",
                    help="报告输出目录（默认 output-dir/report）")
+    p.add_argument("--context-corpus-provenance", default="", dest="context_corpus_provenance",
+                   help="Corpus provenance for this evaluation: sample, wiki, hybrid, dynamic_snapshot, etc.")
+    p.add_argument("--context-corpus-risk", default="", dest="context_corpus_risk",
+                   help="Comma-separated corpus risk tags, e.g. oracle_sample_context,evaluation_set_context_index")
     return p.parse_args()
 
 
@@ -238,6 +242,12 @@ async def _main() -> int:
 
     ours_name = args.ours_name or "LENS (ours)"
     baseline_guard_config = _baseline_guard_config(args)
+    corpus_metadata = _evaluation_corpus_metadata(args, bm_adapter)
+    if corpus_metadata.get("corpus_provenance") == "sample":
+        logger.warning(
+            "Evaluation uses sample-context corpus (%s); results are smoke health checks, not raw-corpus claims.",
+            corpus_metadata.get("corpus_risk", ""),
+        )
     if args.sampling_protocol:
         logger.info("Using --sampling-protocol=%s; CLI sampling-method/golden-n/strata options are ignored.", args.sampling_protocol)
     sampling_protocol = _build_sampling_protocol(args, bm_adapter)
@@ -261,7 +271,7 @@ async def _main() -> int:
     golden_set = None
     if args.create_golden_only or args.sirchmunk_results or (args.baselines and not args.table_only) or (args.import_baseline and not args.table_only):
         _, golden_set = _get_or_create_golden_set(args, bm_adapter, sampling_protocol)
-        _attach_sampling_metadata(gen, golden_set)
+        _attach_sampling_metadata(gen, golden_set, corpus_metadata)
         _write_sampling_report(args, golden_set)
         logger.info(
             "GoldenSet: %d questions seed=%d checksum=%s method=%s",
@@ -298,7 +308,7 @@ async def _main() -> int:
 
         if golden_set is None:
             _, golden_set = _get_or_create_golden_set(args, bm_adapter, sampling_protocol)
-            _attach_sampling_metadata(gen, golden_set)
+            _attach_sampling_metadata(gen, golden_set, corpus_metadata)
 
         baseline_list = []
         for raw_bname in args.baselines.split(","):
@@ -317,6 +327,7 @@ async def _main() -> int:
                 baselines=baseline_list,
                 output_dir=baseline_dir,
                 guard_config=baseline_guard_config,
+                corpus_metadata=corpus_metadata,
             )
             baseline_results = await suite.run(golden_set)
             for bm, results in baseline_results.items():
@@ -336,7 +347,7 @@ async def _main() -> int:
 
         if golden_set is None:
             _, golden_set = _get_or_create_golden_set(args, bm_adapter, sampling_protocol)
-            _attach_sampling_metadata(gen, golden_set)
+            _attach_sampling_metadata(gen, golden_set, corpus_metadata)
 
         import_adapters = []
         import_setup_paths = _parse_named_paths(args.import_baseline_setup or [])
@@ -365,6 +376,7 @@ async def _main() -> int:
                 baselines=import_adapters,
                 output_dir=baseline_dir,
                 guard_config=baseline_guard_config,
+                corpus_metadata=corpus_metadata,
             )
             for res_map in [await suite.run(golden_set)]:
                 for bm, results in res_map.items():
@@ -740,10 +752,40 @@ def _get_or_create_golden_set(args: argparse.Namespace, bm_adapter, sampling_pro
     return manager, golden_set
 
 
-def _attach_sampling_metadata(gen, golden_set) -> None:
+def _attach_sampling_metadata(gen, golden_set, corpus_metadata: dict | None = None) -> None:
     if golden_set is None or not hasattr(gen, "set_sampling_metadata"):
         return
-    gen.set_sampling_metadata(_golden_summary(golden_set))
+    metadata = _golden_summary(golden_set)
+    if corpus_metadata:
+        metadata.update(corpus_metadata)
+    gen.set_sampling_metadata(metadata)
+
+
+def _evaluation_corpus_metadata(args: argparse.Namespace, bm_adapter) -> dict:
+    run_config = {}
+    try:
+        run_config = bm_adapter.get_run_config()
+    except Exception:
+        run_config = {}
+    provenance = (args.context_corpus_provenance or run_config.get("context_corpus_mode") or "").strip().lower()
+    if provenance in {"context", "sample_context"}:
+        provenance = "sample"
+    if not provenance:
+        provenance = "unknown"
+    risk = (args.context_corpus_risk or "").strip()
+    if not risk:
+        if provenance == "sample":
+            risk = "oracle_sample_context,evaluation_set_context_index"
+        elif provenance == "hybrid":
+            risk = "sample_context_plus_raw_wiki"
+        elif provenance in {"wiki", "raw_wiki"}:
+            risk = "raw_wiki"
+    return {
+        "corpus_provenance": provenance,
+        "corpus_risk": risk,
+        "context_corpus_mode": str(run_config.get("context_corpus_mode") or provenance),
+        "require_context_answerable": bool(run_config.get("require_context_answerable", False)),
+    }
 
 
 def _write_sampling_report(args: argparse.Namespace, golden_set) -> None:

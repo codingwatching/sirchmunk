@@ -27,6 +27,7 @@ from evaluation.sampling_protocol import (
     SamplingProtocol,
     compute_sample_id_checksum,
     create_sample,
+    extract_sample_ids,
 )
 from framework.time_utils import now_local_iso
 
@@ -203,9 +204,16 @@ class GoldenSetManager:
 
         if not force_recreate and Path(path).exists():
             try:
-                return GoldenSet.load(path)
+                loaded = GoldenSet.load(path)
             except (ValueError, KeyError) as exc:
                 logger.warning("[GoldenSet] Load failed (%s), recreating...", exc)
+            else:
+                if _matches_fixed_ids(loaded, protocol):
+                    return loaded
+                logger.warning(
+                    "[GoldenSet] Cached set at %s no longer matches the fixed sample IDs content, recreating...",
+                    path,
+                )
 
         if protocol is not None:
             population_loader = getattr(adapter, "load_sampling_population", None)
@@ -282,8 +290,38 @@ def _coerce_protocol(value: Optional[SamplingProtocol | Dict[str, Any]]) -> Opti
 def _protocol_checksum(protocol: SamplingProtocol) -> str:
     payload = protocol.to_dict()
     payload.pop("created_at", None)
+    fingerprint = _sample_ids_fingerprint(protocol)
+    if fingerprint:
+        payload["sample_ids_fingerprint"] = fingerprint
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _sample_ids_fingerprint(protocol: Optional[SamplingProtocol]) -> str:
+    """Content checksum of a fixed_ids sample list.
+
+    fixed_ids protocols often reuse one file path across runs (e.g. quickstart
+    rewrites quickstart_sample_ids.json), so the path alone cannot distinguish
+    different frozen question sets. Hashing the ids keeps the GoldenSet cache
+    key bound to the actual sample content.
+    """
+    if protocol is None or getattr(protocol, "method", "") != "fixed_ids":
+        return ""
+    ids_file = str(getattr(protocol, "sample_ids_file", "") or "")
+    if not ids_file or not Path(ids_file).exists():
+        return ""
+    try:
+        return compute_sample_id_checksum(extract_sample_ids(ids_file))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ""
+
+
+def _matches_fixed_ids(golden_set: GoldenSet, protocol: Optional[SamplingProtocol]) -> bool:
+    """Verify a cached fixed_ids GoldenSet still matches the ids file content."""
+    fingerprint = _sample_ids_fingerprint(protocol)
+    if not fingerprint:
+        return True
+    return golden_set.sample_id_checksum() == fingerprint
 
 
 def _safe_name(value: str) -> str:

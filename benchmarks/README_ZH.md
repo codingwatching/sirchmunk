@@ -30,7 +30,7 @@ mock/smoke exploration
 | Mock/smoke | `run_benchmark.py smoke-tune` | 小样本探索、环境检查、报告 smoke、可选 baseline 对比 | 否 |
 | 冻结样本 | `run_sampling.py create` | 创建固定分层 sample IDs 和 checksum | 仅作为抽样证据 |
 | Assets | `run_benchmark.py assets` | 构建/校验 baseline 预处理、索引、存储和生命周期证据 | setup/lifecycle 证据 |
-| Dynamic G/D | `run_benchmark.py dynamic` | 构建 nested `G_n/D_n` sample/corpus bindings 和可选 dynamic baselines | stage checks 通过后可以 |
+| Dynamic G/D | `run_benchmark.py dynamic` | 构建 nested `G_n/D_n` sample/corpus bindings、可选 dynamic baselines 以及可选的 stale-index 对照臂 | stage checks 通过后可以 |
 | Frozen main | `run_benchmark.py main` | 运行或组装 Sirchmunk 结果、运行主 baseline、生成表格/报告 | gate 通过后可以 |
 | Report/status | `run_benchmark.py report/status` | 重新生成报告并检查 gate 状态 | 若绑定 frozen artifacts 则可以 |
 | 可选 appendix | `run_benchmark.py ablation` | 机制消融 | appendix/ablation |
@@ -157,16 +157,32 @@ benchmarks/hotpotqa/output/exploration/quickstart_eval/paper_table.md
 
 `quickstart_ok=True` 表示本地链路健康。`paper_ready=False` 是预期结果，因为 exploration artifacts 会被有意阻止进入论文结论。
 
+### Corpus Modes And Smoke Boundaries
+
+`smoke-tune` 默认使用 `--context-corpus-mode sample` 来做快速 HotpotQA 健康检查。在该模式下，每个 sampled HotpotQA parquet `context` 会被物化成本地 `.txt` 文件，并且 sample 模式会强制 `HOTPOT_REQUIRE_CONTEXT_ANSWERABLE=true`。这会让 smoke 集合刻意变成闭合且可回答的语料。
+
+sample-context 分数只能视为 pipeline health metrics。BM25、Naive RAG、BM25-RAG 和 Hybrid-RAG 会在 baseline preparation 阶段对 evaluation-set sample contexts 建索引，因此这些 smoke 行会带有 `evaluation_set_context_index` 风险。ReAct 不构建同一个全局索引，但仍然检索 gold-adjacent 的 per-sample context，因此也不是 raw-corpus 证据。
+
+请明确区分这些 corpus modes：
+
+| Mode | 适用场景 | 能否面向论文？ |
+|---|---|---|
+| `sample` | 在 answerable HotpotQA sample contexts 上快速 smoke/debug | 否；validator 会产生 `sample_context_corpus` 和 `evaluation_set_context_index` errors |
+| `wiki` | Raw HotpotQA wiki corpus 检查 | 可以，前提是 frozen samples、pairing 和 gates 均通过 |
+| `hybrid` | sample+wiki 诊断对照 | 不能直接与 raw-corpus claims 对比；validator 会产生 hybrid warning |
+
+Evaluation tables 现在会记录 `corpus_provenance`、`corpus_risk` 和每个 baseline 的 `baseline_index_scope`。sample-context Markdown 表格也会打印显式 warning。面向论文的 runs 应优先使用 raw wiki 或 dynamic `G_n/D_n` snapshots，并要求 academic validator 没有 error-level corpus issue。
+
 ## Step 2: Freeze The Sample IDs
 
-Smoke 通过后，冻结评估集合。对于 HotpotQA fullwiki，推荐主 sampled protocol 是按 `type` 和 `supporting_fact_bucket` 分层的 `n=2000`，validation population 默认规模为 7,405。
+Smoke 通过后，冻结评估集合。对于 HotpotQA fullwiki，推荐主 sampled protocol 是按 `type` 和 `supporting_fact_bucket` 分层的 `n=500`，validation population 默认规模为 7,405。`n=500` 是建议上限：它已能把总体分层比例复现到 0.11 个百分点以内，同时保持所有 baseline 的查询成本可控。
 
 ```bash
 python benchmarks/run_sampling.py create \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --method stratified \
-  --target-n 2000 \
+  --target-n 500 \
   --seed 42 \
   --strata type,supporting_fact_bucket \
   --allocation proportional \
@@ -178,28 +194,29 @@ python benchmarks/run_sampling.py create \
 后续所有 frozen runs 都使用生成的 sample ID 文件：
 
 ```text
-benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_2000_sample_ids.json
+benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_500_sample_ids.json
 ```
 
 在运行昂贵系统前校验 manifest：
 
 ```bash
 python benchmarks/run_sampling.py validate \
-  --manifest benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_2000_manifest.json
+  --manifest benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_500_manifest.json
 ```
 
 不要用临时 `--limit` 替代这个文件来生成论文结论。只有所有系统使用相同 sample IDs 和 checksum 时，sampled result 才是有效的 paired comparison。
 
 ## Step 3: Build Baseline Assets
 
-Assets 阶段记录生命周期证据：预处理、索引、存储、可行性、结构化失败原因，以及 Sirchmunk 的 no-index 行。它与 warm-query accuracy 分开。
+Assets 阶段记录生命周期证据：预处理、索引、存储、可行性、结构化失败原因，以及 Sirchmunk 的 no-index 行。它是 Step 4 warm-query accuracy 之前的 frozen lifecycle preflight，二者职责分离。
 
-构建当前本地支持的 asset set：
+在最终 main 实验前执行这个 frozen asset preflight：
 
 ```bash
 python benchmarks/run_benchmark.py assets \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --output-dir benchmarks/hotpotqa/output \
   --methods bm25,bm25_rag,naive_rag,react \
   --limit 20 \
   --seed 42 \
@@ -215,6 +232,26 @@ python benchmarks/run_benchmark.py assets \
   --stage frozen \
   --strict
 ```
+
+将这条命令作为最终实验的默认 Step 3。`--limit 20` 只加载一个小 型 `golden_like` sample set，用于 baseline path inference 和 `baseline.prepare()` preflight；它不是最终评估样本数。最终 Step 4 样本量由 Step 2 的 frozen sample ID 文件控制，HotpotQA sampled main protocol 通常是 `n=500`。
+
+最终路径的参数说明：
+
+| 参数 | 最终命令取值 | 设置原因 |
+|---|---|---|
+| `--output-dir` | `benchmarks/hotpotqa/output` | 让 assets、main runs、evaluation tables 和 reports 都落在同一个 benchmark output root 下 |
+| `--methods` | `bm25,bm25_rag,naive_rag,react` | 构建当前 assets facade 支持的 lifecycle rows，并包含 Sirchmunk 的 no-index row |
+| `--limit` | `20` | 快速 frozen asset preflight；不要为了匹配 Step 4 而改成 `500` |
+| `--corpus-scale` | `fullwiki` | 将 asset evidence 标记为面向 HotpotQA fullwiki |
+| `--build-timeout` | `86400` | 对每个 baseline asset build 强制 24h wall-clock timeout |
+| `--max-disk-bytes` | `500000000000` | 为 fullwiki asset feasibility 记录 500GB disk budget |
+| `--max-ram-bytes`、`--max-llm-tokens`、`--max-api-cost-usd` | `0` | 本命令不设显式上限；只有资源受限运行才设正值 |
+| `--retry-count` | `0` | 保持失败分类可复现 |
+| `--stage frozen`、`--strict` | 启用 | 面向论文的 asset evidence 必须使用；strict 会在 blocked/failed assets 时返回非零退出码 |
+
+在 raw wiki 模式下，小 `--limit` 通常会解析到同一个 fullwiki 语料目录，因此索引规模主要由 `--corpus-scale` 和文件上限控制。在 sample 或 hybrid 语料模式下，`--limit` 会改变被物化的 sample-context paths 数量，因此会改变 asset 输入规模。
+
+默认不要把 Step 3 registry 传给 Step 4。下面最终 Step 4 命令使用 `bm25_rag,hybrid_rag,react`，而当前 assets facade 构建的是 `bm25,bm25_rag,naive_rag,react` 的 registry rows。只有当 registry 已经包含 Step 4 每个 exact method 的 ready record 时，才给 Step 4 附加 `--asset-registry`。
 
 查看 registry：
 
@@ -240,16 +277,18 @@ benchmarks/hotpotqa/output/assets/tables/feasibility_table.md
 
 ## Step 4: Run The Frozen Main Experiment
 
-Frozen main 阶段使用固定 IDs 和 frozen 设置。你可以让 control layer 运行 Sirchmunk，也可以传入已有 Sirchmunk predictions JSONL。
+最终 frozen main 命令使用固定 sample IDs、cold cache、strict gates，以及核心 paper-main 在线 baseline set：`bm25_rag,hybrid_rag,react`。
 
-运行 Sirchmunk 和当前完整 paper-main baseline set：
+运行 Sirchmunk 和最终核心 paper-main baselines：
 
 ```bash
 python benchmarks/run_benchmark.py main \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --output-dir benchmarks/hotpotqa/output \
   --run-sirchmunk \
-  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_2000_sample_ids.json \
+  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_500_sample_ids.json \
+  --expected-population-size 7405 \
   --baselines bm25_rag,hybrid_rag,react \
   --cache-mode cold \
   --baseline-sample-timeout 0 \
@@ -263,15 +302,17 @@ python benchmarks/run_benchmark.py main \
   --strict
 ```
 
-或从已有 Sirchmunk predictions 组装 frozen main：
+如果 Sirchmunk predictions 已经存在，则用下面命令组装同一张 frozen main 表，不重新运行 Sirchmunk：
 
 ```bash
 python benchmarks/run_benchmark.py main \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --output-dir benchmarks/hotpotqa/output \
   --sirchmunk-results benchmarks/hotpotqa/output/main/runs/<run_id>/results/predictions.jsonl \
   --run-artifact-dir benchmarks/hotpotqa/output/main/runs/<run_id> \
-  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_2000_sample_ids.json \
+  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_500_sample_ids.json \
+  --expected-population-size 7405 \
   --baselines bm25_rag,hybrid_rag,react \
   --cache-mode cold \
   --baseline-sample-timeout 0 \
@@ -285,7 +326,7 @@ python benchmarks/run_benchmark.py main \
   --strict
 ```
 
-如果启用 `--asset-registry`，frozen asset gate 会要求 registry 对 `--baselines` 声明的每个 method 都有 reusable asset record。只有 registry 对该列表完整时才传入它。
+`lightrag_v1` 或 `graphrag` 等 related-work imports 不属于这条可直接执行的核心命令，因为它们需要预计算 prediction/setup 文件。等这些文件存在后再单独执行 assembly run 加入它们；如果需要非默认 SDK LightRAG 参数，请直接使用 `run_evaluation.py`。
 
 Main 输出：
 
@@ -335,7 +376,7 @@ Frozen paper runs 会经过 Gate 0-5 检查：
 | Gate 2 | Sampling | fixed sample IDs、GoldenSet、sampling protocol、checksum |
 | Gate 3 | Frozen run | `stage=frozen`、确定性 cache、有效 protocol |
 | Gate 4 | Evaluation | 样本数、系统、baseline comparison 完整性 |
-| Gate 5 | Report | academic validator、table/sample pairing、provenance |
+| Gate 5 | Report | academic validator、table/sample pairing、corpus provenance/risk |
 
 Frozen paper runs 必须满足：
 
@@ -346,8 +387,12 @@ eval feedback disabled
 memory updates disabled
 sample_id_checksum recorded
 all non-published systems use the same sample IDs
+corpus_provenance is not sample for paper-facing tables
+baseline_index_scope is not evaluation_set_sample_context
 validator has no error-level issue
 ```
+
+Academic validator 会将 corpus boundary violations 视为 blocking issues。`sample_context_corpus` 表示表格使用了 answerable HotpotQA sample contexts，而不是 raw corpus。`evaluation_set_context_index` 表示至少一个 baseline 索引了 evaluation-set sample context。`hybrid_context_corpus` 是 warning，表示 sample+wiki 结果需要单独措辞，不能直接与 raw-corpus rows 对比。
 
 <details>
 <summary>Optional: Ablation</summary>
@@ -358,7 +403,7 @@ validator has no error-level issue
 python benchmarks/run_benchmark.py ablation \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
-  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_2000_sample_ids.json \
+  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_500_sample_ids.json \
   --cache-mode cold \
   --max-combinations 16 \
   --replace
@@ -370,7 +415,7 @@ python benchmarks/run_benchmark.py ablation \
 python benchmarks/run_benchmark.py ablation \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
-  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_2000_sample_ids.json \
+  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_500_sample_ids.json \
   --cache-mode cold \
   --max-combinations 16 \
   --run \
@@ -435,9 +480,9 @@ pip install git+https://github.com/HKUDS/LightRAG.git@v1.3.6
 python benchmarks/run_benchmark.py dynamic \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
-  --golden-n 2000 \
+  --golden-n 500 \
   --seed 42 \
-  --stages 500,1000,2000 \
+  --stages 125,250,500 \
   --strata type,supporting_fact_bucket \
   --materialize symlink \
   --background-ratio 3.0 \
@@ -455,9 +500,9 @@ python benchmarks/run_benchmark.py dynamic \
 python benchmarks/run_benchmark.py dynamic \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
-  --golden-n 2000 \
+  --golden-n 500 \
   --seed 42 \
-  --stages 500,1000,2000 \
+  --stages 125,250,500 \
   --strata type,supporting_fact_bucket \
   --materialize symlink \
   --background-ratio 3.0 \
@@ -480,6 +525,65 @@ benchmarks/hotpotqa/output/dynamic_eval/tables/update_readiness.*
 benchmarks/hotpotqa/output/dynamic_eval/tables/snapshot_audit.*
 ```
 
+### Stale-index 对照臂
+
+`update_readiness` 只记录系统是否*声明*需要重建索引，无法说明这个重建要求在答案质量上的代价。加上 `--stale-index-arm` 可以直接测量该代价：
+
+```bash
+python benchmarks/run_benchmark.py dynamic \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --golden-n 500 \
+  --seed 42 \
+  --stages 125,250,500 \
+  --strata type,supporting_fact_bucket \
+  --materialize symlink \
+  --run-baselines \
+  --baselines bm25_rag,hybrid_rag,react \
+  --stale-index-arm \
+  --staleness-max-samples 200
+```
+
+对每个跃迁 `D_{n-1} -> D_n`，该臂只在新增问题集（`delta = G_n \ G_{n-1}`，其 supporting evidence 文章仅存在于 `D_n`）上对比两次运行：
+
+| 臂 | 索引构建于 | 查询语料 | 含义 |
+|---|---|---|---|
+| fresh | `D_n` | `D_n` | 已付出重建成本 |
+| stale | `D_{n-1}` | `D_n` | 语料已增长，索引未重建 |
+
+stale 臂复用上一 stage 的系统实例并跳过其 prepare 步骤，因此 index-heavy 系统只能从触及不到新证据的旧索引作答，而 index-free 系统在查询时读取当前语料。预期解读：
+
+| 系统类别 | 成员 | 预期 `Ev.Rec Gap` |
+|---|---|---|
+| `index_dependent` | `bm25_rag`、`hybrid_rag`、`lightrag_v136*` | 为正 |
+| `index_free` | `react`、`lens_full`、`lens_no_prior`、`lens_no_seq` | 接近零 |
+
+接近零的那一行是实测对照结果，而不是假设，因此该臂会对所有被请求的系统执行，包括 LENS 自身。查询预算有限时可用 `--staleness-max-samples` 限制每个跃迁的 delta 问题数。
+
+新增产出：
+
+```text
+benchmarks/hotpotqa/output/dynamic_eval/tables/stale_index_quality.*
+benchmarks/hotpotqa/output/dynamic_eval/runs/<stage>/staleness/baseline_<name>.jsonl
+benchmarks/hotpotqa/output/dynamic_eval/runs/<stage>/stage_records/<name>_staleness_record.json
+```
+
+每条 staleness 记录都固定了 `from_corpus_checksum`、`to_corpus_checksum`、`delta_sample_id_checksum` 与 `stale_index_prepared_on`，因此报告出的落差可追溯到唯一的索引状态和唯一的 delta 问题集。`dynamic_eval_manifest.json` 会记录 `stale_index_arm`，并按系统类别聚合 `staleness_summary`。
+
+### 嵌套 stage 的抽样保真度
+
+分层的父集只能保证在它自身规模上分层比例正确。从随机洗牌后的父序直接切前缀，会使每个更小的 stage 退化为简单随机子样本，从而偏离总体分布，甚至整层丢失稀有层。因此嵌套 stage 改用分层均衔序（stratum-balanced order）推导：每个层的成员均匀铺开在序列上，使每个 stage 既保持比例，又仍是下一个 stage 的严格子集。
+
+在 HotpotQA fullwiki validation 总体上实测（7,405 题，`type` x `supporting_fact_bucket` 共 8 个层，最稀有层 0.32%）：
+
+| Stage | 洗牌父序前缀 | 分层均衔序 |
+|---|---|---|
+| `G_125` | 漂移 7.30pp，2 个层为空 | 漂移 0.70pp，0 空层 |
+| `G_250` | 漂移 2.90pp，1 个层为空 | 漂移 0.30pp，0 空层 |
+| `G_500` | 漂移 0.11pp，0 空层 | 漂移 0.11pp，0 空层 |
+
+每个 stage 都会在 `nested_sample_manifest.json` 和各自的 sample-ids 文件中记录 `strata_distribution`、`proportion_delta_by_stratum`、`max_abs_proportion_delta` 与 `empty_strata`，并用 `reference_scope` 标明对比基准（父 manifest 记录了总体分布时为 `population`）。学术 validator 在漂移超过 5pp 时告警，因此这些数值是可直接校验的，而不是假设。仅当需要精确复现旧的 parent-order 产物时，才向 `derive_nested_sample_sets` 传入 `balance_strata=False`。
+
 </details>
 
 <details>
@@ -493,7 +597,7 @@ benchmarks/hotpotqa/output/dynamic_eval/tables/snapshot_audit.*
 | `run_sampling.py` | 冻结样本 | 创建/校验显式 sampling artifacts |
 | `run_baseline_assets.py` | `assets` | 调试 asset registry 与 lifecycle records |
 | `run_evaluation.py` | `main` | 手动组装表格或使用非默认 evaluation flags |
-| `run_dynamic_evaluation.py` | `dynamic` | 调试 `G_n/D_n` snapshots 和 dynamic baselines |
+| `run_dynamic_evaluation.py` | `dynamic` | 调试 `G_n/D_n` snapshots、dynamic baselines 和 stale-index 对照臂 |
 | `run_report.py` | `report` | 手动重新生成报告 |
 | `run_queue.py` | `queue` | 低层队列调试 |
 | `run_research_loop.py` | Exploration | Badcase tuning 和 dry-run 分析 |
@@ -505,7 +609,7 @@ python benchmarks/run_evaluation.py \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --sirchmunk-results benchmarks/hotpotqa/output/main/runs/<run_id>/results/predictions.jsonl \
-  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_2000_sample_ids.json \
+  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_500_sample_ids.json \
   --baselines bm25_rag,hybrid_rag,react \
   --import-baseline "External System=output/external_predictions.jsonl" \
   --import-baseline-setup "External System=output/external_setup_metrics.json" \
@@ -527,10 +631,12 @@ python benchmarks/run_evaluation.py \
   --baseline-max-api-cost-usd 0 \
   --baseline-max-disk-bytes 0 \
   --baseline-min-free-disk-bytes 0 \
+  --context-corpus-provenance wiki \
+  --context-corpus-risk raw_wiki \
   --generate-report
 ```
 
-只有 direct-script 输出保留 stage、sample IDs、checksum、config hash 和 manifest provenance 时，才将其作为统一 tasks 的输入。
+只有 direct-script 输出保留 stage、sample IDs、checksum、config hash、manifest provenance 和 corpus provenance/risk 时，才将其作为统一 tasks 的输入。
 
 </details>
 
@@ -572,7 +678,7 @@ python benchmarks/run_benchmark.py smoke-tune \
 
 - `paper_ready=false`：检查 `benchmarks/hotpotqa/output/main/main_summary.json` 和 `benchmarks/hotpotqa/output/main/report/validation.json`。
 - `Gate 1` 失败：只有当 registry 对每个 frozen `--baselines` method 都包含 ready reusable record 时，才传入 `--asset-registry`；否则先重建匹配 assets。
-- `Gate 2` 失败：传入 frozen `sampling_stratified_42_2000_sample_ids.json`、sampling protocol 或合法 GoldenSet manifest。
+- `Gate 2` 失败：传入 frozen `sampling_stratified_42_500_sample_ids.json`、sampling protocol 或合法 GoldenSet manifest。
 - `Gate 3` 失败：确认 `stage=frozen`、`cache-mode cold|compiled`，并关闭 eval feedback / memory updates。
 - `Gate 5` 失败：使用 `run_benchmark.py report` 重新生成报告并检查 validator 错误。
 - Env 文件缺失：从 examples 创建私有 profile，并把 secrets 放入被忽略的文件中。

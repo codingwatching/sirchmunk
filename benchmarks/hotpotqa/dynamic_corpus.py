@@ -6,25 +6,37 @@ import json
 import os
 import random
 import shutil
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Set
 
-from evaluation.sampling_protocol import compute_sample_id_checksum, write_sample_ids
+from evaluation.sampling_protocol import (
+    compute_sample_id_checksum,
+    proportion_deltas,
+    stratum_distribution_for,
+    stratum_key_for,
+    write_sample_ids,
+)
 from framework.time_utils import now_local_iso
 from hotpotqa.title_resolver import HotpotQATitleResolver, normalize_title, safe_title_filename
 
 
 @dataclass
 class NestedSampleManifest:
-    """Lineage manifest for G_500/G_1000/G_2000 derived from one parent set."""
+    """Lineage manifest for nested G_n stages derived from one parent set."""
 
     parent_sample_count: int
     parent_sample_id_checksum: str
     parent_frozen_order_checksum: str
     stages: List[Dict[str, Any]] = field(default_factory=list)
+    strata: List[str] = field(default_factory=list)
+    nesting_order_strategy: str = "parent_order"
+    nesting_order_checksum: str = ""
+    reference_distribution: Dict[str, int] = field(default_factory=dict)
+    reference_scope: str = "parent_sample"
     created_at: str = field(default_factory=now_local_iso)
-    manifest_version: int = 1
+    manifest_version: int = 2
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -77,14 +89,37 @@ def compute_frozen_order_checksum(sample_ids: Iterable[str]) -> str:
 def derive_nested_sample_sets(
     golden_set: Any,
     *,
-    stages: Sequence[int] = (500, 1000, 2000),
+    stages: Sequence[int] = (125, 250, 500),
     output_dir: str | Path,
+    strata: Sequence[str] | None = None,
+    balance_strata: bool = True,
 ) -> NestedSampleManifest:
-    """Derive nested G_n sample-id files from a parent GoldenSet order."""
+    """Derive nested G_n sample-id files from one parent GoldenSet.
+
+    A stratified parent set only guarantees proportional strata at its own size.
+    Cutting prefixes out of a randomly shuffled parent order turns each smaller
+    stage into a simple random subsample, which drifts from the population and
+    can drop rare strata entirely. When ``balance_strata`` is set and strata are
+    resolvable, the nesting order instead spreads every stratum evenly across the
+    sequence, so each stage stays proportional while remaining a strict subset of
+    the next one. Per-stage strata distributions and proportion deltas are stored
+    in the manifest so the fidelity of every stage is auditable.
+    """
     samples = _samples_from(golden_set)
     sample_ids = [str(_sample_id(sample)) for sample in samples]
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
+
+    resolved_strata = _resolve_strata(golden_set, strata)
+    reference_distribution, reference_scope = _resolve_reference_distribution(
+        golden_set, samples, resolved_strata,
+    )
+    nesting_ids = sample_ids
+    strategy = "parent_order"
+    if balance_strata and resolved_strata:
+        nesting_ids = _stratum_balanced_order(samples, resolved_strata)
+        strategy = "stratum_balanced"
+    sample_by_id = {str(_sample_id(sample)): sample for sample in samples}
 
     parent_checksum = compute_sample_id_checksum(sample_ids)
     parent_order_checksum = compute_frozen_order_checksum(sample_ids)
@@ -92,14 +127,24 @@ def derive_nested_sample_sets(
         parent_sample_count=len(sample_ids),
         parent_sample_id_checksum=parent_checksum,
         parent_frozen_order_checksum=parent_order_checksum,
+        strata=list(resolved_strata),
+        nesting_order_strategy=strategy,
+        nesting_order_checksum=compute_frozen_order_checksum(nesting_ids),
+        reference_distribution=dict(reference_distribution),
+        reference_scope=reference_scope,
     )
 
     for stage_n in stages:
         stage_n = int(stage_n)
-        if stage_n <= 0 or stage_n > len(sample_ids):
-            raise ValueError(f"Invalid stage size {stage_n}; parent has {len(sample_ids)} samples")
-        stage_ids = sample_ids[:stage_n]
+        if stage_n <= 0 or stage_n > len(nesting_ids):
+            raise ValueError(f"Invalid stage size {stage_n}; parent has {len(nesting_ids)} samples")
+        stage_ids = nesting_ids[:stage_n]
         stage_name = f"G_{stage_n}"
+        fidelity = _stage_fidelity(
+            [sample_by_id[sample_id] for sample_id in stage_ids],
+            resolved_strata,
+            reference_distribution,
+        )
         path = write_sample_ids(
             out / f"{stage_name}_sample_ids.json",
             stage_ids,
@@ -109,6 +154,9 @@ def derive_nested_sample_sets(
                 "parent_frozen_order_checksum": parent_order_checksum,
                 "frozen_order_checksum": compute_frozen_order_checksum(stage_ids),
                 "prefix_of_parent": True,
+                "nesting_order_strategy": strategy,
+                "strata": list(resolved_strata),
+                **fidelity,
             },
         )
         manifest.stages.append({
@@ -118,6 +166,7 @@ def derive_nested_sample_sets(
             "sample_id_checksum": compute_sample_id_checksum(stage_ids),
             "frozen_order_checksum": compute_frozen_order_checksum(stage_ids),
             "prefix_of_parent": True,
+            **fidelity,
         })
 
     (out / "nested_sample_manifest.json").write_text(
@@ -125,6 +174,78 @@ def derive_nested_sample_sets(
         encoding="utf-8",
     )
     return manifest
+
+
+def _resolve_strata(golden_set: Any, strata: Sequence[str] | None) -> List[str]:
+    """Prefer explicit strata, else reuse the parent sampling protocol's strata."""
+    if strata:
+        return [str(key) for key in strata if str(key)]
+    protocol = getattr(golden_set, "sampling_protocol", None)
+    if isinstance(protocol, dict):
+        declared = protocol.get("strata")
+        if isinstance(declared, (list, tuple)):
+            return [str(key) for key in declared if str(key)]
+    return []
+
+
+def _resolve_reference_distribution(
+    golden_set: Any,
+    samples: Sequence[Any],
+    strata: Sequence[str],
+) -> tuple[Dict[str, int], str]:
+    """Use the population distribution when the parent manifest recorded it.
+
+    Comparing a stage against the full population is the meaningful fidelity
+    check. The parent sample distribution is only a fallback for parent sets that
+    were built without a sampling manifest.
+    """
+    if not strata:
+        return {}, "unavailable"
+    manifest = getattr(golden_set, "sampling_manifest", None)
+    if isinstance(manifest, dict):
+        before = manifest.get("distribution_before")
+        if isinstance(before, dict) and isinstance(before.get("strata"), dict) and before["strata"]:
+            return {str(k): int(v) for k, v in before["strata"].items()}, "population"
+    return stratum_distribution_for(samples, strata), "parent_sample"
+
+
+def _stratum_balanced_order(samples: Sequence[Any], strata: Sequence[str]) -> List[str]:
+    """Order sample ids so every prefix keeps the parent's stratum proportions.
+
+    Members of a stratum of size ``c`` are ranked at ``i / c``, which spreads them
+    evenly over the sequence. Ranking the first member of each stratum at 0 keeps
+    rare strata present even in the smallest stage, at the cost of a marginal
+    over-representation there; the exact deviation is recorded per stage.
+    """
+    groups: Dict[str, List[str]] = defaultdict(list)
+    for sample in samples:
+        groups[stratum_key_for(sample, strata)].append(str(_sample_id(sample)))
+    ranked: List[tuple[float, str, str]] = []
+    for key, ids in groups.items():
+        size = len(ids) or 1
+        for index, sample_id in enumerate(ids):
+            ranked.append((index / size, key, sample_id))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in ranked]
+
+
+def _stage_fidelity(
+    stage_samples: Sequence[Any],
+    strata: Sequence[str],
+    reference_distribution: Dict[str, int],
+) -> Dict[str, Any]:
+    """Report how closely one stage matches the reference strata distribution."""
+    if not strata or not reference_distribution:
+        return {}
+    stage_counts = stratum_distribution_for(stage_samples, strata)
+    deltas = proportion_deltas(stage_counts, reference_distribution)
+    empty = sorted(key for key in reference_distribution if stage_counts.get(key, 0) == 0)
+    return {
+        "strata_distribution": stage_counts,
+        "proportion_delta_by_stratum": deltas,
+        "max_abs_proportion_delta": round(max((abs(value) for value in deltas.values()), default=0.0), 6),
+        "empty_strata": empty,
+    }
 
 
 def build_dynamic_corpus_snapshot(

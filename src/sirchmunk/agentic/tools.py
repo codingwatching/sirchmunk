@@ -21,6 +21,26 @@ from sirchmunk.utils.file_utils import fast_extract
 logger = logging.getLogger(__name__)
 
 
+def _looks_like_plain_text_file(path: Path, *, sample_bytes: int = 4096) -> bool:
+    """Return True for extensionless/raw files that are likely UTF-8 text."""
+    try:
+        raw = path.read_bytes()[:sample_bytes]
+    except OSError:
+        return False
+    if not raw:
+        return True
+    if b"\x00" in raw:
+        return False
+    decoded = raw.decode("utf-8", errors="replace")
+    if not decoded:
+        return False
+    replacement_count = decoded.count("\ufffd")
+    if replacement_count > max(1, len(decoded) // 100):
+        return False
+    textish_count = sum(1 for ch in decoded if ch.isprintable() or ch in "\r\n\t")
+    return textish_count / max(len(decoded), 1) >= 0.85
+
+
 # ---------------------------------------------------------------------------
 # Abstract base
 # ---------------------------------------------------------------------------
@@ -457,7 +477,7 @@ class FileReadTool(BaseTool):
                     ".yml", ".xml", ".csv", ".log", ".rst", ".html", ".css",
                     ".sh", ".bash", ".toml", ".cfg", ".ini", ".conf",
                 }
-                if path.suffix.lower() in text_extensions:
+                if path.suffix.lower() in text_extensions or _looks_like_plain_text_file(path):
                     content = path.read_text(encoding="utf-8", errors="replace")
                 else:
                     extraction = await fast_extract(path)

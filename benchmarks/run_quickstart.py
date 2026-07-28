@@ -83,6 +83,8 @@ def main() -> None:
     print(f"seed      : {args.seed}")
     if args.benchmark == "hotpotqa":
         print(f"corpus    : {args.context_corpus_mode}")
+        if args.context_corpus_mode == "sample" and args.run_evaluation:
+            print("warning   : sample-context smoke uses answerable parquet context; baseline scores are health checks, not raw-corpus retrieval claims")
     print()
 
     child_env = _child_env(args, limit)
@@ -172,9 +174,21 @@ def _child_env(args: argparse.Namespace, limit: int) -> dict[str, str]:
     if args.benchmark == "hotpotqa":
         child_env["HOTPOT_LIMIT"] = str(limit)
         child_env["HOTPOT_CONTEXT_CORPUS_MODE"] = args.context_corpus_mode
+        child_env["HOTPOT_CONTEXT_CORPUS_PROVENANCE"] = args.context_corpus_mode
+        child_env["HOTPOT_CONTEXT_CORPUS_RISK"] = _context_corpus_risk(args)
         if args.context_corpus_mode == "sample":
             child_env["HOTPOT_REQUIRE_CONTEXT_ANSWERABLE"] = "true"
     return child_env
+
+
+def _context_corpus_risk(args: argparse.Namespace) -> str:
+    if args.benchmark != "hotpotqa":
+        return ""
+    if args.context_corpus_mode == "sample":
+        return "oracle_sample_context,evaluation_set_context_index"
+    if args.context_corpus_mode == "hybrid":
+        return "sample_context_plus_raw_wiki"
+    return "raw_wiki"
 
 
 def _run_evaluation(
@@ -208,6 +222,10 @@ def _run_evaluation(
         str(args.baseline_sample_timeout),
         "--baseline-max-runtime",
         str(args.baseline_max_runtime),
+        "--context-corpus-provenance",
+        args.context_corpus_mode,
+        "--context-corpus-risk",
+        _context_corpus_risk(args),
     ]
     if args.sampling_protocol:
         cmd.extend(["--sampling-protocol", args.sampling_protocol])

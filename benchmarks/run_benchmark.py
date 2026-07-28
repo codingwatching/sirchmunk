@@ -46,7 +46,7 @@ Tasks:
 Examples:
   python benchmarks/run_benchmark.py assets --benchmark hotpotqa --env benchmarks/hotpotqa/.env.hotpotqa.frozen --methods bm25_rag
   python benchmarks/run_benchmark.py smoke-tune --benchmark hotpotqa --env benchmarks/hotpotqa/.env.hotpotqa.exploration --limit 20
-  python benchmarks/run_benchmark.py dynamic --benchmark hotpotqa --env benchmarks/hotpotqa/.env.hotpotqa.frozen --golden-n 2000
+  python benchmarks/run_benchmark.py dynamic --benchmark hotpotqa --env benchmarks/hotpotqa/.env.hotpotqa.frozen --golden-n 500
   python benchmarks/run_benchmark.py main --benchmark hotpotqa --env benchmarks/hotpotqa/.env.hotpotqa.frozen --sirchmunk-results output/results.jsonl --generate-report
 """
 

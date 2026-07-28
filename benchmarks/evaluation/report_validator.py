@@ -327,6 +327,7 @@ class AcademicReportValidator:
         if len(sample_sizes) > 1:
             issues.append(ValidationIssue("error", "paired_samples", f"Non-published systems have different sample sizes: {sorted(sample_sizes)}", str(table_path)))
         non_published = [s for s in systems if not s.get("is_published_only")]
+        issues.extend(self._validate_corpus_provenance(table_path, table, non_published))
         issues.extend(self._validate_table_sampling(table_path, table, non_published))
         missing_checksums = [s.get("system_name") for s in non_published if not s.get("sample_id_checksum")]
         if missing_checksums:
@@ -413,6 +414,45 @@ class AcademicReportValidator:
                 values = {str(row.get("corpus_checksum") or "") for row in transition_rows if row.get("corpus_checksum")}
                 if len(values) > 1:
                     issues.append(ValidationIssue("error", "dynamic_update_corpus_mismatch", f"Rows in transition {transition or '<unknown>'} do not share corpus_checksum.", str(table_path)))
+        return issues
+
+    def _validate_corpus_provenance(
+        self,
+        table_path: Path,
+        table: Dict[str, Any],
+        non_published: List[Dict[str, Any]],
+    ) -> List[ValidationIssue]:
+        issues: List[ValidationIssue] = []
+        sampling = table.get("sampling") if isinstance(table.get("sampling"), dict) else {}
+        provenance = str(sampling.get("corpus_provenance") or "").lower()
+        risk = str(sampling.get("corpus_risk") or "").lower()
+        row_risks = ",".join(str(row.get("corpus_risk") or "") for row in non_published).lower()
+        row_scopes = {str(row.get("baseline_index_scope") or "").lower() for row in non_published}
+        if provenance in {"sample", "sample_context"}:
+            issues.append(ValidationIssue(
+                "error",
+                "sample_context_corpus",
+                "Sample-context corpus uses oracle/gold-adjacent HotpotQA parquet context; results are smoke health checks, not raw-corpus retrieval claims.",
+                str(table_path),
+            ))
+        if (
+            "evaluation_set_context_index" in risk
+            or "evaluation_set_context_index" in row_risks
+            or "evaluation_set_sample_context" in row_scopes
+        ):
+            issues.append(ValidationIssue(
+                "error",
+                "evaluation_set_context_index",
+                "One or more baselines indexed the evaluation-set sample context; this is not valid for paper-facing baseline comparison.",
+                str(table_path),
+            ))
+        if provenance == "hybrid" or "sample_context_plus_raw_wiki" in risk:
+            issues.append(ValidationIssue(
+                "warning",
+                "hybrid_context_corpus",
+                "Hybrid sample+wiki corpus detected; verify claim wording and do not compare it directly with raw-corpus results.",
+                str(table_path),
+            ))
         return issues
 
     def _validate_table_corpus_boundaries(

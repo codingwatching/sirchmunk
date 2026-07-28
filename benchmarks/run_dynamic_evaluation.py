@@ -27,16 +27,22 @@ from evaluation.golden_set import GoldenSetManager  # noqa: E402
 from evaluation.sampling_protocol import (  # noqa: E402
     DEFAULT_HOTPOTQA_POPULATION_SIZE,
     DEFAULT_HOTPOTQA_STRATA,
+    compute_sample_id_checksum,
     create_sampling_protocol,
 )
 from framework.registry import load_benchmark_adapter, supported_benchmarks  # noqa: E402
 from framework.dynamic_stage_runner import (  # noqa: E402
     StageExecutionRecord,
+    StalenessEvaluationRecord,
     build_stage_bindings,
     save_stage_bindings,
     validate_result_reuse,
 )
-from hotpotqa.dynamic_corpus import build_dynamic_corpus_snapshot, derive_nested_sample_sets  # noqa: E402
+from hotpotqa.dynamic_corpus import (  # noqa: E402
+    build_dynamic_corpus_snapshot,
+    compute_frozen_order_checksum,
+    derive_nested_sample_sets,
+)
 from hotpotqa.title_resolver import HotpotQATitleResolver  # noqa: E402
 
 
@@ -45,9 +51,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--benchmark", default="hotpotqa", choices=supported_benchmarks())
     parser.add_argument("--env", required=True, help="Benchmark env file")
     parser.add_argument("--output-dir", default="", help="Default: benchmarks/{benchmark}/output/dynamic_eval")
-    parser.add_argument("--golden-n", type=int, default=2000)
+    parser.add_argument("--golden-n", type=int, default=500, help="Parent sampled set size; 500 is the recommended maximum for the sampled protocol")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--stages", default="500,1000,2000", help="Comma separated nested stage sizes")
+    parser.add_argument("--stages", default="125,250,500", help="Comma separated nested stage sizes, must not exceed --golden-n")
     parser.add_argument("--strata", default=",".join(DEFAULT_HOTPOTQA_STRATA))
     parser.add_argument("--materialize", choices=["symlink", "copy", "manifest"], default="symlink")
     parser.add_argument("--background-ratio", type=float, default=3.0)
@@ -60,6 +66,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lightrag-max-files", type=int, default=0, help="LightRAG v1.3.6 max indexed files, 0=unlimited")
     parser.add_argument("--lightrag-max-file-chars", type=int, default=300000, help="LightRAG v1.3.6 max chars per indexed file")
     parser.add_argument("--skip-existing", action="store_true", help="Reuse existing per-stage baseline JSONL when present")
+    parser.add_argument("--stale-index-arm", action="store_true", help="Also answer newly added questions with the previous stage index to measure staleness cost")
+    parser.add_argument("--staleness-max-samples", type=int, default=0, help="Cap delta questions per transition in the stale-index arm, 0=all newly added questions")
     return parser.parse_args()
 
 
@@ -99,7 +107,12 @@ def main() -> int:
     )
 
     sampling_dir = output_dir / "sampling"
-    nested = derive_nested_sample_sets(golden_set, stages=stages, output_dir=sampling_dir)
+    nested = derive_nested_sample_sets(
+        golden_set,
+        stages=stages,
+        output_dir=sampling_dir,
+        strata=[key.strip() for key in args.strata.split(",") if key.strip()],
+    )
 
     wiki_dir = _wiki_dir(adapter)
     resolver = HotpotQATitleResolver(wiki_dir)
@@ -147,11 +160,16 @@ def main() -> int:
         "corpus_snapshots": corpus_manifests,
         "stage_bindings_path": bindings_path,
         "table_paths": table_paths,
+        "stale_index_arm": bool(args.stale_index_arm),
+        "staleness_max_samples": int(args.staleness_max_samples),
         "baseline_runs": baseline_runs,
     }
     summary_path = output_dir / "dynamic_eval_manifest.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(json.dumps({"dynamic_eval_manifest": str(summary_path), "stage_bindings": bindings_path}, indent=2))
+    printed = {"dynamic_eval_manifest": str(summary_path), "stage_bindings": bindings_path}
+    if baseline_runs.get("staleness_summary"):
+        printed["staleness_summary"] = baseline_runs["staleness_summary"]
+    print(json.dumps(printed, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -191,11 +209,14 @@ async def _run_baselines_for_bindings(args, base_adapter, golden_set, bindings, 
     runs = {}
     dynamic_rows = []
     update_rows = []
+    staleness_rows = []
     previous_binding = None
     previous_baselines = {}
+    previous_sample_ids: list[str] = []
     for binding in bindings:
         stage_adapter = _StageAdapter(base_adapter, binding)
-        stage_samples = _select_sample_dicts(golden_set.samples, _load_sample_ids(binding.sample_ids_file))
+        stage_sample_ids = _load_sample_ids(binding.sample_ids_file)
+        stage_samples = _select_sample_dicts(golden_set.samples, stage_sample_ids)
         stage_golden = _StageGoldenSet(stage_samples, binding)
         baselines = [_baseline_by_name(spec, stage_adapter, args) for spec in baseline_specs]
         if previous_binding is not None and previous_baselines:
@@ -216,7 +237,11 @@ async def _run_baselines_for_bindings(args, base_adapter, golden_set, bindings, 
             output_dir=str(baseline_dir),
         )
         with _stage_environment(binding):
-            result_map = await suite.run(stage_golden, skip_existing=args.skip_existing)
+            result_map = await suite.run(
+                stage_golden,
+                skip_existing=args.skip_existing,
+                skip_cleanup=args.stale_index_arm,
+            )
         stage_records = {}
         for baseline in baselines:
             results = result_map.get(baseline.name, [])
@@ -226,15 +251,40 @@ async def _run_baselines_for_bindings(args, base_adapter, golden_set, bindings, 
             record_path.write_text(json.dumps(record_payload, indent=2, ensure_ascii=False), encoding="utf-8")
             stage_records[baseline.name] = str(record_path)
             dynamic_rows.append(_dynamic_result_row(binding, baseline, results))
-        previous_binding = binding
-        previous_baselines = {baseline.name: baseline for baseline in baselines}
-        runs[binding.stage_name] = {
+        stage_entry = {
             "output_dir": binding.output_dir,
             "corpus_checksum": binding.corpus_checksum,
             "sample_id_checksum": binding.sample_id_checksum,
             "stage_records": stage_records,
             "systems": {name: len(results) for name, results in result_map.items()},
         }
+        if args.stale_index_arm and previous_binding is not None and previous_baselines:
+            stale_rows, stale_records = await _run_staleness_arm(
+                args=args,
+                from_binding=previous_binding,
+                to_binding=binding,
+                previous_baselines=previous_baselines,
+                previous_sample_ids=previous_sample_ids,
+                current_sample_ids=stage_sample_ids,
+                golden_set=golden_set,
+                stage_adapter=stage_adapter,
+                fresh_results=result_map,
+            )
+            staleness_rows.extend(stale_rows)
+            if stale_records:
+                stage_entry["staleness_records"] = stale_records
+        if args.stale_index_arm and previous_baselines:
+            # Previous-stage instances were kept alive only to hold a stale index
+            # for the transition just measured; release them before advancing.
+            for baseline in previous_baselines.values():
+                await baseline.cleanup()
+        runs[binding.stage_name] = stage_entry
+        previous_binding = binding
+        previous_baselines = {baseline.name: baseline for baseline in baselines}
+        previous_sample_ids = stage_sample_ids
+    if args.stale_index_arm and previous_baselines:
+        for baseline in previous_baselines.values():
+            await baseline.cleanup()
     tables_dir = output_dir / "tables"
     generator = DynamicPaperTableGenerator()
     runs["tables"] = {}
@@ -242,19 +292,33 @@ async def _run_baselines_for_bindings(args, base_adapter, golden_set, bindings, 
     runs["tables"].update({f"lifecycle_{k}": v for k, v in generator.generate_lifecycle_main_table(dynamic_rows, tables_dir).items()})
     runs["tables"].update({f"budget_{k}": v for k, v in generator.generate_budget_quality_table(dynamic_rows, tables_dir).items()})
     runs["tables"].update({f"update_{k}": v for k, v in generator.generate_update_readiness_table(update_rows, tables_dir).items()})
+    if staleness_rows:
+        from evaluation.staleness import summarize_staleness_rows
+
+        runs["tables"].update({f"staleness_{k}": v for k, v in generator.generate_staleness_table(staleness_rows, tables_dir).items()})
+        runs["staleness_rows"] = staleness_rows
+        runs["staleness_summary"] = summarize_staleness_rows(staleness_rows)
     return runs
 
 
 class _StageGoldenSet:
-    def __init__(self, samples: list[dict], binding) -> None:
+    def __init__(
+        self,
+        samples: list[dict],
+        binding,
+        *,
+        stage_name: str = "",
+        sample_id_checksum: str = "",
+        frozen_order_checksum: str = "",
+    ) -> None:
         self.samples = samples
         self.n_questions = len(samples)
         self.seed = 0
-        self.sampling_protocol = {"method": "fixed_ids", "stage_name": binding.stage_name}
+        self.sampling_protocol = {"method": "fixed_ids", "stage_name": stage_name or binding.stage_name}
         self.sampling_manifest = {
             "sample_ids": [sample["sample_id"] for sample in samples],
-            "sample_id_checksum": binding.sample_id_checksum,
-            "frozen_order_checksum": binding.frozen_order_checksum,
+            "sample_id_checksum": sample_id_checksum or binding.sample_id_checksum,
+            "frozen_order_checksum": frozen_order_checksum or binding.frozen_order_checksum,
         }
 
     def sample_ids(self) -> list[str]:
@@ -533,6 +597,142 @@ async def _measure_transition_cost(from_binding, to_binding, baseline, to_stage_
             "sample_id_checksum": to_binding.sample_id_checksum,
             "frozen_order_checksum": to_binding.frozen_order_checksum,
         }
+
+
+async def _run_staleness_arm(
+    *,
+    args,
+    from_binding,
+    to_binding,
+    previous_baselines: dict,
+    previous_sample_ids: list[str],
+    current_sample_ids: list[str],
+    golden_set,
+    stage_adapter,
+    fresh_results: dict,
+) -> tuple[list[dict], dict]:
+    """Answer newly added questions with the previous stage index.
+
+    The arm isolates index staleness from every other variable: the questions are
+    exactly the ones added between the two stages, the corpus path already points
+    at the current snapshot, and ``skip_prepare`` keeps each system on the index
+    it built for the previous snapshot. Systems that retrieve from an internal
+    index therefore cannot reach the newly added evidence, while systems that
+    read the corpus at query time can.
+    """
+    from evaluation.suite import BaselineEvaluationSuite
+    from evaluation.staleness import build_staleness_row, compute_delta_sample_ids
+
+    delta_ids = compute_delta_sample_ids(previous_sample_ids, current_sample_ids)
+    if args.staleness_max_samples > 0:
+        delta_ids = delta_ids[: args.staleness_max_samples]
+    if not delta_ids:
+        return [], {}
+
+    delta_samples = _select_sample_dicts(golden_set.samples, delta_ids)
+    delta_checksum = compute_sample_id_checksum(delta_ids)
+    delta_golden = _StageGoldenSet(
+        delta_samples,
+        to_binding,
+        stage_name=f"{to_binding.stage_name}_stale_delta",
+        sample_id_checksum=delta_checksum,
+        frozen_order_checksum=compute_frozen_order_checksum(delta_ids),
+    )
+
+    baselines = list(previous_baselines.values())
+    stale_dir = Path(to_binding.output_dir) / "staleness"
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    suite = BaselineEvaluationSuite(
+        bm_adapter=stage_adapter,
+        baselines=baselines,
+        output_dir=str(stale_dir),
+        corpus_metadata={
+            "index_state": "stale",
+            "stale_index_prepared_on": from_binding.d_stage,
+            "query_corpus_stage": to_binding.d_stage,
+            "corpus_checksum": to_binding.corpus_checksum,
+        },
+    )
+    with _stage_environment(to_binding):
+        stale_map = await suite.run(
+            delta_golden,
+            skip_existing=False,
+            skip_prepare=True,
+            skip_cleanup=True,
+        )
+
+    delta_set = {str(sample_id) for sample_id in delta_ids}
+    records_dir = Path(to_binding.output_dir) / "stage_records"
+    records_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+    record_paths: dict = {}
+    for baseline in baselines:
+        stale_results = stale_map.get(baseline.name, []) or []
+        fresh_delta = [
+            result for result in (fresh_results.get(baseline.name, []) or [])
+            if str(getattr(result, "sample_id", "")) in delta_set
+        ]
+        mode = "measured" if stale_results else "no_stale_results"
+        row = build_staleness_row(
+            system_name=baseline.citation_name,
+            baseline_name=baseline.name,
+            from_stage=from_binding.stage_name,
+            to_stage=to_binding.stage_name,
+            delta_sample_ids=delta_ids,
+            fresh_results=fresh_delta,
+            stale_results=stale_results,
+            index_required=bool(_baseline_flag(baseline, "is_index_required", True)),
+            query_ready_immediately=bool(_baseline_flag(baseline, "is_query_ready_immediately", False)),
+            stale_index_setup_metrics=_safe_setup_metrics(baseline),
+            from_corpus_checksum=from_binding.corpus_checksum,
+            to_corpus_checksum=to_binding.corpus_checksum,
+            delta_sample_id_checksum=delta_checksum,
+            stale_arm_mode=mode,
+        )
+        rows.append(row)
+        record = StalenessEvaluationRecord(
+            transition=row["transition"],
+            from_stage=from_binding.stage_name,
+            to_stage=to_binding.stage_name,
+            system_name=baseline.citation_name,
+            baseline_name=baseline.name,
+            delta_sample_ids=list(delta_ids),
+            delta_sample_id_checksum=delta_checksum,
+            from_corpus_checksum=from_binding.corpus_checksum,
+            to_corpus_checksum=to_binding.corpus_checksum,
+            stale_index_prepared_on=from_binding.d_stage,
+            query_corpus_dir=to_binding.search_corpus_dir,
+            stale_arm_mode=mode,
+            fresh_results_path=str(Path(to_binding.output_dir) / "baselines" / f"baseline_{baseline.name}.jsonl"),
+            stale_results_path=str(stale_dir / f"baseline_{baseline.name}.jsonl"),
+            metrics=row,
+            metadata={"baseline_version": f"{baseline.__class__.__module__}.{baseline.__class__.__name__}"},
+        )
+        record_path = records_dir / f"{baseline.name}_staleness_record.json"
+        record_path.write_text(json.dumps(record.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+        record_paths[baseline.name] = str(record_path)
+    return rows, record_paths
+
+
+def _baseline_flag(baseline, method_name: str, default: bool) -> bool:
+    getter = getattr(baseline, method_name, None)
+    if not callable(getter):
+        return default
+    try:
+        return bool(getter())
+    except Exception:
+        return default
+
+
+def _safe_setup_metrics(baseline) -> dict:
+    getter = getattr(baseline, "collect_setup_metrics", None)
+    if not callable(getter):
+        return {}
+    try:
+        metrics = getter()
+    except Exception:
+        return {}
+    return metrics if isinstance(metrics, dict) else {}
 
 
 def _query_budget_of_result(result) -> dict:

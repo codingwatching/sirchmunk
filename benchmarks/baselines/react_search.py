@@ -16,6 +16,42 @@ from typing import Any, Dict, List, Optional
 from .base_adapter import BaselineAdapter, BaselinePrediction, BaselineSetupResult
 
 
+def _compact_search_history(history: Any, *, limit: int = 16, text_limit: int = 240) -> List[Dict[str, Any]]:
+    """Keep ReAct telemetry bounded while preserving query-budget counts."""
+    if not isinstance(history, list):
+        return []
+    compact: List[Dict[str, Any]] = []
+    for index, item in enumerate(history[:limit]):
+        if isinstance(item, dict):
+            compact.append({
+                "index": index,
+                "tool": str(item.get("tool") or item.get("tool_name") or "")[:80],
+                "summary": str(item.get("summary") or item.get("query") or item.get("arguments") or item)[:text_limit],
+            })
+        else:
+            compact.append({"index": index, "summary": str(item)[:text_limit]})
+    return compact
+
+
+def _compact_retrieval_logs(logs: Any, *, limit: int = 16) -> List[Dict[str, Any]]:
+    """Drop bulky retrieval payloads from ReAct JSONL artifacts."""
+    if not isinstance(logs, list):
+        return []
+    compact: List[Dict[str, Any]] = []
+    for index, log in enumerate(logs[:limit]):
+        data = log.to_dict() if hasattr(log, "to_dict") else log
+        if isinstance(data, dict):
+            compact.append({
+                "index": index,
+                "tool_name": str(data.get("tool_name") or data.get("tool") or "")[:80],
+                "tokens": int(data.get("tokens") or 0),
+                "timestamp": str(data.get("timestamp") or "")[:80],
+            })
+        else:
+            compact.append({"index": index, "summary": str(data)[:240]})
+    return compact
+
+
 class ReActSearchBaseline(BaselineAdapter):
     """Pure ReAct + retrieval tools baseline."""
 
@@ -133,6 +169,8 @@ class ReActSearchBaseline(BaselineAdapter):
         answer, ctx = await agent.run(query=question)
         elapsed = time.monotonic() - start
 
+        search_history = getattr(ctx, "search_history", [])
+        retrieval_logs = getattr(ctx, "retrieval_logs", [])
         return BaselinePrediction(
             answer=answer,
             elapsed=elapsed,
@@ -142,8 +180,10 @@ class ReActSearchBaseline(BaselineAdapter):
                 "tools": registry.tool_names,
                 "loop_count": getattr(ctx, "loop_count", 0),
                 "read_file_ids": sorted(getattr(ctx, "read_file_ids", set()) or []),
-                "search_history": getattr(ctx, "search_history", []),
-                "retrieval_logs": [log.to_dict() for log in getattr(ctx, "retrieval_logs", [])],
+                "search_history": _compact_search_history(search_history),
+                "search_history_count": len(search_history) if isinstance(search_history, list) else 0,
+                "retrieval_logs": _compact_retrieval_logs(retrieval_logs),
+                "retrieval_log_count": len(retrieval_logs) if isinstance(retrieval_logs, list) else 0,
                 "setup_metrics": self.collect_setup_metrics(),
             },
         )

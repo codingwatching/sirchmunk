@@ -66,6 +66,36 @@ class StageExecutionRecord:
         }
 
 
+@dataclass
+class StalenessEvaluationRecord:
+    """Audit record for one stale-index arm on one stage transition.
+
+    The record pins both corpus snapshots and the delta question set so a
+    reported staleness gap can be traced back to the exact index state and the
+    exact newly added questions that produced it.
+    """
+
+    transition: str
+    from_stage: str
+    to_stage: str
+    system_name: str
+    baseline_name: str
+    delta_sample_ids: List[str] = field(default_factory=list)
+    delta_sample_id_checksum: str = ""
+    from_corpus_checksum: str = ""
+    to_corpus_checksum: str = ""
+    stale_index_prepared_on: str = ""
+    query_corpus_dir: str = ""
+    stale_arm_mode: str = "measured"
+    fresh_results_path: str = ""
+    stale_results_path: str = ""
+    metrics: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 def build_stage_bindings(
     *,
     nested_sample_manifest: Dict[str, Any],
@@ -143,6 +173,7 @@ def load_json(path: str | Path) -> Dict[str, Any]:
 
 __all__ = [
     "StageExecutionRecord",
+    "StalenessEvaluationRecord",
     "DynamicStageBinding",
     "build_stage_bindings",
     "load_json",

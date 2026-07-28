@@ -63,6 +63,9 @@ class SystemEntry:
     source_grounding_accuracy: float = 0.0
     corpus_checksum: str = ""
     frozen_order_checksum: str = ""
+    corpus_provenance: str = ""
+    corpus_risk: str = ""
+    baseline_index_scope: str = ""
     by_question_type: Dict[str, Dict] = field(default_factory=dict)
     is_ours: bool = False
     is_published_only: bool = False   # True = 只有发表数字，无 CI
@@ -231,6 +234,9 @@ class PaperTableGenerator:
         corpus_metadata = self._sampling_metadata.get("corpus_snapshot", {}) if isinstance(self._sampling_metadata, dict) else {}
         result_corpus_checksum = _first_metric_value(ordered_results, "corpus_checksum")
         result_frozen_order_checksum = _first_metric_value(ordered_results, "frozen_order_checksum")
+        entry_corpus_provenance = str(self._sampling_metadata.get("corpus_provenance") or _first_metric_value(ordered_results, "corpus_provenance") or "")
+        entry_corpus_risk = str(self._sampling_metadata.get("corpus_risk") or _first_metric_value(ordered_results, "corpus_risk") or "")
+        entry_index_scope = str(_first_metric_value(ordered_results, "baseline_index_scope") or "")
         entry = SystemEntry(
             system_name=system_name,
             n=n,
@@ -253,6 +259,9 @@ class PaperTableGenerator:
             source_grounding_accuracy=round(sum(grounded_values) / n * 100, 1) if n else 0.0,
             corpus_checksum=str(result_corpus_checksum or corpus_metadata.get("corpus_checksum", "")),
             frozen_order_checksum=str(result_frozen_order_checksum or corpus_metadata.get("frozen_order_checksum", "")),
+            corpus_provenance=entry_corpus_provenance,
+            corpus_risk=entry_corpus_risk,
+            baseline_index_scope=entry_index_scope,
             by_question_type=by_qt_final,
             is_ours=bool(is_ours or (self._our_name and system_name == self._our_name)),
             is_published_only=False,
@@ -664,7 +673,8 @@ class PaperTableGenerator:
                     ]
                     breakdown_md += "| " + " | ".join([e.system_name] + vals) + " |\n"
 
-        return "\n".join(rows) + "\n" + footer + breakdown_md
+        corpus_warning = _corpus_warning_markdown(self._sampling_metadata)
+        return "\n".join(rows) + "\n" + footer + corpus_warning + breakdown_md
 
     # ------------------------------------------------------------------
     # JSON 输出
@@ -703,6 +713,9 @@ class PaperTableGenerator:
                     "sample_id_checksum": e.sample_id_checksum,
                     "frozen_order_checksum": e.frozen_order_checksum,
                     "corpus_checksum":    e.corpus_checksum,
+                    "corpus_provenance":  e.corpus_provenance,
+                    "corpus_risk":        e.corpus_risk,
+                    "baseline_index_scope": e.baseline_index_scope,
                     "sample_ids":         e.sample_ids,
                     "setup_metrics":      e.setup_metrics,
                     "query_budget_summary": e.query_budget_summary,
@@ -727,6 +740,17 @@ class PaperTableGenerator:
             ],
         }
         return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _corpus_warning_markdown(sampling_metadata: Dict[str, Any]) -> str:
+    provenance = str((sampling_metadata or {}).get("corpus_provenance") or "")
+    risk = str((sampling_metadata or {}).get("corpus_risk") or "")
+    if provenance == "sample":
+        return (
+            "\n> Warning: this table uses HotpotQA sample-context corpus "
+            f"(`corpus_risk={risk or 'oracle_sample_context'}`); treat results as smoke health-check metrics, not raw-corpus retrieval claims.\n"
+        )
+    return ""
 
 
 def _metadata_of(result: Any) -> Dict[str, Any]:

@@ -30,7 +30,7 @@ mock/smoke exploration
 | Mock/smoke | `run_benchmark.py smoke-tune` | Small exploration run, env check, report smoke, optional baseline comparison | No |
 | Freeze samples | `run_sampling.py create` | Create fixed stratified sample IDs and checksum | Sampling evidence only |
 | Assets | `run_benchmark.py assets` | Build/validate baseline preprocessing, indexing, storage, and lifecycle evidence | Setup/lifecycle evidence |
-| Dynamic G/D | `run_benchmark.py dynamic` | Build nested `G_n/D_n` sample/corpus bindings and optional dynamic baselines | Yes, if stage checks pass |
+| Dynamic G/D | `run_benchmark.py dynamic` | Build nested `G_n/D_n` sample/corpus bindings, optional dynamic baselines, and the optional stale-index arm | Yes, if stage checks pass |
 | Frozen main | `run_benchmark.py main` | Run or assemble Sirchmunk results, run main baselines, generate tables/reports | Yes, if gates pass |
 | Report/status | `run_benchmark.py report/status` | Regenerate reports and inspect gate state | Yes, if tied to frozen artifacts |
 | Optional appendix | `run_benchmark.py ablation` | Mechanism ablation | Appendix/ablation |
@@ -157,16 +157,32 @@ benchmarks/hotpotqa/output/exploration/quickstart_eval/paper_table.md
 
 `quickstart_ok=True` means the local pipeline is healthy. `paper_ready=False` is expected because exploration artifacts are deliberately blocked from paper claims.
 
+### Corpus Modes And Smoke Boundaries
+
+`smoke-tune` defaults to `--context-corpus-mode sample` for fast HotpotQA health checks. In this mode, each sampled HotpotQA parquet `context` is materialized into local `.txt` files, and sample mode forces `HOTPOT_REQUIRE_CONTEXT_ANSWERABLE=true`. This makes the smoke set intentionally closed and answerable.
+
+Treat sample-context scores as pipeline health metrics only. BM25, Naive RAG, BM25-RAG, and Hybrid-RAG build indexes over the evaluation-set sample contexts during baseline preparation, so their smoke rows carry `evaluation_set_context_index` risk. ReAct does not build the same global index, but it still searches gold-adjacent per-sample context and is therefore not raw-corpus evidence.
+
+Use these corpus modes deliberately:
+
+| Mode | Intended use | Paper-facing? |
+|---|---|---|
+| `sample` | Fast smoke/debug over answerable HotpotQA sample contexts | No; validator emits `sample_context_corpus` and `evaluation_set_context_index` errors |
+| `wiki` | Raw HotpotQA wiki corpus checks | Yes, if frozen samples, pairing, and gates pass |
+| `hybrid` | Diagnostic sample+wiki comparison | Not directly comparable to raw-corpus claims; validator emits a hybrid warning |
+
+Evaluation tables now record `corpus_provenance`, `corpus_risk`, and per-baseline `baseline_index_scope`. A sample-context Markdown table also prints an explicit warning. For paper-facing runs, prefer raw wiki or dynamic `G_n/D_n` snapshots and require the academic validator to have no error-level corpus issue.
+
 ## Step 2: Freeze The Sample IDs
 
-After smoke passes, freeze the evaluation set. For HotpotQA fullwiki, the recommended main sampled protocol is stratified `n=2000` over `type` and `supporting_fact_bucket`, with the default validation population size of 7,405.
+After smoke passes, freeze the evaluation set. For HotpotQA fullwiki, the recommended main sampled protocol is stratified `n=500` over `type` and `supporting_fact_bucket`, with the default validation population size of 7,405. `n=500` is the recommended maximum: it already reproduces the population strata proportions to within 0.11 percentage points while keeping query cost tractable for every baseline.
 
 ```bash
 python benchmarks/run_sampling.py create \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --method stratified \
-  --target-n 2000 \
+  --target-n 500 \
   --seed 42 \
   --strata type,supporting_fact_bucket \
   --allocation proportional \
@@ -178,28 +194,29 @@ python benchmarks/run_sampling.py create \
 Use the generated sample ID file in all frozen runs:
 
 ```text
-benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_2000_sample_ids.json
+benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_500_sample_ids.json
 ```
 
 Validate the manifest before running expensive systems:
 
 ```bash
 python benchmarks/run_sampling.py validate \
-  --manifest benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_2000_manifest.json
+  --manifest benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_500_manifest.json
 ```
 
 Never replace this with an ad hoc `--limit` for paper-facing claims. A sampled result is valid only as a paired comparison when every system uses the same sample IDs and checksum.
 
 ## Step 3: Build Baseline Assets
 
-The assets stage records lifecycle evidence: preprocessing, indexing, storage, feasibility, structured failures, and Sirchmunk’s no-index row. It is separate from warm-query accuracy.
+The assets stage records lifecycle evidence: preprocessing, indexing, storage, feasibility, structured failures, and Sirchmunk’s no-index row. It is a frozen preflight for lifecycle evidence and is separate from Step 4 warm-query accuracy.
 
-Build the current locally supported asset set:
+Run this frozen asset preflight before the final main experiment:
 
 ```bash
 python benchmarks/run_benchmark.py assets \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --output-dir benchmarks/hotpotqa/output \
   --methods bm25,bm25_rag,naive_rag,react \
   --limit 20 \
   --seed 42 \
@@ -215,6 +232,26 @@ python benchmarks/run_benchmark.py assets \
   --stage frozen \
   --strict
 ```
+
+Use this command as the default Step 3 for the final experiment. `--limit 20` loads a small `golden_like` sample set only for baseline path inference and `baseline.prepare()` preflight; it is not the final evaluation size. The final Step 4 sample size is controlled by the frozen sample ID file from Step 2, normally `n=500` for the HotpotQA sampled main protocol.
+
+Parameter notes for the final path:
+
+| Parameter | Final command value | Why it is set this way |
+|---|---|---|
+| `--output-dir` | `benchmarks/hotpotqa/output` | Keeps assets, main runs, evaluation tables, and reports under the same benchmark output root |
+| `--methods` | `bm25,bm25_rag,naive_rag,react` | Builds currently supported lifecycle asset rows plus Sirchmunk’s no-index row |
+| `--limit` | `20` | Fast frozen asset preflight; do not change it to `500` just to match Step 4 |
+| `--corpus-scale` | `fullwiki` | Records the asset evidence as HotpotQA fullwiki-facing |
+| `--build-timeout` | `86400` | Enforces a 24h wall-clock timeout per baseline asset build |
+| `--max-disk-bytes` | `500000000000` | Records a 500GB disk budget for fullwiki asset feasibility |
+| `--max-ram-bytes`, `--max-llm-tokens`, `--max-api-cost-usd` | `0` | No explicit ceiling in this command; set positive values only for constrained runs |
+| `--retry-count` | `0` | Keeps failure classification reproducible |
+| `--stage frozen`, `--strict` | enabled | Required for paper-facing asset evidence; strict exits non-zero on blocked/failed assets |
+
+In raw wiki mode, the small `--limit` usually resolves to the same fullwiki corpus directory, so index scale is mainly controlled by `--corpus-scale` and the file caps. In sample or hybrid corpus modes, `--limit` changes the number of materialized sample-context paths and therefore changes the asset input scale.
+
+Do not pass the Step 3 registry to Step 4 by default. The final Step 4 command below uses `bm25_rag,hybrid_rag,react`, while this assets facade currently builds registry rows for `bm25,bm25_rag,naive_rag,react`. Attach `--asset-registry` to Step 4 only after you have a registry with ready records for every exact method in Step 4.
 
 Inspect the registry:
 
@@ -240,16 +277,18 @@ Failed baseline assets remain visible with structured reasons such as `timeout`,
 
 ## Step 4: Run The Frozen Main Experiment
 
-The frozen main stage uses fixed IDs and frozen settings. You can either run Sirchmunk inside the control layer or pass an existing Sirchmunk predictions JSONL.
+The final frozen main command uses fixed sample IDs, cold cache, strict gates, and the core paper-main online baseline set: `bm25_rag,hybrid_rag,react`.
 
-Run Sirchmunk and the complete current paper-main baseline set:
+Run Sirchmunk and the final core paper-main baselines:
 
 ```bash
 python benchmarks/run_benchmark.py main \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --output-dir benchmarks/hotpotqa/output \
   --run-sirchmunk \
-  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_2000_sample_ids.json \
+  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_500_sample_ids.json \
+  --expected-population-size 7405 \
   --baselines bm25_rag,hybrid_rag,react \
   --cache-mode cold \
   --baseline-sample-timeout 0 \
@@ -263,15 +302,17 @@ python benchmarks/run_benchmark.py main \
   --strict
 ```
 
-Or assemble a frozen main run from existing Sirchmunk predictions:
+If Sirchmunk predictions already exist, assemble the same frozen main table without rerunning Sirchmunk:
 
 ```bash
 python benchmarks/run_benchmark.py main \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --output-dir benchmarks/hotpotqa/output \
   --sirchmunk-results benchmarks/hotpotqa/output/main/runs/<run_id>/results/predictions.jsonl \
   --run-artifact-dir benchmarks/hotpotqa/output/main/runs/<run_id> \
-  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_2000_sample_ids.json \
+  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_500_sample_ids.json \
+  --expected-population-size 7405 \
   --baselines bm25_rag,hybrid_rag,react \
   --cache-mode cold \
   --baseline-sample-timeout 0 \
@@ -285,7 +326,7 @@ python benchmarks/run_benchmark.py main \
   --strict
 ```
 
-If you enable `--asset-registry`, the frozen asset gate expects reusable asset records for every method declared by `--baselines`. Only attach it when the registry is complete for that list.
+Related-work imports such as `lightrag_v1` or `graphrag` are not part of this directly executable core command because they require precomputed prediction/setup files. Add them in a separate assembly run only after those files exist, or use direct `run_evaluation.py` for non-default SDK LightRAG options.
 
 Main outputs:
 
@@ -335,7 +376,7 @@ Frozen paper runs are checked by Gate 0-5:
 | Gate 2 | Sampling | fixed sample IDs, GoldenSet, sampling protocol, checksum |
 | Gate 3 | Frozen run | `stage=frozen`, deterministic cache, valid protocol |
 | Gate 4 | Evaluation | sample count, systems, baseline comparison completeness |
-| Gate 5 | Report | academic validator, table/sample pairing, provenance |
+| Gate 5 | Report | academic validator, table/sample pairing, corpus provenance/risk |
 
 Frozen paper runs must satisfy:
 
@@ -346,8 +387,12 @@ eval feedback disabled
 memory updates disabled
 sample_id_checksum recorded
 all non-published systems use the same sample IDs
+corpus_provenance is not sample for paper-facing tables
+baseline_index_scope is not evaluation_set_sample_context
 validator has no error-level issue
 ```
+
+The academic validator treats corpus boundary violations as blocking issues. `sample_context_corpus` means the table used answerable HotpotQA sample contexts rather than the raw corpus. `evaluation_set_context_index` means at least one baseline indexed the evaluation-set sample context. `hybrid_context_corpus` is a warning that sample+wiki results need separate claim wording and should not be compared directly with raw-corpus rows.
 
 <details>
 <summary>Optional: Ablation</summary>
@@ -358,7 +403,7 @@ Create frozen LENS/Sirchmunk mechanism variants:
 python benchmarks/run_benchmark.py ablation \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
-  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_2000_sample_ids.json \
+  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_500_sample_ids.json \
   --cache-mode cold \
   --max-combinations 16 \
   --replace
@@ -370,7 +415,7 @@ Run queued variants immediately:
 python benchmarks/run_benchmark.py ablation \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
-  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_2000_sample_ids.json \
+  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_500_sample_ids.json \
   --cache-mode cold \
   --max-combinations 16 \
   --run \
@@ -435,9 +480,9 @@ Run the default LightRAG lifecycle mode through the dynamic task:
 python benchmarks/run_benchmark.py dynamic \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
-  --golden-n 2000 \
+  --golden-n 500 \
   --seed 42 \
-  --stages 500,1000,2000 \
+  --stages 125,250,500 \
   --strata type,supporting_fact_bucket \
   --materialize symlink \
   --background-ratio 3.0 \
@@ -455,9 +500,9 @@ Run all LightRAG query modes for appendix sensitivity:
 python benchmarks/run_benchmark.py dynamic \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
-  --golden-n 2000 \
+  --golden-n 500 \
   --seed 42 \
-  --stages 500,1000,2000 \
+  --stages 125,250,500 \
   --strata type,supporting_fact_bucket \
   --materialize symlink \
   --background-ratio 3.0 \
@@ -480,6 +525,65 @@ benchmarks/hotpotqa/output/dynamic_eval/tables/update_readiness.*
 benchmarks/hotpotqa/output/dynamic_eval/tables/snapshot_audit.*
 ```
 
+### Stale-index arm
+
+`update_readiness` records whether a system *declares* that it needs a rebuild. It does not show what that requirement costs in answer quality. Add `--stale-index-arm` to measure the cost directly:
+
+```bash
+python benchmarks/run_benchmark.py dynamic \
+  --benchmark hotpotqa \
+  --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
+  --golden-n 500 \
+  --seed 42 \
+  --stages 125,250,500 \
+  --strata type,supporting_fact_bucket \
+  --materialize symlink \
+  --run-baselines \
+  --baselines bm25_rag,hybrid_rag,react \
+  --stale-index-arm \
+  --staleness-max-samples 200
+```
+
+For each transition `D_{n-1} -> D_n` the arm compares two runs over exactly the newly added questions (`delta = G_n \ G_{n-1}`), whose supporting evidence articles only exist in `D_n`:
+
+| Arm | Index built on | Corpus queried | Meaning |
+|---|---|---|---|
+| fresh | `D_n` | `D_n` | rebuild already paid |
+| stale | `D_{n-1}` | `D_n` | corpus grew, index not rebuilt |
+
+The stale arm reuses the previous stage's system instance and skips its preparation step, so index-heavy systems answer from an index that cannot reach the new evidence, while index-free systems read the current corpus at query time. Expected reading:
+
+| System class | Members | Expected `Ev.Rec Gap` |
+|---|---|---|
+| `index_dependent` | `bm25_rag`, `hybrid_rag`, `lightrag_v136*` | positive |
+| `index_free` | `react`, `lens_full`, `lens_no_prior`, `lens_no_seq` | near zero |
+
+The near-zero row is a measured control result, not an assumption, which is why the arm runs for every requested system including LENS itself. Use `--staleness-max-samples` to cap delta questions per transition when query budget is limited.
+
+Additional outputs:
+
+```text
+benchmarks/hotpotqa/output/dynamic_eval/tables/stale_index_quality.*
+benchmarks/hotpotqa/output/dynamic_eval/runs/<stage>/staleness/baseline_<name>.jsonl
+benchmarks/hotpotqa/output/dynamic_eval/runs/<stage>/stage_records/<name>_staleness_record.json
+```
+
+Each staleness record pins `from_corpus_checksum`, `to_corpus_checksum`, `delta_sample_id_checksum`, and `stale_index_prepared_on`, so a reported gap is traceable to one index state and one delta question set. `dynamic_eval_manifest.json` carries `stale_index_arm` and a `staleness_summary` aggregated by system class.
+
+### Nested stage sampling fidelity
+
+A stratified parent set only guarantees proportional strata at its own size. Cutting prefixes out of a randomly shuffled parent order turns each smaller stage into a simple random subsample, which drifts from the population and can drop rare strata entirely. Nested stages are therefore derived with a stratum-balanced order: each stratum's members are spread evenly across the sequence, so every stage stays proportional while remaining a strict subset of the next one.
+
+Measured on the HotpotQA fullwiki validation population (7,405 questions, 8 strata from `type` x `supporting_fact_bucket`, rarest stratum 0.32%):
+
+| Stage | Prefix of shuffled parent | Stratum-balanced order |
+|---|---|---|
+| `G_125` | 7.30pp drift, 2 strata empty | 0.70pp drift, 0 empty |
+| `G_250` | 2.90pp drift, 1 stratum empty | 0.30pp drift, 0 empty |
+| `G_500` | 0.11pp drift, 0 empty | 0.11pp drift, 0 empty |
+
+Every stage records `strata_distribution`, `proportion_delta_by_stratum`, `max_abs_proportion_delta`, and `empty_strata` in `nested_sample_manifest.json` and in its own sample-ids file, with `reference_scope` naming what the stage was compared against (`population` when the parent manifest recorded the population distribution). The academic validator warns above 5pp drift, so these values are directly checkable rather than assumed. Pass `balance_strata=False` to `derive_nested_sample_sets` only when an older parent-order artifact must be reproduced exactly.
+
 </details>
 
 <details>
@@ -493,7 +597,7 @@ Prefer `run_benchmark.py` for normal workflows. Use direct scripts when debuggin
 | `run_sampling.py` | Freeze samples | Create/validate explicit sampling artifacts |
 | `run_baseline_assets.py` | `assets` | Debug asset registry and lifecycle records |
 | `run_evaluation.py` | `main` | Manual table assembly or non-default evaluation flags |
-| `run_dynamic_evaluation.py` | `dynamic` | Debug `G_n/D_n` snapshots and dynamic baselines |
+| `run_dynamic_evaluation.py` | `dynamic` | Debug `G_n/D_n` snapshots, dynamic baselines, and the stale-index arm |
 | `run_report.py` | `report` | Manual report regeneration |
 | `run_queue.py` | `queue` | Low-level queue debugging |
 | `run_research_loop.py` | Exploration | Badcase tuning and dry-run analysis |
@@ -505,7 +609,7 @@ python benchmarks/run_evaluation.py \
   --benchmark hotpotqa \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --sirchmunk-results benchmarks/hotpotqa/output/main/runs/<run_id>/results/predictions.jsonl \
-  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_2000_sample_ids.json \
+  --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sampling_stratified_42_500_sample_ids.json \
   --baselines bm25_rag,hybrid_rag,react \
   --import-baseline "External System=output/external_predictions.jsonl" \
   --import-baseline-setup "External System=output/external_setup_metrics.json" \
@@ -527,10 +631,12 @@ python benchmarks/run_evaluation.py \
   --baseline-max-api-cost-usd 0 \
   --baseline-max-disk-bytes 0 \
   --baseline-min-free-disk-bytes 0 \
+  --context-corpus-provenance wiki \
+  --context-corpus-risk raw_wiki \
   --generate-report
 ```
 
-Use direct-script outputs as inputs to unified tasks only when they preserve stage, sample IDs, checksum, config hash, and manifest provenance.
+Use direct-script outputs as inputs to unified tasks only when they preserve stage, sample IDs, checksum, config hash, manifest provenance, and corpus provenance/risk.
 
 </details>
 
@@ -572,7 +678,7 @@ python benchmarks/run_benchmark.py smoke-tune \
 
 - `paper_ready=false`: inspect `benchmarks/hotpotqa/output/main/main_summary.json` and `benchmarks/hotpotqa/output/main/report/validation.json`.
 - `Gate 1` fails: attach `--asset-registry` only when it contains ready reusable records for every frozen `--baselines` method, or rebuild matching assets first.
-- `Gate 2` fails: pass the frozen `sampling_stratified_42_2000_sample_ids.json`, a sampling protocol, or a valid GoldenSet manifest.
+- `Gate 2` fails: pass the frozen `sampling_stratified_42_500_sample_ids.json`, a sampling protocol, or a valid GoldenSet manifest.
 - `Gate 3` fails: verify `stage=frozen`, `cache-mode cold|compiled`, and disabled eval feedback/memory updates.
 - `Gate 5` fails: regenerate the report with `run_benchmark.py report` and inspect validator errors.
 - Env file missing: create the private profile from examples and keep secrets in ignored files.

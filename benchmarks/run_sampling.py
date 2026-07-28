@@ -11,12 +11,12 @@ Examples::
       --benchmark hotpotqa \
       --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
       --method stratified \
-      --target-n 2000 \
+      --target-n 500 \
       --seed 42 \
       --strata type,supporting_fact_bucket
 
     python benchmarks/run_sampling.py validate \
-      --manifest benchmarks/hotpotqa/sampling_manifest_stratified_42_2000.json
+      --manifest benchmarks/hotpotqa/sampling_manifest_stratified_42_500.json
 """
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def _parse_args() -> argparse.Namespace:
     create = sub.add_parser("create", help="Create a sampled GoldenSet and sampling manifest")
     _add_common_benchmark_args(create)
     create.add_argument("--method", default="stratified", choices=["simple_random", "stratified", "full", "diagnostic_rare", "fixed_ids"])
-    create.add_argument("--target-n", type=int, default=2000, dest="target_n")
+    create.add_argument("--target-n", type=int, default=500, dest="target_n")
     create.add_argument("--seed", type=int, default=42)
     create.add_argument("--strata", default=",".join(DEFAULT_HOTPOTQA_STRATA))
     create.add_argument("--allocation", default="proportional", choices=["proportional", "equal", "uniform"])

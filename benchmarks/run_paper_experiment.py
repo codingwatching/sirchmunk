@@ -26,6 +26,7 @@ for _p in (str(_SCRIPT_DIR), str(_SRC)):
         sys.path.insert(0, _p)
 
 from evaluation.report_generator import ReportGenerator  # noqa: E402
+from evaluation.sampling_protocol import write_sample_ids  # noqa: E402
 from framework.asset_registry import AssetRegistry  # noqa: E402
 from framework.control_gates import evaluate_control_gates, failed_gate_names  # noqa: E402
 from framework.control_phase import ControlBlock, ExperimentStage, for_benchmark_output_dir  # noqa: E402
@@ -91,7 +92,7 @@ def _add_common_main_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
     parser.add_argument("--sampling-method", default="stratified", choices=["simple_random", "stratified", "full", "diagnostic_rare", "fixed_ids"])
-    parser.add_argument("--golden-n", type=int, default=2000)
+    parser.add_argument("--golden-n", type=int, default=500)
     parser.add_argument("--strata", default="type,supporting_fact_bucket")
     parser.add_argument("--sample-ids-file", default="")
     parser.add_argument("--sampling-protocol", default="")
@@ -201,6 +202,18 @@ async def _main_experiment(args: argparse.Namespace) -> int:
     elif not args.create_golden_only and not args.table_only:
         logger.error("main requires --sirchmunk-results, --run-sirchmunk, --table-only, or --create-golden-only")
         return 1
+
+    if sirchmunk_results and not args.sample_ids_file and not args.sampling_protocol:
+        args.sample_ids_file = _write_sample_ids_from_results(
+            sirchmunk_results,
+            layout.main_sampling_dir / f"{run_id}_actual_sample_ids.json",
+            run_id=run_id,
+        )
+        config = _control_config(args, output_base=output_base, run_id=run_id)
+        validation = validate_control_config(config)
+        if not validation.ok:
+            print(json.dumps({"validation": validation.to_dict()}, indent=2, ensure_ascii=False))
+            return 1
 
     eval_result = _run_evaluation(args, env_file, layout, sirchmunk_results, run_artifact_dir)
     table_json = layout.main_evaluation_dir / "paper_table.json"
@@ -567,6 +580,28 @@ def _run_cmd(cmd: List[str]) -> int:
     logger.info("Running: %s", " ".join(cmd))
     result = subprocess.run(cmd, text=True, check=False)
     return int(result.returncode)
+
+
+def _write_sample_ids_from_results(results_path: Path, output_path: Path, *, run_id: str) -> str:
+    sample_ids: List[str] = []
+    with Path(results_path).open(encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            sample_id = row.get("sample_id") or row.get("hotpot_id") or row.get("id")
+            if sample_id:
+                sample_ids.append(str(sample_id))
+    if not sample_ids:
+        raise ValueError(f"No sample IDs found in {results_path}")
+    write_sample_ids(
+        output_path,
+        sample_ids,
+        metadata={"source_results": str(Path(results_path).resolve()), "run_id": run_id},
+    )
+    logger.info("Persisted %d actual sample IDs for evaluation: %s", len(sample_ids), output_path)
+    return str(output_path.resolve())
 
 
 def _infer_run_dir_from_results(results_path: Path) -> Optional[Path]:

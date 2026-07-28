@@ -24,6 +24,22 @@ class DynamicPaperTableGenerator:
         normalized = [_update_row(row) for row in rows]
         return _write_table_set(output_dir, "update_readiness", headers, normalized)
 
+    def generate_staleness_table(self, rows: Iterable[Dict[str, Any]], output_dir: str | Path) -> Dict[str, str]:
+        """Quality cost of answering newly added questions with a stale index.
+
+        Positive gaps mean the stale index lost quality on the delta questions.
+        Index-free systems are expected to stay near zero, which makes their row
+        the control arm rather than a claim.
+        """
+        headers = [
+            "System", "Transition", "Delta N",
+            "Fresh EM", "Stale EM", "EM Gap",
+            "Fresh Ev.Rec", "Stale Ev.Rec", "Ev.Rec Gap",
+            "Expectation",
+        ]
+        normalized = [_staleness_row(row) for row in rows]
+        return _write_table_set(output_dir, "stale_index_quality", headers, normalized)
+
     def generate_lifecycle_main_table(self, rows: Iterable[Dict[str, Any]], output_dir: str | Path) -> Dict[str, str]:
         headers = ["System", "G/D Stage", "Setup", "Index", "Storage", "Rebuild", "Query-ready", "C_avg@100"]
         normalized = [_lifecycle_row(row) for row in rows]
@@ -89,6 +105,34 @@ def _lifecycle_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "sample_id_checksum": row.get("sample_id_checksum", ""),
         "frozen_order_checksum": row.get("frozen_order_checksum", ""),
         "corpus_checksum": row.get("corpus_checksum", ""),
+    }
+
+
+def _staleness_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "System": row.get("system_name") or row.get("baseline_name") or "",
+        "Transition": row.get("transition", ""),
+        "Delta N": row.get("delta_sample_count", ""),
+        "Fresh EM": row.get("fresh_official_em", ""),
+        "Stale EM": row.get("stale_official_em", ""),
+        "EM Gap": row.get("official_em_gap", ""),
+        "Fresh Ev.Rec": row.get("fresh_evidence_recall", ""),
+        "Stale Ev.Rec": row.get("stale_evidence_recall", ""),
+        "Ev.Rec Gap": row.get("evidence_recall_gap", ""),
+        "Expectation": row.get("staleness_expectation", ""),
+        "stale_arm_mode": row.get("stale_arm_mode", ""),
+        "index_required": row.get("index_required", ""),
+        "query_ready_immediately": row.get("query_ready_immediately", ""),
+        "stale_index_indexed_documents": row.get("stale_index_indexed_documents", ""),
+        "fresh_official_f1": row.get("fresh_official_f1", ""),
+        "stale_official_f1": row.get("stale_official_f1", ""),
+        "official_f1_gap": row.get("official_f1_gap", ""),
+        "judge_accuracy_gap": row.get("judge_accuracy_gap", ""),
+        "stale_failure_rate": row.get("stale_failure_rate", ""),
+        "from_corpus_checksum": row.get("from_corpus_checksum", ""),
+        "to_corpus_checksum": row.get("to_corpus_checksum", ""),
+        "delta_sample_id_checksum": row.get("delta_sample_id_checksum", ""),
+        "failure_message": row.get("failure_message", ""),
     }
 
 

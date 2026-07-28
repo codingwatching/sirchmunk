@@ -78,6 +78,7 @@ class BaselineEvaluationSuite:
         output_dir: str,
         max_concurrent: int = 3,             # 系统级并发（同时评估几个竞品）
         guard_config: Optional[GuardConfig | Dict[str, Any]] = None,
+        corpus_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Args:
@@ -93,17 +94,25 @@ class BaselineEvaluationSuite:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._max_concurrent = max_concurrent
         self._guard_config = _coerce_guard_config(guard_config)
+        self._corpus_metadata = dict(corpus_metadata or {})
 
     async def run(
         self,
         golden_set,                          # GoldenSet
         skip_existing: bool = True,
+        *,
+        skip_prepare: bool = False,
+        skip_cleanup: bool = False,
     ) -> Dict[str, List[BaselineResult]]:
         """对 golden_set 中的所有样本，逐个系统进行评估。
 
         Args:
             golden_set:    GoldenSet 实例，含所有要评估的样本。
             skip_existing: 若某系统的结果 JSONL 已存在，跳过该系统（断点续算）。
+            skip_prepare:  复用 baseline 当前已有的索引状态，不再调用 prepare()。
+                           stale-index 对照臂依赖此选项保留上一个语料快照的索引。
+            skip_cleanup:  评估结束后不释放 baseline 资源，便于后续 stage 复用其
+                           索引状态（持久化索引的竞品在 cleanup 后可能无法再查询）。
 
         Returns:
             {system_name: [BaselineResult, ...]}
@@ -136,7 +145,7 @@ class BaselineEvaluationSuite:
             async with semaphore:
                 out_path = self._output_dir / f"baseline_{baseline.name}.jsonl"
                 if skip_existing and out_path.exists():
-                    can_reuse, reason = _can_reuse_baseline_cache(out_path, baseline)
+                    can_reuse, reason = _can_reuse_baseline_cache(out_path, baseline, golden_set)
                     if can_reuse:
                         logger.info("[Suite] '%s' already done, loading from %s",
                                     baseline.name, out_path)
@@ -151,18 +160,25 @@ class BaselineEvaluationSuite:
 
                 logger.info("[Suite] Evaluating '%s' (%d samples)...",
                             baseline.citation_name, len(golden_set.samples))
-                setup = await baseline.prepare(golden_set=golden_set, bm_adapter=self._bm_adapter)
-                logger.info(
-                    "[Suite] '%s' setup: %.2fs, docs=%d, storage=%d bytes",
-                    baseline.citation_name,
-                    setup.setup_seconds,
-                    setup.indexed_documents,
-                    setup.storage_bytes,
-                )
+                if skip_prepare:
+                    logger.info(
+                        "[Suite] '%s' reusing existing index state; prepare() skipped",
+                        baseline.citation_name,
+                    )
+                else:
+                    setup = await baseline.prepare(golden_set=golden_set, bm_adapter=self._bm_adapter)
+                    logger.info(
+                        "[Suite] '%s' setup: %.2fs, docs=%d, storage=%d bytes",
+                        baseline.citation_name,
+                        setup.setup_seconds,
+                        setup.indexed_documents,
+                        setup.storage_bytes,
+                    )
                 try:
                     results = await self._eval_baseline(baseline, golden_set, judge, str(out_path))
                 finally:
-                    await baseline.cleanup()
+                    if not skip_cleanup:
+                        await baseline.cleanup()
                 all_results[baseline.name] = results
                 logger.info("[Suite] '%s' done: acc=%.1f%%",
                             baseline.citation_name,
@@ -225,9 +241,11 @@ class BaselineEvaluationSuite:
                     context_paths = []
 
                 setup_metrics = baseline.collect_setup_metrics()
+                corpus_metadata = _baseline_corpus_metadata(self._corpus_metadata, setup_metrics)
                 baseline_identity = _baseline_cache_identity(baseline)
                 base_metadata: Dict[str, Any] = {
                     **baseline.extra_metadata(),
+                    **corpus_metadata,
                     "baseline_cache_identity": baseline_identity,
                     "setup_metrics": setup_metrics,
                 }
@@ -237,6 +255,7 @@ class BaselineEvaluationSuite:
                     "result_schema_version": baseline_identity["result_schema_version"],
                     "adapter_class": baseline_identity["adapter_class"],
                     "config_hash": baseline_identity["config_hash"],
+                    **corpus_metadata,
                 }
                 prediction_obj = None
                 prediction_text = ""
@@ -474,6 +493,27 @@ class BaselineEvaluationSuite:
                     pass
         return results
 
+
+def _baseline_corpus_metadata(corpus_metadata: Dict[str, Any], setup_metrics: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = dict(corpus_metadata or {})
+    provenance = str(metadata.get("corpus_provenance") or "")
+    risk = str(metadata.get("corpus_risk") or "")
+    try:
+        indexed_documents = int(setup_metrics.get("indexed_documents") or 0)
+    except (TypeError, ValueError):
+        indexed_documents = 0
+    index_required = bool(setup_metrics.get("index_required")) or indexed_documents > 0
+    if provenance == "sample" and index_required:
+        extra = "evaluation_set_context_index"
+        risks = {part.strip() for part in risk.split(",") if part.strip()}
+        risks.add(extra)
+        metadata["corpus_risk"] = ",".join(sorted(risks))
+        metadata["baseline_index_scope"] = "evaluation_set_sample_context"
+    elif provenance == "sample":
+        metadata.setdefault("baseline_index_scope", "per_sample_oracle_context")
+    return metadata
+
+
 def _baseline_cache_identity(baseline: BaselineAdapter) -> Dict[str, Any]:
     identity_fn = getattr(baseline, "cache_identity", None)
     if callable(identity_fn):
@@ -495,7 +535,7 @@ def _baseline_cache_identity(baseline: BaselineAdapter) -> Dict[str, Any]:
     }
 
 
-def _can_reuse_baseline_cache(path: Path, baseline: BaselineAdapter) -> tuple[bool, str]:
+def _can_reuse_baseline_cache(path: Path, baseline: BaselineAdapter, golden_set: Any = None) -> tuple[bool, str]:
     first = _read_first_jsonl_record(path)
     if not first:
         return False, "empty_or_unreadable_jsonl"
@@ -513,7 +553,63 @@ def _can_reuse_baseline_cache(path: Path, baseline: BaselineAdapter) -> tuple[bo
         actual_value = str(actual.get(key, ""))
         if actual_value != str(expected_value):
             return False, f"{key}_mismatch(actual={actual_value!r}, expected={expected_value!r})"
+    expected_ids = _expected_sample_ids(golden_set)
+    if expected_ids:
+        observed_ids, malformed = _read_jsonl_sample_ids(path)
+        if malformed:
+            return False, f"malformed_jsonl_records={malformed}"
+        if len(observed_ids) != len(expected_ids):
+            return False, f"row_count_mismatch(actual={len(observed_ids)}, expected={len(expected_ids)})"
+        duplicate_count = len(observed_ids) - len(set(observed_ids))
+        if duplicate_count:
+            return False, f"duplicate_sample_ids={duplicate_count}"
+        expected_set = set(expected_ids)
+        observed_set = set(observed_ids)
+        if expected_set != observed_set:
+            missing = sorted(expected_set - observed_set)[:5]
+            extra = sorted(observed_set - expected_set)[:5]
+            return False, f"sample_ids_mismatch(missing={missing}, extra={extra})"
     return True, "ok"
+
+
+
+def _expected_sample_ids(golden_set: Any = None) -> List[str]:
+    if golden_set is None:
+        return []
+    sample_ids_fn = getattr(golden_set, "sample_ids", None)
+    if callable(sample_ids_fn):
+        try:
+            return [str(sample_id) for sample_id in sample_ids_fn()]
+        except Exception:
+            return []
+    ids: List[str] = []
+    for sample in getattr(golden_set, "samples", []) or []:
+        if isinstance(sample, dict) and sample.get("sample_id"):
+            ids.append(str(sample["sample_id"]))
+    return ids
+
+
+def _read_jsonl_sample_ids(path: Path) -> tuple[List[str], int]:
+    ids: List[str] = []
+    malformed = 0
+    try:
+        with path.open(encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    malformed += 1
+                    continue
+                if isinstance(row, dict) and row.get("sample_id"):
+                    ids.append(str(row["sample_id"]))
+                else:
+                    malformed += 1
+    except OSError:
+        return ids, malformed + 1
+    return ids, malformed
 
 
 def _read_first_jsonl_record(path: Path) -> Optional[Dict[str, Any]]:

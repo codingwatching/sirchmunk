@@ -239,6 +239,34 @@ def compute_sample_id_checksum(sample_ids: Iterable[str]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
+def stratum_key_for(sample: Any, strata: Sequence[str]) -> str:
+    """Return the stratum key of one sample for the given strata keys."""
+    return _stratum_key(_sample_to_dict(sample), strata)
+
+
+def stratum_distribution_for(samples: Sequence[Any], strata: Sequence[str]) -> Dict[str, int]:
+    """Return stratum counts for a sample set, using the same keys as manifests."""
+    return _stratum_distribution([_sample_to_dict(sample) for sample in samples], strata)
+
+
+def proportion_deltas(
+    stage_counts: Dict[str, int],
+    reference_counts: Dict[str, int],
+) -> Dict[str, float]:
+    """Per-stratum proportion difference between a stage and a reference set.
+
+    Positive values mean the stage over-represents that stratum. Keys come from
+    the reference so a stratum missing from the stage is reported rather than
+    silently dropped.
+    """
+    stage_total = sum(stage_counts.values()) or 1
+    reference_total = sum(reference_counts.values()) or 1
+    return {
+        key: round(stage_counts.get(key, 0) / stage_total - value / reference_total, 6)
+        for key, value in sorted(reference_counts.items())
+    }
+
+
 def extract_sample_ids(path: str | Path) -> List[str]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(data, list):
