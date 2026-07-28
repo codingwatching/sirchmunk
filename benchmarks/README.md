@@ -34,15 +34,15 @@ The current LENS paper draft uses this workflow to support the AAAI-style claim 
 | `status` | `run_benchmark.py status` | Inspect summaries and asset registries | No |
 | `queue` | `run_benchmark.py queue` | Advanced queue operations | Operational |
 
-## Baseline Scope (Phase 0)
+## Baseline Scope (Phase 0 / P1)
 
-Phase 0 only clarifies baseline semantics and cache safety; it does not add new retrieval families. Use `bm25` / `bm25_local` and `naive_rag` / `naive_rag_local` only as quickstart/local smoke baselines. They are useful for regression checks but are not the paper-facing BM25-RAG row.
+Phase 0 clarifies baseline semantics and cache safety. Use `bm25` / `bm25_local` and `naive_rag` / `naive_rag_local` only as quickstart/local smoke baselines. They are useful for regression checks but are not the paper-facing BM25-RAG row.
 
-For paper-oriented main comparisons, use `bm25_rag` for fixed-chunk sparse RAG, `hybrid_rag` for BM25+dense reciprocal-rank fusion RAG when the experiment scope includes hybrid retrieval, and `react` / `react_search` for the ordinary tool-use agent baseline. Existing baseline JSONL files are reusable only when the cached `baseline_name`, `citation_name`, adapter class, schema version, and config hash match the current adapter, preventing new table labels from wrapping stale predictions.
+For paper-oriented main comparisons, use `bm25_rag` for fixed-chunk sparse RAG, `hybrid_rag` for BM25+dense reciprocal-rank fusion RAG, and `react` / `react_search` for the ordinary tool-use agent baseline. Existing baseline JSONL files are reusable only when the cached `baseline_name`, `citation_name`, adapter class, schema version, and config hash match the current adapter, preventing new table labels from wrapping stale predictions.
 
-Remaining planned work is deliberately narrow: optionally expose `dense_rag` and long-context baselines for appendix/sensitivity, and keep LightRAG v1.3.6 in lifecycle/related-work tables. The minimal main paper table remains focused on dynamic raw-corpus behavior, update readiness, and source-grounded evidence localization.
+Remaining planned work is deliberately narrow: optionally expose `dense_rag` for appendix/sensitivity and keep LightRAG v1.3.6 in lifecycle/related-work tables. Long-context baselines are explicitly out of scope for the current implementation plan. The minimal main paper table remains focused on dynamic raw-corpus behavior, update readiness, and source-grounded evidence localization.
 
-`hybrid_rag` defaults to a deterministic hashed dense backend so smoke and lifecycle checks do not require model downloads. For stronger embedding-backed runs, pass `--hybrid-dense-backend sirchmunk_embedding` and configure `EMBEDDING_MODEL_ID`; the backend choice is recorded in baseline metadata and cache identity.
+`hybrid_rag` is now implemented as the P1 paper-facing Hybrid-RAG baseline. It defaults to a deterministic hashed dense backend so smoke and lifecycle checks do not require model downloads. For stronger embedding-backed runs, pass `--hybrid-dense-backend sirchmunk_embedding` and configure `EMBEDDING_MODEL_ID`; the backend choice is recorded in baseline metadata and cache identity.
 
 ## Install Benchmark Dependencies
 
@@ -137,7 +137,7 @@ python benchmarks/run_benchmark.py smoke-tune \
   --baselines bm25,naive_rag
 ```
 
-`bm25` and `naive_rag` in smoke runs are quickstart-local baselines. They are intentionally separate from the paper-facing `bm25_rag` row used in frozen main experiments.
+`bm25` and `naive_rag` in smoke runs are quickstart-local baselines. They are intentionally separate from the paper-facing `bm25_rag` row used in frozen main experiments. Use `hybrid_rag` in smoke only when validating the P1 Hybrid-RAG path itself.
 
 When `--baselines` is explicitly provided and the evaluation is not `--table-only`, the evaluation step also prints a terminal `Baseline Final Report` after the paper table paths. The report is an ASCII summary with `Baseline`, `N`, `Acc`, `EM`, `F1`, `Cov`, `Evd`, `Avg`, `P95`, `Tok/Q`, `Fail`, and `Notes`, so smoke baseline regressions are visible without opening the generated JSON table.
 
@@ -240,7 +240,7 @@ python benchmarks/run_benchmark.py main \
   --strict
 ```
 
-For formal main runs, the same `Baseline Final Report` is printed whenever `--baselines` triggers actual baseline execution. Official EM/F1 are used when present in baseline telemetry/metadata; otherwise EM/F1 fall back to `judge_correct` so the terminal summary remains informative for baselines that only expose judged correctness. Phase 0 cache validation will rebuild stale baseline JSONL files when adapter identity or config metadata no longer match.
+For formal main runs, the same `Baseline Final Report` is printed whenever `--baselines` triggers actual baseline execution. Official EM/F1 are used when present in baseline telemetry/metadata; otherwise EM/F1 fall back to `judge_correct` so the terminal summary remains informative for baselines that only expose judged correctness. Phase 0 cache validation will rebuild stale baseline JSONL files when adapter identity or config metadata no longer match. P1 Hybrid-RAG records BM25/dense fusion parameters and dense backend metadata in the same cache identity path.
 
 Main outputs:
 

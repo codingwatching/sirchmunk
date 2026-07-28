@@ -34,15 +34,15 @@ smoke-tune
 | `status` | `run_benchmark.py status` | 检查 summary 和 asset registry | 否 |
 | `queue` | `run_benchmark.py queue` | 高级队列操作 | 运维用途 |
 
-## Baseline Scope (Phase 0)
+## Baseline Scope (Phase 0 / P1)
 
-Phase 0 只校准 baseline 语义和缓存复用安全，不新增新的检索家族。`bm25` / `bm25_local` 与 `naive_rag` / `naive_rag_local` 只用于 quickstart/local smoke baseline，可用于回归检查，但不代表论文主表中的 BM25-RAG。
+Phase 0 校准 baseline 语义和缓存复用安全。`bm25` / `bm25_local` 与 `naive_rag` / `naive_rag_local` 只用于 quickstart/local smoke baseline，可用于回归检查，但不代表论文主表中的 BM25-RAG。
 
-面向论文主实验时，使用 `bm25_rag` 表示 fixed-chunk sparse RAG；当实验范围包含 hybrid retrieval 时，使用 `hybrid_rag` 表示 BM25+dense reciprocal-rank fusion RAG；使用 `react` / `react_search` 表示普通 tool-use agent baseline。已有 baseline JSONL 只有在缓存中的 `baseline_name`、`citation_name`、adapter class、schema version 和 config hash 与当前 adapter 完全匹配时才允许复用，避免用新表格名称包装旧预测结果。
+面向论文主实验时，使用 `bm25_rag` 表示 fixed-chunk sparse RAG，使用 `hybrid_rag` 表示 BM25+dense reciprocal-rank fusion RAG，使用 `react` / `react_search` 表示普通 tool-use agent baseline。已有 baseline JSONL 只有在缓存中的 `baseline_name`、`citation_name`、adapter class、schema version 和 config hash 与当前 adapter 完全匹配时才允许复用，避免用新表格名称包装旧预测结果。
 
-剩余计划保持克制：可选将 `dense_rag` 和 long-context baselines 放入 appendix/sensitivity；LightRAG v1.3.6 保持在 lifecycle/related-work 表。最小主论文表仍聚焦 dynamic raw-corpus 行为、update readiness 和 source-grounded evidence localization。
+剩余计划保持克制：可选将 `dense_rag` 放入 appendix/sensitivity；LightRAG v1.3.6 保持在 lifecycle/related-work 表。Long-context baseline 明确排除在当前实现计划之外。最小主论文表仍聚焦 dynamic raw-corpus 行为、update readiness 和 source-grounded evidence localization。
 
-`hybrid_rag` 默认使用 deterministic hashed dense backend，保证 smoke 和 lifecycle 检查不依赖模型下载。若要运行更强的 embedding-backed 设置，可传入 `--hybrid-dense-backend sirchmunk_embedding` 并配置 `EMBEDDING_MODEL_ID`；backend 选择会写入 baseline metadata 和 cache identity。
+`hybrid_rag` 现在已作为 P1 paper-facing Hybrid-RAG baseline 实现。它默认使用 deterministic hashed dense backend，保证 smoke 和 lifecycle 检查不依赖模型下载。若要运行更强的 embedding-backed 设置，可传入 `--hybrid-dense-backend sirchmunk_embedding` 并配置 `EMBEDDING_MODEL_ID`；backend 选择会写入 baseline metadata 和 cache identity。
 
 ## Install Benchmark Dependencies
 
@@ -137,7 +137,7 @@ python benchmarks/run_benchmark.py smoke-tune \
   --baselines bm25,naive_rag
 ```
 
-smoke run 中的 `bm25` 和 `naive_rag` 是 quickstart-local baselines，与 frozen main experiment 中 paper-facing 的 `bm25_rag` 行严格区分。
+smoke run 中的 `bm25` 和 `naive_rag` 是 quickstart-local baselines，与 frozen main experiment 中 paper-facing 的 `bm25_rag` 行严格区分。只有在验证 P1 Hybrid-RAG 路径本身时，才在 smoke 中使用 `hybrid_rag`。
 
 当显式传入 `--baselines` 且评估不是 `--table-only` 时，evaluation 步骤会在论文表格路径之后额外打印终端版 `Baseline Final Report`。该 ASCII 汇总表包含 `Baseline`、`N`、`Acc`、`EM`、`F1`、`Cov`、`Evd`、`Avg`、`P95`、`Tok/Q`、`Fail` 和 `Notes`，因此不打开生成的 JSON 表格也能快速看到 smoke baseline 是否退化。
 
@@ -240,7 +240,7 @@ python benchmarks/run_benchmark.py main \
   --strict
 ```
 
-正式 main 运行中，只要 `--baselines` 触发了真实 baseline 执行，也会打印同一张 `Baseline Final Report`。如果 baseline telemetry/metadata 中存在 official EM/F1，则优先使用官方指标；否则 EM/F1 回退到 `judge_correct`，保证仅暴露 judge correctness 的 baseline 也能在终端汇总中呈现可读结果。Phase 0 缓存校验会在 adapter 身份或配置元数据不一致时自动重建 stale baseline JSONL。
+正式 main 运行中，只要 `--baselines` 触发了真实 baseline 执行，也会打印同一张 `Baseline Final Report`。如果 baseline telemetry/metadata 中存在 official EM/F1，则优先使用官方指标；否则 EM/F1 回退到 `judge_correct`，保证仅暴露 judge correctness 的 baseline 也能在终端汇总中呈现可读结果。Phase 0 缓存校验会在 adapter 身份或配置元数据不一致时自动重建 stale baseline JSONL。P1 Hybrid-RAG 会将 BM25/dense fusion 参数和 dense backend 元数据写入同一套 cache identity。
 
 Main outputs：
 
