@@ -148,7 +148,10 @@ class BaselineEvaluationSuite:
             "[Suite] system-level concurrency=%d over %d baseline(s); per-sample concurrency: %s",
             self._max_concurrent,
             len(self._baselines),
-            ", ".join(f"{b.name}={_baseline_sample_concurrency(b)}" for b in self._baselines) or "n/a",
+            ", ".join(
+                f"{b.name}={_resolve_sample_concurrency(self._bm_adapter, b)}"
+                for b in self._baselines
+            ) or "n/a",
         )
         all_results: Dict[str, List[BaselineResult]] = {}
 
@@ -210,7 +213,7 @@ class BaselineEvaluationSuite:
         results: List[BaselineResult] = []
         results_lock = asyncio.Lock()
         request_delay = baseline.get_request_delay()
-        max_conc = baseline.get_max_concurrent()
+        max_conc = _resolve_sample_concurrency(self._bm_adapter, baseline)
         sample_semaphore = asyncio.Semaphore(max_conc)
         budget_guard = BudgetGuard(self._guard_config, output_dir=self._output_dir)
         timeout_guard = TimeoutGuard(self._guard_config.sample_timeout_seconds)
@@ -380,6 +383,7 @@ class BaselineEvaluationSuite:
                     tokens=pred_tokens,
                     judge_tokens=judge_tokens,
                     guard_config=self._guard_config,
+                    measured_sample_concurrency=max_conc,
                 )
                 telemetry["evidence_traces"] = evidence_traces
                 telemetry["query_budget"] = query_budget
@@ -730,6 +734,7 @@ def _normalize_query_budget(
     tokens: int,
     judge_tokens: int,
     guard_config: GuardConfig,
+    measured_sample_concurrency: int = 1,
 ) -> Dict[str, Any]:
     """Normalize query-time budget telemetry across baseline implementations."""
     existing = telemetry.get("query_budget") if isinstance(telemetry.get("query_budget"), dict) else {}
@@ -750,6 +755,11 @@ def _normalize_query_budget(
         "max_runtime_seconds": _safe_float(existing.get("max_runtime_seconds", guard_config.max_runtime_seconds)),
         "max_total_tokens": _safe_int(existing.get("max_total_tokens", guard_config.max_total_tokens)),
         "budget_exceeded": str(telemetry.get("failure_reason") or "") == "budget_exceeded",
+        # Latency is only comparable between systems measured at the same
+        # concurrency, so pin the value this sample was actually measured under.
+        "measured_sample_concurrency": _safe_int(
+            existing.get("measured_sample_concurrency", measured_sample_concurrency), 1
+        ),
     }
 
 
@@ -784,6 +794,32 @@ def _baseline_sample_concurrency(baseline: BaselineAdapter) -> int:
         return max(int(baseline.get_max_concurrent()), 1)
     except (AttributeError, TypeError, ValueError):
         return 1
+
+
+def _resolve_sample_concurrency(bm_adapter: Any, baseline: BaselineAdapter) -> int:
+    """Resolve how many samples of one baseline may be in flight at once.
+
+    The baseline's own declaration is the default. A positive benchmark-level
+    override raises it, which is what makes multi-turn LLM baselines finish in
+    hours instead of days, but only for baselines that allow concurrent queries.
+    The resolved value is recorded per result so the reported latency stays
+    interpretable: latency measured under concurrency is a property of the
+    measurement setup, not of the system alone.
+    """
+    declared = _baseline_sample_concurrency(baseline)
+    getter = getattr(bm_adapter, "get_baseline_sample_concurrency", None)
+    if not callable(getter):
+        return declared
+    try:
+        override = int(getter())
+    except (TypeError, ValueError):
+        return declared
+    if override <= 0:
+        return declared
+    supports = getattr(baseline, "supports_query_concurrency", None)
+    if callable(supports) and not supports():
+        return declared
+    return max(override, 1)
 
 
 def _resolve_system_concurrency(bm_adapter: Any, max_concurrent: Optional[int]) -> int:

@@ -7,7 +7,6 @@ latency.
 """
 from __future__ import annotations
 
-import asyncio
 import inspect
 import os
 import time
@@ -155,6 +154,15 @@ class LightRAGV136Baseline(BaselineAdapter):
                 metadata={**self.extra_metadata(), "working_dir": str(working_dir)},
             )
             raise
+
+    def supports_query_concurrency(self) -> bool:
+        """Queries run against one shared LightRAG instance and its persistent stores.
+
+        Concurrent queries on that single instance are not verified to be safe, so
+        this baseline opts out of the benchmark-level concurrency override and
+        stays serial regardless of configuration.
+        """
+        return False
 
     async def predict(self, question: str, context_paths: List[str]) -> BaselinePrediction:
         start = time.monotonic()

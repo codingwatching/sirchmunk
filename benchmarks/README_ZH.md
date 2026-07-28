@@ -112,11 +112,25 @@ benchmarks/.env.global < benchmarks/hotpotqa/.env.hotpotqa.base < profile env < 
 
 Mock/smoke 使用 exploration profile。只有在 sample IDs 和运行设置冻结后，才使用 frozen profile。
 
-`HOTPOT_MAX_CONCURRENT` 控制两件事：LENS 运行时同时处理多少个样本，以及同时并行评估多少个竞品系统。它有意不控制单个竞品内部的样本并发——后者由各 `BaselineAdapter` 自行声明，且默认串行。像 ReAct 这类竞品每个样本要发多次 LLM 调用，抬高其内部并发既可能触发服务方限流，也会改变所报延迟的测量条件。把这一维度保留在竞品自身，能让论文表格中的延迟在各系统间保持可比。每次 baseline suite 运行开始时会打印生效值：
+`HOTPOT_MAX_CONCURRENT` 控制两件事：LENS 运行时同时处理多少个样本，以及同时并行评估多少个竞品系统。单个竞品内部的样本并发是另一个开关 `HOTPOT_BASELINE_SAMPLE_CONCURRENT`，默认不设（`0`），即每个 `BaselineAdapter` 保留自己的声明，通常为串行。每次 baseline suite 运行开始时会打印生效值：
 
 ```text
 [Suite] system-level concurrency=5 over 3 baseline(s); per-sample concurrency: bm25_rag=1, hybrid_rag=1, react=1
 ```
+
+抬高 `HOTPOT_BASELINE_SAMPLE_CONCURRENT` 的意义在于：墙钟成本完全由单一竞品主导。在 `G_125_D_125` stage 上实测：
+
+| Baseline | 平均延迟 | Tokens/样本 | 1,750 样本位下的串行耗时 |
+|---|---|---|---|
+| `bm25_rag` | 3.0s | 4.1K | 1.4h |
+| `hybrid_rag` | 3.7s | 3.8K | 1.8h |
+| `react` | 75.2s | 32.2K | **36.6h** |
+
+由于各系统本来并行，ReAct 单独就决定了整个正式流水线的墙钟时间。由此引出两点。
+
+第一，延迟只在相同并发度下才可跨系统比较。LENS 自身的单样本延迟本就是在 `HOTPOT_MAX_CONCURRENT` 信号量内测得的，所以串行的 baseline 与并发的 LENS 从未在同等条件下被测量。与其回避这一点，不如记录下来：每条结果都会写入 `query_budget.measured_sample_concurrency`；而与并发无关的成本列（`avg_tokens`、`avg_llm_calls`、`avg_oracle_calls`）仍作为成本主证据，延迟只是次要的、依赖环境的数字。
+
+第二，抬高并发会消耗超时余量。ReAct 观测到的最慢样本为 99.3s，而 `SAMPLE_TIMEOUT_SECONDS=300`，约 3 倍余量。若竞争把某个样本拖到超过该值，它会被记为超时失败而不是慢成功，因此应逐步抬升并检查失败计数。查询路径共享单一可变实例的竞品可用 `supports_query_concurrency() -> False` 退出；LightRAG 已如此声明，无论配置如何都保持串行。
 
 ## Step 1: Mock/Smoke Exploration
 

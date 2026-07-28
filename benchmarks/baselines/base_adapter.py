@@ -319,6 +319,14 @@ class BaselineAdapter(ABC):
         """最大并发请求数。默认 1（串行），避免 API 限流。"""
         return 1
 
+    def supports_query_concurrency(self) -> bool:
+        """本竞品是否允许多个样本同时查询。
+
+        默认 True。声明 False 的竞品不会被 benchmark 级的并发覆盖影响，用于
+        查询路径共享可变实例、并发安全性未经验证的情形。
+        """
+        return True
+
     def get_request_delay(self) -> float:
         """每次请求间延迟（秒）。默认 1.0。"""
         return 1.0

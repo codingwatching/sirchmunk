@@ -112,11 +112,25 @@ benchmarks/.env.global < benchmarks/hotpotqa/.env.hotpotqa.base < profile env < 
 
 Use the exploration profile for mock/smoke work. Use the frozen profile only after sample IDs and run settings are fixed.
 
-`HOTPOT_MAX_CONCURRENT` controls two things: how many samples the LENS run processes at once, and how many baseline systems are evaluated in parallel. It deliberately does not control per-sample concurrency inside a single baseline, which each `BaselineAdapter` declares for itself and keeps serial by default. Baselines such as ReAct issue several LLM calls per sample, so raising their internal concurrency risks provider rate limits and also changes the conditions under which the reported latency was measured. Keeping that dimension per-baseline keeps latency comparable across systems in the paper tables. The effective values are logged at the start of every baseline suite run:
+`HOTPOT_MAX_CONCURRENT` controls two things: how many samples the LENS run processes at once, and how many baseline systems are evaluated in parallel. Per-sample concurrency inside a single baseline is a separate knob, `HOTPOT_BASELINE_SAMPLE_CONCURRENT`, which is unset (`0`) by default so every `BaselineAdapter` keeps its own declaration, normally serial. The effective values are logged at the start of every baseline suite run:
 
 ```text
 [Suite] system-level concurrency=5 over 3 baseline(s); per-sample concurrency: bm25_rag=1, hybrid_rag=1, react=1
 ```
+
+Raising `HOTPOT_BASELINE_SAMPLE_CONCURRENT` matters because wall-clock cost is dominated by one baseline. Measured on a `G_125_D_125` stage:
+
+| Baseline | Mean latency | Tokens/sample | Serial cost over 1,750 sample slots |
+|---|---|---|---|
+| `bm25_rag` | 3.0s | 4.1K | 1.4h |
+| `hybrid_rag` | 3.7s | 3.8K | 1.8h |
+| `react` | 75.2s | 32.2K | **36.6h** |
+
+Since systems run in parallel, ReAct alone sets the wall clock for the whole formal pipeline. Two consequences follow.
+
+First, latency is only comparable between systems measured at the same concurrency. LENS already measures its own per-sample latency inside a `HOTPOT_MAX_CONCURRENT` semaphore, so a serial baseline and a concurrent LENS run were never measured under identical conditions. Rather than pretend otherwise, every result row records `query_budget.measured_sample_concurrency`, and the concurrency-invariant cost columns (`avg_tokens`, `avg_llm_calls`, `avg_oracle_calls`) remain the primary cost evidence; latency is a secondary, environment-dependent number.
+
+Second, raising concurrency consumes timeout headroom. ReAct's slowest observed sample is 99.3s against `SAMPLE_TIMEOUT_SECONDS=300`, about 3x of headroom. If contention inflates a sample beyond that, it is recorded as a timeout failure rather than a slow success, so raise the value gradually and check the failure counts. Baselines whose query path shares one mutable instance opt out by declaring `supports_query_concurrency() -> False`; LightRAG does this and stays serial regardless of configuration.
 
 ## Step 1: Mock/Smoke Exploration
 

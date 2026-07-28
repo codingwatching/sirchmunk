@@ -356,9 +356,14 @@ class HotpotQAAdapter(BenchmarkAdapter):
     def get_max_concurrent(self) -> int:
         """HOTPOT_MAX_CONCURRENT：LENS 自身运行的样本并发 + 同时评估的竞品数。
 
-        不影响单个竞品内部的样本并发（由各 BaselineAdapter 自行声明，默认串行）。
+        不影响单个竞品内部的样本并发，后者由 HOTPOT_BASELINE_SAMPLE_CONCURRENT
+        统一覆盖，未设时保留各 BaselineAdapter 自己的声明。
         """
         return self._get_int("HOTPOT_MAX_CONCURRENT", 3)
+
+    def get_baseline_sample_concurrency(self) -> int:
+        """HOTPOT_BASELINE_SAMPLE_CONCURRENT：竞品内部样本并发，0 = 不覆盖。"""
+        return self._get_int("HOTPOT_BASELINE_SAMPLE_CONCURRENT", 0)
 
     def get_request_delay(self) -> float:
         try:

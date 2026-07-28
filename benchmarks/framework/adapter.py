@@ -104,6 +104,16 @@ class BenchmarkAdapter(ABC):
         """
         return 3
 
+    def get_baseline_sample_concurrency(self) -> int:
+        """竞品内部样本级并发的统一覆盖值，0 = 不覆盖。
+
+        默认不覆盖，即每个 BaselineAdapter 维持自己声明的（通常为串行）。
+        设为正整数可以把所有支持并发查询的竞品抬到同一并发度，这对多轮
+        LLM 竞品（如 ReAct）的墙钟时间影响数量级。代价是延迟列的测量条件随之
+        改变，因此实测并发度会随结果一起记录，供表格和审计使用。
+        """
+        return 0
+
     def get_request_delay(self) -> float:
         """每次请求间延迟（秒），默认 0.5。"""
         return 0.5
