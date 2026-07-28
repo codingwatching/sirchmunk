@@ -106,9 +106,11 @@ def _parse_args() -> argparse.Namespace:
                    help="本文系统（LENS/Sirchmunk）的结果 JSONL 文件路径")
     p.add_argument("--baselines", default="",
                    help=(
-                       "运行的竞品列表（逗号分隔）: "
-                       "bm25, bm25_rag, react, naive_rag, lightrag_v1, lightrag_v136, graphrag, "
-                       "lens_full, lens_no_prior, lens_no_seq, lens_no_reuse, or module:factory"
+                       "运行的竞品列表（逗号分隔）。Paper main 推荐 bm25_rag,react；"
+                       "Phase 0 后 bm25/bm25_local 与 naive_rag/naive_rag_local 仅表示 quickstart/local smoke baselines，"
+                       "不等同于论文主表 BM25-RAG。可选 related-work/lifecycle: lightrag_v136；"
+                       "imported: lightrag_v1, graphrag；ablation: lens_full,lens_no_prior,lens_no_seq,lens_no_reuse；"
+                       "custom: module:factory。Long-context baseline 当前明确不纳入实现范围。"
                    ))
     p.add_argument("--import-baseline", action="append", dest="import_baseline",
                    metavar="NAME=PATH",
@@ -235,6 +237,7 @@ async def _main() -> int:
         benchmark_name=args.benchmark.upper(),
         our_system_name=ours_name,
     )
+    explicit_baseline_report_rows = []
 
     question_type_key = "question_type"
     try:
@@ -309,6 +312,7 @@ async def _main() -> int:
                     (b.citation_name for b in baseline_list if b.name == bm),
                     bm,
                 )
+                explicit_baseline_report_rows.append((citation, results))
                 gen.add_system_results(system_name=citation, results=results, question_type_key=question_type_key)
                 logger.info("竞品 '%s': %d 条结果", citation, len(results))
 
@@ -379,6 +383,8 @@ async def _main() -> int:
     print("\n✅ 论文表格已生成：")
     for fmt, path in paths.items():
         print(f"   {fmt.upper():8}: {path}")
+    if args.baselines and not args.table_only:
+        _print_explicit_baseline_report(explicit_baseline_report_rows)
 
     if args.generate_report:
         from evaluation.report_generator import ReportGenerator
@@ -396,6 +402,158 @@ async def _main() -> int:
     print()
 
     return 0
+
+
+def _print_explicit_baseline_report(rows: list[tuple[str, list]]) -> None:
+    """Print final report for baselines explicitly requested by --baselines."""
+    print("\n== Baseline Final Report ==")
+    if not rows:
+        print("  (no baseline results produced)")
+        return
+    columns = [
+        ("Baseline", 28, "<"),
+        ("N", 5, ">"),
+        ("Acc", 5, ">"),
+        ("EM", 5, ">"),
+        ("F1", 5, ">"),
+        ("Cov", 5, ">"),
+        ("Evd", 5, ">"),
+        ("Avg", 6, ">"),
+        ("P95", 6, ">"),
+        ("Tok/Q", 7, ">"),
+        ("Fail", 4, ">"),
+    ]
+
+    def _cell(value, width: int, align: str) -> str:
+        text = str(value)
+        if len(text) > width:
+            text = text[: max(width - 1, 0)] + "~"
+        return f"{text:<{width}}" if align == "<" else f"{text:>{width}}"
+
+    def _row(values) -> str:
+        return " | ".join(
+            _cell(value, width, align)
+            for value, (_, width, align) in zip(values, columns)
+        )
+
+    header = _row(label for label, _, _ in columns) + " | Notes"
+    separator = "-+-".join("-" * width for _, width, _ in columns) + "-+------"
+    print(header)
+    print(separator)
+    for name, results in rows:
+        metrics = _baseline_report_metrics(results)
+        print(
+            _row([
+                name,
+                metrics["n"],
+                f"{metrics['accuracy']:.1f}",
+                f"{metrics['em']:.1f}",
+                f"{metrics['f1']:.1f}",
+                f"{metrics['coverage']:.1f}",
+                f"{metrics['evidence_recall']:.1f}",
+                f"{metrics['avg_latency']:.1f}s",
+                f"{metrics['p95_latency']:.1f}s",
+                f"{metrics['avg_tokens']:.1f}",
+                metrics["failures"],
+            ])
+            + f" | {metrics['notes']}"
+        )
+    print()
+
+
+def _baseline_report_metrics(results: list) -> dict:
+    n = len(results)
+    if not n:
+        return {
+            "n": 0,
+            "accuracy": 0.0,
+            "em": 0.0,
+            "f1": 0.0,
+            "coverage": 0.0,
+            "evidence_recall": 0.0,
+            "avg_latency": 0.0,
+            "p95_latency": 0.0,
+            "avg_tokens": 0.0,
+            "failures": 0,
+            "notes": "empty",
+        }
+    latencies = [_safe_float(getattr(row, "elapsed", 0.0)) for row in results]
+    tokens = [_baseline_tokens(row) for row in results]
+    failures = [row for row in results if getattr(row, "error", None) or getattr(row, "failure_reason", "")]
+    failure_types = sorted({str(getattr(row, "failure_reason", "") or "error") for row in failures})
+    official_em_values = [_metric_value_or_none(row, "official_em", "em") for row in results]
+    official_f1_values = [_metric_value_or_none(row, "official_f1", "f1") for row in results]
+    official_em = [value for value in official_em_values if value is not None]
+    official_f1 = [value for value in official_f1_values if value is not None]
+    if not official_em:
+        official_em = [1.0 if bool(getattr(row, "judge_correct", False)) else 0.0 for row in results]
+    if not official_f1:
+        official_f1 = [1.0 if bool(getattr(row, "judge_correct", False)) else 0.0 for row in results]
+    notes = ",".join(failure_types[:3]) if failure_types else ""
+    imported = any(_metadata(row).get("imported_baseline") for row in results)
+    if imported:
+        missing = sum(1 for row in results if _failure_reason(row) == "import_missing")
+        notes = (notes + "; " if notes else "") + f"import_missing={missing}"
+    return {
+        "n": n,
+        "accuracy": sum(1 for row in results if bool(getattr(row, "judge_correct", False))) / n * 100,
+        "em": sum(official_em) / n * 100,
+        "f1": sum(official_f1) / n * 100,
+        "coverage": sum(1 for row in results if bool(getattr(row, "coverage", False))) / n * 100,
+        "evidence_recall": sum(_safe_float(getattr(row, "evidence_recall", 0.0)) for row in results) / n * 100,
+        "avg_latency": sum(latencies) / n,
+        "p95_latency": _percentile(latencies, 0.95),
+        "avg_tokens": sum(tokens) / n,
+        "failures": len(failures),
+        "notes": notes,
+    }
+
+
+def _baseline_tokens(row) -> float:
+    telemetry = getattr(row, "telemetry", {}) or {}
+    if isinstance(telemetry, dict):
+        total = telemetry.get("total_tokens")
+        judge = telemetry.get("judge_tokens", 0)
+        if total is not None:
+            return _safe_float(total) + _safe_float(judge)
+    return _safe_float(getattr(row, "tokens_used", 0)) + _safe_float(getattr(row, "judge_tokens", 0))
+
+
+def _metric_value_or_none(row, *keys: str) -> float | None:
+    for source in (_telemetry(row), _metadata(row)):
+        for key in keys:
+            if key in source:
+                return _safe_float(source.get(key))
+    return None
+
+
+def _failure_reason(row) -> str:
+    return str(getattr(row, "failure_reason", "") or _metadata(row).get("failure_reason", "") or "")
+
+
+def _telemetry(row) -> dict:
+    value = getattr(row, "telemetry", {}) or {}
+    return value if isinstance(value, dict) else {}
+
+
+def _metadata(row) -> dict:
+    value = getattr(row, "metadata", {}) or {}
+    return value if isinstance(value, dict) else {}
+
+
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(max(int(round((len(ordered) - 1) * q)), 0), len(ordered) - 1)
+    return ordered[index]
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value if value is not None else default)
+    except (TypeError, ValueError):
+        return default
 
 
 def _baseline_guard_config(args: argparse.Namespace) -> dict:
@@ -489,8 +647,11 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None
             raise TypeError(f"Factory {raw_name} did not return BaselineAdapter")
         return baseline
     raise ValueError(
-        "Unknown baseline. Use bm25, bm25_rag, react, naive_rag, lightrag_v1, "
-        "lightrag_v136, graphrag, lens_no_prior, lens_no_seq, lens_no_reuse, or module:factory."
+        "Unknown baseline. Use bm25_rag or react for paper main; "
+        "bm25/bm25_local and naive_rag/naive_rag_local are quickstart/local smoke baselines; "
+        "related-work/lifecycle: lightrag_v136; imported: lightrag_v1, graphrag; "
+        "ablation: lens_no_prior, lens_no_seq, lens_no_reuse; custom: module:factory. "
+        "Long-context is intentionally excluded from the current implementation scope."
     )
 
 

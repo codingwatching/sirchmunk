@@ -2,9 +2,9 @@
 
 论文主表 baseline：固定 chunk → BM25 检索 top-k chunks → 同一 LLM 生成答案。
 
-与现有 LocalBM25Baseline 的区别：
-- LocalBM25Baseline 只返回 best sentence，不调用 LLM；适合纯 lexical lower-bound。
-- BM25RAGBaseline 使用 BM25 选择 chunks，再调用生成 LLM；适合作为论文主表 baseline。
+与 LocalBM25Baseline 的区别：
+- LocalBM25Baseline 是 quickstart/local smoke baseline，可选轻量 LLM 合成，但不作为论文主表 baseline。
+- BM25RAGBaseline 使用固定 chunk 级 BM25 选择 chunks，再调用生成 LLM；适合作为论文主表 sparse RAG baseline。
 
 公平性：
 - prepare() 记录 index build / preprocessing / storage 成本。

@@ -136,10 +136,18 @@ class BaselineEvaluationSuite:
             async with semaphore:
                 out_path = self._output_dir / f"baseline_{baseline.name}.jsonl"
                 if skip_existing and out_path.exists():
-                    logger.info("[Suite] '%s' already done, loading from %s",
-                                baseline.name, out_path)
-                    all_results[baseline.name] = self._load_results(str(out_path))
-                    return
+                    can_reuse, reason = _can_reuse_baseline_cache(out_path, baseline)
+                    if can_reuse:
+                        logger.info("[Suite] '%s' already done, loading from %s",
+                                    baseline.name, out_path)
+                        all_results[baseline.name] = self._load_results(str(out_path))
+                        return
+                    logger.info(
+                        "[Suite] Stale cache for '%s' ignored: %s; rebuilding %s",
+                        baseline.name,
+                        reason,
+                        out_path,
+                    )
 
                 logger.info("[Suite] Evaluating '%s' (%d samples)...",
                             baseline.citation_name, len(golden_set.samples))
@@ -217,13 +225,18 @@ class BaselineEvaluationSuite:
                     context_paths = []
 
                 setup_metrics = baseline.collect_setup_metrics()
+                baseline_identity = _baseline_cache_identity(baseline)
                 base_metadata: Dict[str, Any] = {
                     **baseline.extra_metadata(),
+                    "baseline_cache_identity": baseline_identity,
                     "setup_metrics": setup_metrics,
                 }
                 telemetry: Dict[str, Any] = {
                     "baseline_name": baseline.name,
                     "system_name": baseline.citation_name,
+                    "result_schema_version": baseline_identity["result_schema_version"],
+                    "adapter_class": baseline_identity["adapter_class"],
+                    "config_hash": baseline_identity["config_hash"],
                 }
                 prediction_obj = None
                 prediction_text = ""
@@ -277,6 +290,7 @@ class BaselineEvaluationSuite:
                     pred_tokens = prediction_obj.tokens_used
                     if isinstance(prediction_obj.metadata, dict):
                         base_metadata.update(prediction_obj.metadata)
+                        base_metadata["baseline_cache_identity"] = baseline_identity
                         _merge_prediction_telemetry(telemetry, prediction_obj.metadata)
                 elif not error:
                     error = "Baseline returned no prediction."
@@ -380,7 +394,15 @@ class BaselineEvaluationSuite:
 
     @staticmethod
     def _result_to_dict(r: BaselineResult) -> dict:
+        metadata = r.metadata if isinstance(r.metadata, dict) else {}
+        identity = metadata.get("baseline_cache_identity") if isinstance(metadata.get("baseline_cache_identity"), dict) else {}
         return {
+            "result_schema_version": identity.get("result_schema_version", ""),
+            "baseline_name": identity.get("baseline_name", ""),
+            "citation_name": identity.get("citation_name", r.system_name),
+            "adapter_class": identity.get("adapter_class", ""),
+            "config_hash": identity.get("config_hash", ""),
+            "baseline_cache_identity": identity,
             "sample_id":     r.sample_id,
             "system_name":   r.system_name,
             "question":      r.question,
@@ -396,8 +418,8 @@ class BaselineEvaluationSuite:
             "error":         r.error,
             "failure_reason": r.failure_reason,
             "telemetry":     r.telemetry,
-            "metadata":      r.metadata,
-            "setup_metrics": r.metadata.get("setup_metrics", {}) if isinstance(r.metadata, dict) else {},
+            "metadata":      metadata,
+            "setup_metrics": metadata.get("setup_metrics", {}),
         }
 
     @staticmethod
@@ -439,6 +461,62 @@ class BaselineEvaluationSuite:
                 except (json.JSONDecodeError, KeyError, TypeError):
                     pass
         return results
+
+def _baseline_cache_identity(baseline: BaselineAdapter) -> Dict[str, Any]:
+    identity_fn = getattr(baseline, "cache_identity", None)
+    if callable(identity_fn):
+        value = identity_fn()
+        if isinstance(value, dict):
+            return {
+                "result_schema_version": str(value.get("result_schema_version", "")),
+                "baseline_name": str(value.get("baseline_name", baseline.name)),
+                "citation_name": str(value.get("citation_name", baseline.citation_name)),
+                "adapter_class": str(value.get("adapter_class", baseline.__class__.__name__)),
+                "config_hash": str(value.get("config_hash", "")),
+            }
+    return {
+        "result_schema_version": str(getattr(baseline, "result_schema_version", "baseline_result_v2")),
+        "baseline_name": baseline.name,
+        "citation_name": baseline.citation_name,
+        "adapter_class": f"{baseline.__class__.__module__}.{baseline.__class__.__qualname__}",
+        "config_hash": "",
+    }
+
+
+def _can_reuse_baseline_cache(path: Path, baseline: BaselineAdapter) -> tuple[bool, str]:
+    first = _read_first_jsonl_record(path)
+    if not first:
+        return False, "empty_or_unreadable_jsonl"
+    expected = _baseline_cache_identity(baseline)
+    actual = first.get("baseline_cache_identity") if isinstance(first.get("baseline_cache_identity"), dict) else {}
+    if not actual:
+        actual = {
+            "result_schema_version": first.get("result_schema_version", ""),
+            "baseline_name": first.get("baseline_name", ""),
+            "citation_name": first.get("citation_name", first.get("system_name", "")),
+            "adapter_class": first.get("adapter_class", ""),
+            "config_hash": first.get("config_hash", ""),
+        }
+    for key, expected_value in expected.items():
+        actual_value = str(actual.get(key, ""))
+        if actual_value != str(expected_value):
+            return False, f"{key}_mismatch(actual={actual_value!r}, expected={expected_value!r})"
+    return True, "ok"
+
+
+def _read_first_jsonl_record(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        with path.open(encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                return row if isinstance(row, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+    return None
+
 
 def _merge_prediction_telemetry(telemetry: Dict[str, Any], metadata: Dict[str, Any]) -> None:
     """Promote baseline-specific retrieval metadata into common telemetry keys."""

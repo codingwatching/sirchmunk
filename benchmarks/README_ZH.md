@@ -32,6 +32,14 @@ smoke-tune
 | `status` | `run_benchmark.py status` | 检查 summary 和 asset registry | 否 |
 | `queue` | `run_benchmark.py queue` | 高级队列操作 | 运维用途 |
 
+## Baseline Scope (Phase 0)
+
+Phase 0 只校准 baseline 语义和缓存复用安全，不新增新的检索家族。`bm25` / `bm25_local` 与 `naive_rag` / `naive_rag_local` 只用于 quickstart/local smoke baseline，可用于回归检查，但不代表论文主表中的 BM25-RAG。
+
+面向论文主实验时，使用 `bm25_rag` 表示 fixed-chunk sparse RAG，使用 `react` / `react_search` 表示普通 tool-use agent baseline。已有 baseline JSONL 只有在缓存中的 `baseline_name`、`citation_name`、adapter class、schema version 和 config hash 与当前 adapter 完全匹配时才允许复用，避免用新表格名称包装旧预测结果。
+
+剩余计划保持克制：下一步只新增 `hybrid_rag` 作为 paper-facing RAG baseline，可选暴露 `dense_rag` 到 appendix/sensitivity；LightRAG v1.3.6 保持在 lifecycle/related-work 表。Long-context baseline 明确排除在当前计划之外。
+
 ## Install Benchmark Dependencies
 
 ```bash
@@ -125,6 +133,10 @@ python benchmarks/run_benchmark.py smoke-tune \
   --baselines bm25,naive_rag
 ```
 
+smoke run 中的 `bm25` 和 `naive_rag` 是 quickstart-local baselines，与 frozen main experiment 中 paper-facing 的 `bm25_rag` 行严格区分。
+
+当显式传入 `--baselines` 且评估不是 `--table-only` 时，evaluation 步骤会在论文表格路径之后额外打印终端版 `Baseline Final Report`。该 ASCII 汇总表包含 `Baseline`、`N`、`Acc`、`EM`、`F1`、`Cov`、`Evd`、`Avg`、`P95`、`Tok/Q`、`Fail` 和 `Notes`，因此不打开生成的 JSON 表格也能快速看到 smoke baseline 是否退化。
+
 典型 exploration 输出：
 
 ```text
@@ -199,7 +211,7 @@ python benchmarks/run_benchmark.py main \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --sirchmunk-results benchmarks/hotpotqa/output/main/runs/<run_id>/results/predictions.jsonl \
   --run-artifact-dir benchmarks/hotpotqa/output/main/runs/<run_id> \
-  --baselines bm25,naive_rag \
+  --baselines bm25_rag,react \
   --asset-registry benchmarks/hotpotqa/output/assets/asset_registry.jsonl \
   --sampling-method stratified \
   --golden-n 2000 \
@@ -217,12 +229,14 @@ python benchmarks/run_benchmark.py main \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --run-sirchmunk \
   --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sample_ids.json \
-  --baselines bm25,naive_rag \
+  --baselines bm25_rag,react \
   --asset-registry benchmarks/hotpotqa/output/assets/asset_registry.jsonl \
   --cache-mode cold \
   --generate-report \
   --strict
 ```
+
+正式 main 运行中，只要 `--baselines` 触发了真实 baseline 执行，也会打印同一张 `Baseline Final Report`。如果 baseline telemetry/metadata 中存在 official EM/F1，则优先使用官方指标；否则 EM/F1 回退到 `judge_correct`，保证仅暴露 judge correctness 的 baseline 也能在终端汇总中呈现可读结果。Phase 0 缓存校验会在 adapter 身份或配置元数据不一致时自动重建 stale baseline JSONL。
 
 Main outputs：
 

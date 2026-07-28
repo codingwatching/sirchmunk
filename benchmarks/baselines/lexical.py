@@ -28,7 +28,7 @@ class LocalBM25Baseline(BaselineAdapter):
         llm: Optional[Any] = None,
         use_llm_synthesis: bool = True,
         name: str = "bm25_local",
-        citation_name: str = "BM25 + LLM (local)",
+        citation_name: str = "BM25 Local + LLM (smoke)",
     ) -> None:
         self._max_files = max_files
         self._max_file_bytes = max_file_bytes
@@ -141,7 +141,7 @@ class NaiveRAGBaseline(BaselineAdapter):
         llm: Optional[Any] = None,
         use_llm_synthesis: bool = True,
         name: str = "naive_rag_local",
-        citation_name: str = "Naive RAG + LLM (chunk lexical)",
+        citation_name: str = "Naive RAG Local + LLM (smoke)",
     ) -> None:
         self._chunk_words = chunk_words
         self._chunk_overlap = chunk_overlap

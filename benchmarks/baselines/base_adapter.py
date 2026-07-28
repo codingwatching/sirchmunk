@@ -14,6 +14,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -119,6 +121,8 @@ class BaselineAdapter(ABC):
                 return BaselinePrediction(answer=answer, elapsed=0.5)
     """
 
+    result_schema_version = "baseline_result_v2"
+
     # ------------------------------------------------------------------
     # 必须实现
     # ------------------------------------------------------------------
@@ -210,6 +214,48 @@ class BaselineAdapter(ABC):
         """Return setup metrics after prepare()."""
         return {}
 
+    def adapter_class_path(self) -> str:
+        """Return a stable adapter implementation identity for cache reuse checks."""
+        return f"{self.__class__.__module__}.{self.__class__.__qualname__}"
+
+    def baseline_config(self) -> Dict[str, Any]:
+        """Return lightweight constructor/runtime config used to validate cached JSONL reuse."""
+        ignored = {
+            "llm", "setup", "docs", "chunks", "df", "avgdl", "rag", "predictions",
+            "last_paths", "dependency_error", "cache", "index", "searcher",
+        }
+        config: Dict[str, Any] = {}
+        for raw_key, value in sorted(getattr(self, "__dict__", {}).items()):
+            key = str(raw_key).lstrip("_")
+            if key in ignored:
+                continue
+            safe_value = _json_safe_baseline_value(value)
+            if safe_value is not None:
+                config[key] = safe_value
+        return config
+
+    def config_hash(self) -> str:
+        """Stable short hash of adapter identity and reusable configuration."""
+        payload = {
+            "baseline_name": self.name,
+            "citation_name": self.citation_name,
+            "adapter_class": self.adapter_class_path(),
+            "schema_version": self.result_schema_version,
+            "config": self.baseline_config(),
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    def cache_identity(self) -> Dict[str, Any]:
+        """Identity fields that must match before an existing baseline JSONL can be reused."""
+        return {
+            "result_schema_version": self.result_schema_version,
+            "baseline_name": self.name,
+            "citation_name": self.citation_name,
+            "adapter_class": self.adapter_class_path(),
+            "config_hash": self.config_hash(),
+        }
+
     def is_index_ready(self) -> bool:
         """Return whether a full-corpus index is ready for query evaluation.
 
@@ -283,3 +329,19 @@ class BaselineAdapter(ABC):
         如: {"model": "gpt-4o-2024-05-13", "temperature": 0}
         """
         return {}
+
+
+def _json_safe_baseline_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        safe_list = [_json_safe_baseline_value(item) for item in value]
+        return [item for item in safe_list if item is not None]
+    if isinstance(value, dict):
+        safe_dict = {}
+        for key, item in sorted(value.items(), key=lambda kv: str(kv[0])):
+            safe_item = _json_safe_baseline_value(item)
+            if safe_item is not None:
+                safe_dict[str(key)] = safe_item
+        return safe_dict
+    return None

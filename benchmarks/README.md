@@ -32,6 +32,14 @@ The purpose is to keep exploration, baseline asset construction, frozen evaluati
 | `status` | `run_benchmark.py status` | Inspect summaries and asset registries | No |
 | `queue` | `run_benchmark.py queue` | Advanced queue operations | Operational |
 
+## Baseline Scope (Phase 0)
+
+Phase 0 only clarifies baseline semantics and cache safety; it does not add new retrieval families. Use `bm25` / `bm25_local` and `naive_rag` / `naive_rag_local` only as quickstart/local smoke baselines. They are useful for regression checks but are not the paper-facing BM25-RAG row.
+
+For paper-oriented main comparisons, use `bm25_rag` for fixed-chunk sparse RAG and `react` / `react_search` for the ordinary tool-use agent baseline. Existing baseline JSONL files are reusable only when the cached `baseline_name`, `citation_name`, adapter class, schema version, and config hash match the current adapter, preventing new table labels from wrapping stale predictions.
+
+Remaining planned work is deliberately narrow: add `hybrid_rag` as the next paper-facing RAG baseline, optionally expose `dense_rag` for appendix/sensitivity, and keep LightRAG v1.3.6 in lifecycle/related-work tables. Long-context baselines are explicitly out of scope for the current plan.
+
 ## Install Benchmark Dependencies
 
 ```bash
@@ -125,6 +133,10 @@ python benchmarks/run_benchmark.py smoke-tune \
   --baselines bm25,naive_rag
 ```
 
+`bm25` and `naive_rag` in smoke runs are quickstart-local baselines. They are intentionally separate from the paper-facing `bm25_rag` row used in frozen main experiments.
+
+When `--baselines` is explicitly provided and the evaluation is not `--table-only`, the evaluation step also prints a terminal `Baseline Final Report` after the paper table paths. The report is an ASCII summary with `Baseline`, `N`, `Acc`, `EM`, `F1`, `Cov`, `Evd`, `Avg`, `P95`, `Tok/Q`, `Fail`, and `Notes`, so smoke baseline regressions are visible without opening the generated JSON table.
+
 Expected exploration outputs:
 
 ```text
@@ -199,7 +211,7 @@ python benchmarks/run_benchmark.py main \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --sirchmunk-results benchmarks/hotpotqa/output/main/runs/<run_id>/results/predictions.jsonl \
   --run-artifact-dir benchmarks/hotpotqa/output/main/runs/<run_id> \
-  --baselines bm25,naive_rag \
+  --baselines bm25_rag,react \
   --asset-registry benchmarks/hotpotqa/output/assets/asset_registry.jsonl \
   --sampling-method stratified \
   --golden-n 2000 \
@@ -217,12 +229,14 @@ python benchmarks/run_benchmark.py main \
   --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
   --run-sirchmunk \
   --sample-ids-file benchmarks/hotpotqa/output/main/sampling/sample_ids.json \
-  --baselines bm25,naive_rag \
+  --baselines bm25_rag,react \
   --asset-registry benchmarks/hotpotqa/output/assets/asset_registry.jsonl \
   --cache-mode cold \
   --generate-report \
   --strict
 ```
+
+For formal main runs, the same `Baseline Final Report` is printed whenever `--baselines` triggers actual baseline execution. Official EM/F1 are used when present in baseline telemetry/metadata; otherwise EM/F1 fall back to `judge_correct` so the terminal summary remains informative for baselines that only expose judged correctness. Phase 0 cache validation will rebuild stale baseline JSONL files when adapter identity or config metadata no longer match.
 
 Main outputs:
 
