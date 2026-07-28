@@ -12,11 +12,14 @@
 #
 # Usage:
 #   bash scripts/run_paper_experiments.sh <stage>
-#   stages: smoke | sampling | validate | assets | dynamic | main | report | status | ablation | all
+#   stages: smoke | sync | sampling | validate | assets | dynamic | main | report | status | ablation | all
 #
 # Notes:
 #   - Frozen/paper-facing stages all use benchmarks/hotpotqa/.env.hotpotqa.frozen.
 #   - Every frozen stage shares the same sample IDs file (Gate 2 pairing).
+#   - Sampling is gated on raw-corpus synchronization: `create` resolves every
+#     supporting-fact article against the enwiki dump and records the dump
+#     fingerprint (wiki_corpus_fingerprint) in the sample-ids metadata.
 #   - "all" runs the full frozen path in order; smoke is excluded (exploration only).
 # =============================================================================
 set -euo pipefail
@@ -55,14 +58,38 @@ stage_smoke() {
 }
 
 # -----------------------------------------------------------------------------
-# Stage 1: freeze the sample IDs (stratified n=500, seed=42).
-# Skips creation when the frozen sample IDs file already exists.
+# Stage 1a: raw-corpus synchronization gate. Blocks freezing when any
+# supporting-fact article is missing from the raw enwiki dump.
+# First run scans the dump once (~30s) and caches a fingerprinted title index.
 # -----------------------------------------------------------------------------
+stage_sync() {
+  log "Stage 1a: raw-corpus synchronization check"
+  python benchmarks/run_sampling.py check-corpus-sync \
+    --benchmark hotpotqa \
+    --env "$ENV_FROZEN"
+}
+
+# -----------------------------------------------------------------------------
+# Stage 1: freeze the sample IDs (stratified n=500, seed=42).
+# Re-freezes when the existing artifact predates the corpus-sync gate
+# (missing wiki_corpus_fingerprint in sample-ids metadata).
+# -----------------------------------------------------------------------------
+sample_ids_fingerprinted() {
+  [[ -f "$SAMPLE_IDS" ]] || return 1
+  python - "$SAMPLE_IDS" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+fp = (data.get("metadata") or {}).get("wiki_corpus_fingerprint")
+sys.exit(0 if fp else 1)
+PY
+}
+
 stage_sampling() {
-  if [[ -f "$SAMPLE_IDS" ]]; then
-    log "Stage 1: frozen sample IDs already exist, skipping create: $SAMPLE_IDS"
+  stage_sync
+  if sample_ids_fingerprinted; then
+    log "Stage 1: fingerprinted frozen sample IDs already exist, skipping create: $SAMPLE_IDS"
   else
-    log "Stage 1: create frozen stratified sample IDs (n=500, seed=42)"
+    log "Stage 1: create frozen stratified sample IDs (n=500, seed=42, corpus-sync gated)"
     python benchmarks/run_sampling.py create \
       --benchmark hotpotqa \
       --env "$ENV_FROZEN" \
@@ -73,7 +100,8 @@ stage_sampling() {
       --allocation proportional \
       --min-per-stratum 1 \
       --expected-population-size 7405 \
-      --output-dir "$SAMPLING_DIR"
+      --output-dir "$SAMPLING_DIR" \
+      --force
   fi
   stage_validate
 }
@@ -229,6 +257,7 @@ main() {
   local stage="${1:-}"
   case "$stage" in
     smoke)    stage_smoke ;;
+    sync)     stage_sync ;;
     sampling) stage_sampling ;;
     validate) stage_validate ;;
     assets)   stage_assets ;;

@@ -93,7 +93,15 @@ class BenchmarkAdapter(ABC):
         return dict(sample.metadata)
 
     def get_max_concurrent(self) -> int:
-        """最大并发数，默认 3。"""
+        """样本级并发度，默认 3。
+
+        语义分两层，不要混用：
+        - 本系统自身运行（UnifiedExperimentRunner）：同时处理多少个样本。
+        - 竞品评估（BaselineEvaluationSuite）：同时评估多少个竞品系统。
+
+        它不控制单个竞品内部的样本并发，后者由各 BaselineAdapter 自己的
+        get_max_concurrent() 声明，默认串行。
+        """
         return 3
 
     def get_request_delay(self) -> float:

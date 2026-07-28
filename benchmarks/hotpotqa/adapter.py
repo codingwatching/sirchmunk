@@ -354,6 +354,10 @@ class HotpotQAAdapter(BenchmarkAdapter):
         return _HOTPOT_WORK_PATH
 
     def get_max_concurrent(self) -> int:
+        """HOTPOT_MAX_CONCURRENT：LENS 自身运行的样本并发 + 同时评估的竞品数。
+
+        不影响单个竞品内部的样本并发（由各 BaselineAdapter 自行声明，默认串行）。
+        """
         return self._get_int("HOTPOT_MAX_CONCURRENT", 3)
 
     def get_request_delay(self) -> float:

@@ -112,6 +112,12 @@ benchmarks/.env.global < benchmarks/hotpotqa/.env.hotpotqa.base < profile env < 
 
 Use the exploration profile for mock/smoke work. Use the frozen profile only after sample IDs and run settings are fixed.
 
+`HOTPOT_MAX_CONCURRENT` controls two things: how many samples the LENS run processes at once, and how many baseline systems are evaluated in parallel. It deliberately does not control per-sample concurrency inside a single baseline, which each `BaselineAdapter` declares for itself and keeps serial by default. Baselines such as ReAct issue several LLM calls per sample, so raising their internal concurrency risks provider rate limits and also changes the conditions under which the reported latency was measured. Keeping that dimension per-baseline keeps latency comparable across systems in the paper tables. The effective values are logged at the start of every baseline suite run:
+
+```text
+[Suite] system-level concurrency=5 over 3 baseline(s); per-sample concurrency: bm25_rag=1, hybrid_rag=1, react=1
+```
+
 ## Step 1: Mock/Smoke Exploration
 
 This stage answers the first user question: “Can my local environment, data path, retrieval, judging, artifact writing, and report generation work at all?” It is intentionally not paper evidence.

@@ -76,7 +76,7 @@ class BaselineEvaluationSuite:
         bm_adapter,                          # BenchmarkAdapter（提供数据 + judge）
         baselines: List[BaselineAdapter],
         output_dir: str,
-        max_concurrent: int = 3,             # 系统级并发（同时评估几个竞品）
+        max_concurrent: Optional[int] = None,  # 系统级并发（同时评估几个竞品）
         guard_config: Optional[GuardConfig | Dict[str, Any]] = None,
         corpus_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -85,14 +85,19 @@ class BaselineEvaluationSuite:
             bm_adapter:     BenchmarkAdapter 实例（提供 get_search_paths + build_judge）。
             baselines:      BaselineAdapter 列表。
             output_dir:     竞品结果 JSONL 的输出目录。
-            max_concurrent: 同时运行的竞品系统数（一般保持默认，避免 API 限流）。
+            max_concurrent: 同时运行的竞品系统数。留空时取 benchmark adapter 的并发
+                            配置（HotpotQA 为 HOTPOT_MAX_CONCURRENT），使该配置在系统
+                            维度真正生效，而不是停留在一个硬编码常量上。注意这只控制
+                            "同时跑几个竞品"；每个竞品内部的样本级并发由该竞品自己的
+                            get_max_concurrent() 决定，默认串行以避免 API 限流并保持
+                            延迟指标可比。
             guard_config:   可选预算/超时守卫配置，用于将 baseline 失败精确分类。
         """
         self._bm_adapter = bm_adapter
         self._baselines = baselines
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
-        self._max_concurrent = max_concurrent
+        self._max_concurrent = _resolve_system_concurrency(bm_adapter, max_concurrent)
         self._guard_config = _coerce_guard_config(guard_config)
         self._corpus_metadata = dict(corpus_metadata or {})
 
@@ -139,6 +144,12 @@ class BaselineEvaluationSuite:
 
         # 系统级信号量控制并发
         semaphore = asyncio.Semaphore(self._max_concurrent)
+        logger.info(
+            "[Suite] system-level concurrency=%d over %d baseline(s); per-sample concurrency: %s",
+            self._max_concurrent,
+            len(self._baselines),
+            ", ".join(f"{b.name}={_baseline_sample_concurrency(b)}" for b in self._baselines) or "n/a",
+        )
         all_results: Dict[str, List[BaselineResult]] = {}
 
         async def _run_one_system(baseline: BaselineAdapter):
@@ -765,6 +776,35 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _baseline_sample_concurrency(baseline: BaselineAdapter) -> int:
+    """Per-sample concurrency a baseline declares for itself, for logging only."""
+    try:
+        return max(int(baseline.get_max_concurrent()), 1)
+    except (AttributeError, TypeError, ValueError):
+        return 1
+
+
+def _resolve_system_concurrency(bm_adapter: Any, max_concurrent: Optional[int]) -> int:
+    """Resolve how many baseline systems may be evaluated at once.
+
+    An explicit value always wins. Otherwise the benchmark adapter's concurrency
+    configuration is used, so a profile-level setting reaches the suite instead of
+    being shadowed by a hardcoded constant. Falls back to 1 when the adapter
+    exposes nothing usable, since serial evaluation is always safe.
+    """
+    if max_concurrent is not None:
+        return max(int(max_concurrent), 1)
+    getter = getattr(bm_adapter, "get_max_concurrent", None)
+    if callable(getter):
+        try:
+            return max(int(getter()), 1)
+        except (TypeError, ValueError):
+            pass
+    return 1
+
+
 def _coerce_guard_config(value: Optional[GuardConfig | Dict[str, Any]]) -> GuardConfig:
     if value is None:
         return GuardConfig()

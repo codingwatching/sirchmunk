@@ -112,6 +112,12 @@ benchmarks/.env.global < benchmarks/hotpotqa/.env.hotpotqa.base < profile env < 
 
 Mock/smoke 使用 exploration profile。只有在 sample IDs 和运行设置冻结后，才使用 frozen profile。
 
+`HOTPOT_MAX_CONCURRENT` 控制两件事：LENS 运行时同时处理多少个样本，以及同时并行评估多少个竞品系统。它有意不控制单个竞品内部的样本并发——后者由各 `BaselineAdapter` 自行声明，且默认串行。像 ReAct 这类竞品每个样本要发多次 LLM 调用，抬高其内部并发既可能触发服务方限流，也会改变所报延迟的测量条件。把这一维度保留在竞品自身，能让论文表格中的延迟在各系统间保持可比。每次 baseline suite 运行开始时会打印生效值：
+
+```text
+[Suite] system-level concurrency=5 over 3 baseline(s); per-sample concurrency: bm25_rag=1, hybrid_rag=1, react=1
+```
+
 ## Step 1: Mock/Smoke Exploration
 
 这一阶段回答新用户的第一个问题：“我的本地环境、数据路径、检索、评估、artifact 写入和报告生成是否能跑通？”它故意不作为论文证据。
