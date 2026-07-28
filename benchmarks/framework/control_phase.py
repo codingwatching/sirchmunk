@@ -21,7 +21,7 @@ from typing import Dict
 
 
 class ControlBlock(str, Enum):
-    """Top-level control-layer blocks (``run_benchmark.py <block>``)."""
+    """Internal control-layer blocks for ResearchOps workflow phases."""
 
     ASSETS = "assets"
     SMOKE_TUNE = "smoke-tune"

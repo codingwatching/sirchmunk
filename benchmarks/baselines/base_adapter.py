@@ -174,7 +174,7 @@ class BaselineAdapter(ABC):
         return BaselineSetupResult()
 
     async def run(self, question: str, context_paths: List[str]) -> BaselinePrediction:
-        """Run one prediction. Defaults to predict() for backward compatibility."""
+        """Run one prediction through the adapter implementation."""
         return await self.predict(question, context_paths)
 
     async def evaluate(self, prediction: str, gold_answer: str, question: str, judge: Any) -> Dict[str, Any]:
@@ -276,9 +276,9 @@ class BaselineAdapter(ABC):
     def validate_index(self, corpus_manifest: Optional[Dict[str, Any]] = None) -> Any:
         """Validate that the built index covers the declared corpus.
 
-        The default implementation is permissive for backwards compatibility.
+        The default implementation is suitable for index-free and manual-import baselines.
         Indexing baselines should return ``BaselineIndexValidation`` or a
-        compatible dict with ``index_ready`` and coverage metadata.
+        dict with ``index_ready`` and coverage metadata.
         """
         if not _HAS_LIFECYCLE_SCHEMA or BaselineIndexValidation is None:
             return {"index_ready": True}

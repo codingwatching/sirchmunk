@@ -107,8 +107,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--baselines", default="",
                    help=(
                        "运行的竞品列表（逗号分隔）。Paper main 推荐 bm25_rag,hybrid_rag,react；"
-                       "Phase 0 后 bm25/bm25_local 与 naive_rag/naive_rag_local 仅表示 quickstart/local smoke baselines，"
-                       "不等同于论文主表 BM25-RAG。可选 related-work/lifecycle: lightrag_v136；"
+                       "quickstart/local smoke 可使用 bm25,naive_rag；"
+                       "related-work/lifecycle: lightrag_v136 或 lightrag_v136_<mode>；"
                        "imported: lightrag_v1, graphrag；ablation: lens_full,lens_no_prior,lens_no_seq,lens_no_reuse；"
                        "custom: module:factory。Long-context baseline 当前明确不纳入实现范围。"
                    ))
@@ -603,12 +603,12 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None
     )
     from baselines.base_adapter import BaselineAdapter
 
-    lower = raw_name.strip().lower().replace("-", "_")
-    if lower in ("bm25", "bm25_local"):
+    lower = raw_name.strip().lower()
+    if lower == "bm25":
         return LocalBM25Baseline(max_files=args.bm25_max_files)
-    if lower in ("bm25_rag", "rag_bm25"):
+    if lower == "bm25_rag":
         return BM25RAGBaseline(max_files=args.bm25_max_files)
-    if lower in ("hybrid_rag", "rag_hybrid"):
+    if lower == "hybrid_rag":
         return HybridRAGBaseline(
             max_files=args.hybrid_max_files,
             bm25_top_k=args.hybrid_bm25_top_k,
@@ -617,19 +617,20 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None
             dense_backend=args.hybrid_dense_backend,
             dense_dim=args.hybrid_dense_dim,
         )
-    if lower in ("react", "react_search"):
+    if lower == "react":
         return ReActSearchBaseline()
-    if lower in ("naive_rag", "naive_rag_local"):
+    if lower == "naive_rag":
         return NaiveRAGBaseline(max_files=args.naive_rag_max_files)
-    if lower in ("lightrag", "lightrag_v1"):
+    if lower == "lightrag_v1":
         return LightRAGV1Baseline(
             predictions_path=args.lightrag_predictions,
             setup_metrics_path=args.lightrag_setup_metrics,
         )
-    if lower in ("lightrag_v136", "lightrag_136", "lightrag_sdk", "lightrag_hybrid") or lower.startswith("lightrag_v136_"):
+    lightrag_modes = ("naive", "local", "global", "hybrid", "mix")
+    if lower == "lightrag_v136" or lower in {f"lightrag_v136_{mode}" for mode in lightrag_modes}:
         mode = args.lightrag_query_mode
-        for candidate in ("naive", "local", "global", "hybrid", "mix"):
-            if lower.endswith("_" + candidate):
+        for candidate in lightrag_modes:
+            if lower == f"lightrag_v136_{candidate}":
                 mode = candidate
                 break
         return LightRAGV136Baseline(
@@ -643,10 +644,7 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None
             predictions_path=args.graphrag_predictions,
             setup_metrics_path=args.graphrag_setup_metrics,
         )
-    if lower in ("lens_full", "full", "lens_no_prior", "no_prior",
-                 "lens_no_seq", "no_seq", "lens_no_reuse", "no_reuse",
-                 "no_multi_signal_prior", "no_sequential_exploration",
-                 "no_knowledge_reuse"):
+    if lower in ("lens_full", "lens_no_prior", "lens_no_seq", "lens_no_reuse"):
         if bm_adapter is None:
             raise ValueError("LENS ablation baseline requires bm_adapter")
         from ablations import build_single_lens_ablation
@@ -670,10 +668,11 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None
             raise TypeError(f"Factory {raw_name} did not return BaselineAdapter")
         return baseline
     raise ValueError(
-        "Unknown baseline. Use bm25_rag, hybrid_rag, or react for paper main; "
-        "bm25/bm25_local and naive_rag/naive_rag_local are quickstart/local smoke baselines; "
-        "related-work/lifecycle: lightrag_v136; imported: lightrag_v1, graphrag; "
-        "ablation: lens_no_prior, lens_no_seq, lens_no_reuse; custom: module:factory. "
+        "Unknown baseline. Use bm25 and naive_rag for quickstart/local smoke; "
+        "bm25_rag, hybrid_rag, and react for paper main; "
+        "related-work/lifecycle: lightrag_v136 or lightrag_v136_<mode>; "
+        "imported: lightrag_v1, graphrag; "
+        "ablation: lens_full, lens_no_prior, lens_no_seq, lens_no_reuse; custom: module:factory. "
         "Long-context is intentionally excluded from the current implementation scope."
     )
 

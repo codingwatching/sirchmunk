@@ -62,13 +62,13 @@ def build_single_lens_ablation(
     max_token_budget: int = 128_000,
     top_k_files: int = 5,
 ) -> BaselineAdapter:
-    """Build one ablation baseline by profile name.
+    """Build one ablation baseline by canonical profile name.
 
-    Supported names include:
-      lens_full / full
-      lens_no_prior / no_multi_signal_prior
-      lens_no_seq / no_sequential_exploration
-      lens_no_reuse / no_knowledge_reuse (appendix-only)
+    Supported names:
+      lens_full
+      lens_no_prior
+      lens_no_seq
+      lens_no_reuse (appendix-only)
     """
     return LensAblationAdapter(
         bm_adapter=bm_adapter,

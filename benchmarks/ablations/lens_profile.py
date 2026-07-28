@@ -113,23 +113,16 @@ class LensSearchProfile:
 
     @classmethod
     def by_name(cls, name: str) -> "LensSearchProfile":
-        normalized = name.strip().lower().replace("-", "_")
-        aliases = {
-            "full": cls.full,
+        normalized = name.strip().lower()
+        profiles = {
             "lens_full": cls.full,
-            "no_prior": cls.without_multi_signal_prior,
             "lens_no_prior": cls.without_multi_signal_prior,
-            "no_multi_signal_prior": cls.without_multi_signal_prior,
-            "no_seq": cls.without_sequential_exploration,
             "lens_no_seq": cls.without_sequential_exploration,
-            "no_sequential_exploration": cls.without_sequential_exploration,
-            "no_reuse": cls.without_knowledge_reuse,
             "lens_no_reuse": cls.without_knowledge_reuse,
-            "no_knowledge_reuse": cls.without_knowledge_reuse,
         }
-        if normalized not in aliases:
+        if normalized not in profiles:
             raise ValueError(f"Unknown LENS profile: {name}")
-        return aliases[normalized]()
+        return profiles[normalized]()
 
 
 def core_lens_profiles() -> List[LensSearchProfile]:

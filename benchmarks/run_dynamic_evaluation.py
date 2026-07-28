@@ -325,21 +325,22 @@ class _StageAdapter:
 
 
 def _baseline_by_name(spec: str, bm_adapter, args=None):
-    lower = spec.strip().lower().replace("-", "_")
-    if lower in {"bm25_rag", "rag_bm25"}:
+    lower = spec.strip().lower()
+    if lower == "bm25_rag":
         from baselines import BM25RAGBaseline
         return BM25RAGBaseline()
-    if lower in {"react", "react_search"}:
+    if lower == "react":
         from baselines import ReActSearchBaseline
         return ReActSearchBaseline()
-    if lower in {"lens_full", "full", "lens_no_prior", "no_prior", "lens_no_seq", "no_seq"}:
+    if lower in {"lens_full", "lens_no_prior", "lens_no_seq"}:
         from ablations import build_single_lens_ablation
         return build_single_lens_ablation(bm_adapter, profile_name=lower)
-    if lower in {"lightrag_v136", "lightrag_136", "lightrag_sdk", "lightrag_hybrid"} or lower.startswith("lightrag_v136_"):
+    lightrag_modes = ("naive", "local", "global", "hybrid", "mix")
+    if lower == "lightrag_v136" or lower in {f"lightrag_v136_{mode}" for mode in lightrag_modes}:
         from baselines import LightRAGV136Baseline
         mode = getattr(args, "lightrag_query_mode", "hybrid") if args is not None else "hybrid"
-        for candidate in ("naive", "local", "global", "hybrid", "mix"):
-            if lower.endswith("_" + candidate):
+        for candidate in lightrag_modes:
+            if lower == f"lightrag_v136_{candidate}":
                 mode = candidate
                 break
         return LightRAGV136Baseline(

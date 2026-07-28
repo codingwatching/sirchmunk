@@ -12,7 +12,6 @@ GoldenSet 的核心职责：
   5. 与自改进循环（run_research_loop.py）完全隔离
 
 文件命名约定：
-  legacy: benchmarks/{benchmark}/golden_set_{seed}_{n}.json
   sampled: benchmarks/{benchmark}/golden_set_{method}_{seed}_{n}_{checksum8}.json
 """
 from __future__ import annotations

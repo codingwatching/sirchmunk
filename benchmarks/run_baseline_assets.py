@@ -527,22 +527,22 @@ def _build_golden_like(adapter: Any, *, limit: int, seed: int) -> SimpleNamespac
 def _load_baselines(methods: List[str], args: argparse.Namespace) -> List[BaselineAdapter]:
     baselines: List[BaselineAdapter] = []
     for raw_name in methods:
-        lower = raw_name.strip().lower().replace("-", "_")
+        lower = raw_name.strip().lower()
         if not lower:
             continue
-        if lower in {"bm25", "bm25_local"}:
+        if lower == "bm25":
             from baselines import LocalBM25Baseline
             baselines.append(LocalBM25Baseline(max_files=args.bm25_max_files))
-        elif lower in {"bm25_rag", "rag_bm25"}:
+        elif lower == "bm25_rag":
             from baselines import BM25RAGBaseline
             baselines.append(BM25RAGBaseline(max_files=args.bm25_max_files))
-        elif lower in {"naive_rag", "naive_rag_local"}:
+        elif lower == "naive_rag":
             from baselines import NaiveRAGBaseline
             baselines.append(NaiveRAGBaseline(max_files=args.naive_rag_max_files))
-        elif lower in {"react", "react_search"}:
+        elif lower == "react":
             from baselines import ReActSearchBaseline
             baselines.append(ReActSearchBaseline())
-        elif lower in {"lightrag", "lightrag_v1"}:
+        elif lower == "lightrag_v1":
             from baselines import LightRAGV1Baseline
             baselines.append(LightRAGV1Baseline(args.lightrag_predictions, args.lightrag_setup_metrics))
         elif lower == "graphrag":

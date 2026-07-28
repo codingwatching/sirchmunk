@@ -30,7 +30,7 @@ class ReActSearchBaseline(BaselineAdapter):
         max_chars_per_file: int = 24_000,
         enable_dir_scan: bool = True,
         dir_scan_max_files: int = 200,
-        name: str = "react_search",
+        name: str = "react",
         citation_name: str = "ReAct Search",
     ) -> None:
         self._llm = llm
@@ -79,7 +79,7 @@ class ReActSearchBaseline(BaselineAdapter):
             rebuild_required=False,
             query_ready_immediately=True,
             metadata={
-                "baseline_type": "react_search",
+                "baseline_type": "react",
                 "max_loops": self._max_loops,
                 "max_token_budget": self._max_token_budget,
                 "tools": ["keyword_search", "file_read"] + (["dir_scan"] if self._enable_dir_scan else []),
@@ -98,7 +98,7 @@ class ReActSearchBaseline(BaselineAdapter):
             return BaselinePrediction(
                 answer="ReAct baseline unavailable: LLM is not configured.",
                 elapsed=time.monotonic() - start,
-                metadata={"baseline_type": "react_search", "error": "missing_llm"},
+                metadata={"baseline_type": "react", "error": "missing_llm"},
             )
 
         from sirchmunk.agentic.dir_scan_tool import DirScanTool
@@ -138,7 +138,7 @@ class ReActSearchBaseline(BaselineAdapter):
             elapsed=elapsed,
             tokens_used=int(getattr(ctx, "total_llm_tokens", 0) or 0),
             metadata={
-                "baseline_type": "react_search",
+                "baseline_type": "react",
                 "tools": registry.tool_names,
                 "loop_count": getattr(ctx, "loop_count", 0),
                 "read_file_ids": sorted(getattr(ctx, "read_file_ids", set()) or []),
@@ -174,7 +174,7 @@ class ReActSearchBaseline(BaselineAdapter):
             "update_supported": True,
             "rebuild_required": False,
             "query_ready_immediately": True,
-            "baseline_type": "react_search",
+            "baseline_type": "react",
         }
 
     def estimate_update_cost(self, mutation: Any) -> Dict[str, Any]:
@@ -191,7 +191,7 @@ class ReActSearchBaseline(BaselineAdapter):
 
     def extra_metadata(self) -> Dict[str, Any]:
         return {
-            "baseline_type": "react_search",
+            "baseline_type": "react",
             "index_required": False,
             "rebuild_required": False,
             "query_ready_immediately": True,

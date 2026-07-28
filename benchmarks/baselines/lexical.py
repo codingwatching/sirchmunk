@@ -27,7 +27,7 @@ class LocalBM25Baseline(BaselineAdapter):
         top_k: int = 5,
         llm: Optional[Any] = None,
         use_llm_synthesis: bool = True,
-        name: str = "bm25_local",
+        name: str = "bm25",
         citation_name: str = "BM25 Local + LLM (smoke)",
     ) -> None:
         self._max_files = max_files
@@ -140,7 +140,7 @@ class NaiveRAGBaseline(BaselineAdapter):
         max_chunks: int = 50000,
         llm: Optional[Any] = None,
         use_llm_synthesis: bool = True,
-        name: str = "naive_rag_local",
+        name: str = "naive_rag",
         citation_name: str = "Naive RAG Local + LLM (smoke)",
     ) -> None:
         self._chunk_words = chunk_words

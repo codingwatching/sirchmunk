@@ -83,9 +83,9 @@ def _baseline_factories(spec: str) -> List[Callable[[], BaselineAdapter]]:
     factories: List[Callable[[], BaselineAdapter]] = []
     for raw_name in [s.strip() for s in spec.split(",") if s.strip()]:
         lower = raw_name.lower()
-        if lower in {"bm25", "bm25_local"}:
+        if lower == "bm25":
             factories.append(lambda: LocalBM25Baseline())
-        elif lower in {"naive_rag", "naive_rag_local"}:
+        elif lower == "naive_rag":
             factories.append(lambda: NaiveRAGBaseline())
         elif ":" in raw_name:
             module_name, _, factory_name = raw_name.partition(":")

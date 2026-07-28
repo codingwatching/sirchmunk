@@ -93,13 +93,13 @@ def _load_baselines(spec: str) -> List[BaselineAdapter]:
     baselines: List[BaselineAdapter] = []
     for raw_name in [s.strip() for s in spec.split(",") if s.strip()]:
         lower = raw_name.lower()
-        if lower in {"bm25", "bm25_local"}:
+        if lower == "bm25":
             baselines.append(LocalBM25Baseline())
-        elif lower in {"bm25_rag", "rag_bm25"}:
+        elif lower == "bm25_rag":
             baselines.append(BM25RAGBaseline())
-        elif lower in {"hybrid_rag", "rag_hybrid"}:
+        elif lower == "hybrid_rag":
             baselines.append(HybridRAGBaseline())
-        elif lower in {"naive_rag", "naive_rag_local"}:
+        elif lower == "naive_rag":
             baselines.append(NaiveRAGBaseline())
         elif ":" in raw_name:
             module_name, _, factory_name = raw_name.partition(":")

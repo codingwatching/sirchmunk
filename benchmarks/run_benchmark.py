@@ -23,16 +23,16 @@ from typing import List
 
 _SCRIPT_DIR = Path(__file__).parent.resolve()
 
-_BLOCKS = {"assets", "smoke-tune", "smoke", "tune", "main", "ablation", "report", "status", "queue"}
+_TASKS = {"assets", "smoke-tune", "main", "ablation", "report", "status", "queue"}
 _ASSET_SUBCOMMANDS = {"prepare", "validate", "status", "scaling", "update-readiness"}
 
 
 def _usage() -> str:
     return """Usage:
-  python benchmarks/run_benchmark.py <block> [options]
-  python benchmarks/run_benchmark.py --block <block> [options]
+  python benchmarks/run_benchmark.py <task> [options]
+  python benchmarks/run_benchmark.py --task <task> [options]
 
-Blocks:
+Tasks:
   assets      Build/validate baseline assets and asset_registry.jsonl
   smoke-tune  Run quickstart smoke/tuning flow
   main        Run/assemble formal main experiment artifacts
@@ -48,27 +48,25 @@ Examples:
 """
 
 
-def _parse_block(argv: List[str]) -> tuple[str, List[str]]:
+def _parse_task(argv: List[str]) -> tuple[str, List[str]]:
     if not argv or argv[0] in {"-h", "--help"}:
         print(_usage())
         raise SystemExit(0)
-    if argv[0] == "--block":
+    if argv[0] == "--task":
         if len(argv) < 2:
-            raise SystemExit("--block requires a value")
-        block = argv[1]
+            raise SystemExit("--task requires a value")
+        task = argv[1]
         rest = argv[2:]
-    elif argv[0].startswith("--block="):
-        block = argv[0].split("=", 1)[1]
+    elif argv[0].startswith("--task="):
+        task = argv[0].split("=", 1)[1]
         rest = argv[1:]
     else:
-        block = argv[0]
+        task = argv[0]
         rest = argv[1:]
-    block = block.strip().lower()
-    if block not in _BLOCKS:
-        raise SystemExit(f"Unknown block: {block}\n\n{_usage()}")
-    if block in {"smoke", "tune"}:
-        block = "smoke-tune"
-    return block, rest
+    task = task.strip().lower()
+    if task not in _TASKS:
+        raise SystemExit(f"Unknown task: {task}\n\n{_usage()}")
+    return task, rest
 
 
 def _status(rest: List[str]) -> int:
@@ -109,7 +107,7 @@ def _status(rest: List[str]) -> int:
             "summary": str(path),
             "control_run_id": data.get("control_run_id"),
             "benchmark": data.get("benchmark"),
-            "block": data.get("block"),
+            "task": data.get("block"),
             "stage": data.get("stage"),
             "status": data.get("status"),
             "blocked": data.get("blocked"),
@@ -127,24 +125,24 @@ def _status(rest: List[str]) -> int:
     return 0
 
 
-def _command_for(block: str, rest: List[str]) -> List[str]:
-    if block == "assets":
+def _command_for(task: str, rest: List[str]) -> List[str]:
+    if task == "assets":
         if rest and rest[0] in _ASSET_SUBCOMMANDS:
             return [sys.executable, str(_SCRIPT_DIR / "run_baseline_assets.py"), rest[0], *rest[1:]]
         return [sys.executable, str(_SCRIPT_DIR / "run_baseline_assets.py"), "prepare", *rest]
-    if block == "smoke-tune":
+    if task == "smoke-tune":
         return [sys.executable, str(_SCRIPT_DIR / "run_quickstart.py"), *rest]
-    if block == "main":
+    if task == "main":
         return [sys.executable, str(_SCRIPT_DIR / "run_paper_experiment.py"), "main", *rest]
-    if block == "ablation":
+    if task == "ablation":
         if rest and rest[0] in {"ablation", "ablation-spec"}:
             return [sys.executable, str(_SCRIPT_DIR / "run_paper_experiment.py"), *rest]
         return [sys.executable, str(_SCRIPT_DIR / "run_paper_experiment.py"), "ablation", *rest]
-    if block == "queue":
+    if task == "queue":
         return [sys.executable, str(_SCRIPT_DIR / "run_queue.py"), *rest]
-    if block == "report":
+    if task == "report":
         return [sys.executable, str(_SCRIPT_DIR / "run_paper_experiment.py"), "report", *rest]
-    raise ValueError(block)
+    raise ValueError(task)
 
 
 def _run(cmd: List[str]) -> int:
@@ -153,10 +151,10 @@ def _run(cmd: List[str]) -> int:
 
 
 def main() -> None:
-    block, rest = _parse_block(sys.argv[1:])
-    if block == "status":
+    task, rest = _parse_task(sys.argv[1:])
+    if task == "status":
         raise SystemExit(_status(rest))
-    raise SystemExit(_run(_command_for(block, rest)))
+    raise SystemExit(_run(_command_for(task, rest)))
 
 
 if __name__ == "__main__":
