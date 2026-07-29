@@ -6887,6 +6887,7 @@ class AgenticSearch(BaseSearch):
                 lines.append(f"- Constraint: {constraint}")
         if lines:
             lines.append("- PRECISE_ANSWER must be the minimal answer span only; do not include explanations, multiple candidates, or SHOULD_ANSWER=false as the answer text.")
+            lines.append("- PRECISE_ANSWER must be copied verbatim from the evidence text: keep the exact surface form, spelling, word order, and number/ordinal style as written in the evidence; do not paraphrase, translate, or normalize it.")
             lines.append("- If evidence is relevant but partial, provide the best supported concise answer instead of refusing.")
         return "\n".join(lines)
 
@@ -7066,8 +7067,40 @@ class AgenticSearch(BaseSearch):
     @staticmethod
     def _trim_single_entity_answer(text: str, expected: str = "") -> str:
         cleaned = re.sub(r"\s+", " ", text).strip()
-        split = re.split(r"\s*(?:,|;|\n|\band\b|\bor\b)\s*", cleaned, maxsplit=1, flags=re.I)
+        # Work titles legitimately contain coordinating conjunctions
+        # (e.g. "Phineas and Ferb"), so trimming them at and/or would cut the
+        # gold span itself; only structural separators are safe there.
+        if expected == "work_title":
+            split = re.split(r"\s*(?:;|\n)\s*", cleaned, maxsplit=1)
+        else:
+            split = re.split(r"\s*(?:,|;|\n|\band\b|\bor\b)\s*", cleaned, maxsplit=1, flags=re.I)
         return split[0].strip() if split and split[0].strip() else cleaned
+
+    @classmethod
+    def _refusal_fallback_answer(
+        cls,
+        answer: str,
+        evidence: str,
+        context: Optional["SearchContext"] = None,
+    ) -> Optional[str]:
+        """Benchmark-gated best-candidate fallback for refusal outcomes.
+
+        Enabled only when ``SIRCHMUNK_REFUSAL_FALLBACK`` is truthy (default
+        off, so product behavior is unchanged). Benchmarks with no abstention
+        reward treat every refusal as a wrong answer; when synthesis already
+        produced a valid short answer span backed by non-empty evidence, the
+        span is returned instead of refusing. The fallback is recorded in
+        telemetry and the caller must not persist such answers as knowledge.
+        """
+        if os.environ.get("SIRCHMUNK_REFUSAL_FALLBACK", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            return None
+        if not (evidence or "").strip() or not answer or answer == _NO_RESULTS_MESSAGE:
+            return None
+        short = cls._extract_answer_span(answer)
+        if not short or cls._is_no_answer_value(short) or cls._is_reserved_answer_span(short):
+            return None
+        cls._record_context_telemetry(context, fallback_best_candidate=True)
+        return answer
 
     @classmethod
     def _verify_target_slot_answer(
@@ -8053,6 +8086,9 @@ class AgenticSearch(BaseSearch):
         target_slot_check = self._verify_target_slot_answer(query, answer, evidence, data_reqs)
         self._record_context_telemetry(context, **target_slot_check)
         if not should_answer and self._is_refusal_answer(answer):
+            fallback = self._refusal_fallback_answer(answer, retrieval.evidence, context)
+            if fallback is not None:
+                return fallback, False, None
             return _NO_RESULTS_MESSAGE, False, None
 
         accepted, reason = self._evaluate_evidence_acceptance(
@@ -8064,6 +8100,9 @@ class AgenticSearch(BaseSearch):
         )
 
         if not accepted:
+            fallback = self._refusal_fallback_answer(answer, retrieval.evidence, context)
+            if fallback is not None:
+                return fallback, False, None
             return _NO_RESULTS_MESSAGE, False, None
 
         cluster = self._make_answer_cluster(

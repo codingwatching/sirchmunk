@@ -59,6 +59,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--background-ratio", type=float, default=3.0)
     parser.add_argument("--background-seed", type=int, default=42)
     parser.add_argument("--allow-missing-evidence", action="store_true", help="Allow snapshots with unresolved evidence titles; not for main-table runs")
+    parser.add_argument("--rebuild-snapshots", action="store_true", help="Force rebuilding D_n snapshots even when a matching frozen snapshot manifest already exists")
     parser.add_argument("--force-recreate-golden", action="store_true")
     parser.add_argument("--run-baselines", action="store_true", help="Run built-in baselines for each G/D stage")
     parser.add_argument("--baselines", default="bm25_rag,hybrid_rag,react", help="Comma separated: bm25_rag,hybrid_rag,react,lens_full,lens_no_prior,lens_no_seq,lightrag_v136,lightrag_v136_<mode>")
@@ -134,11 +135,24 @@ def main() -> int:
         sample_ids = stage["sample_ids_file"]
         ids = _load_sample_ids(sample_ids)
         d_stage = f"D_{stage_n}"
+        snapshot_dir = output_dir / "corpus" / d_stage
+        reused = None if args.rebuild_snapshots else _load_reusable_snapshot_manifest(
+            snapshot_dir,
+            stage_name=d_stage,
+            sample_ids=ids,
+            materialize_mode=args.materialize,
+            background_ratio=args.background_ratio,
+            background_seed=args.background_seed,
+        )
+        if reused is not None:
+            print(f"[snapshot-gate] {d_stage}: frozen snapshot reused (corpus_checksum={reused.get('corpus_checksum','')})", flush=True)
+            corpus_manifests.append(reused)
+            continue
         manifest = build_dynamic_corpus_snapshot(
             parent_samples,
             sample_ids=ids,
             wiki_dir=wiki_dir,
-            output_dir=output_dir / "corpus" / d_stage,
+            output_dir=snapshot_dir,
             stage_name=d_stage,
             materialize_mode=args.materialize,
             background_ratio=args.background_ratio,
@@ -146,6 +160,7 @@ def main() -> int:
             resolver=resolver,
             strict_evidence=not args.allow_missing_evidence,
         )
+        print(f"[snapshot-gate] {d_stage}: snapshot built (corpus_checksum={manifest.corpus_checksum})", flush=True)
         corpus_manifests.append(manifest.to_dict())
 
     bindings = build_stage_bindings(
@@ -490,6 +505,51 @@ def _select_sample_dicts(samples: list[dict], sample_ids: list[str]) -> list[dic
     return [by_id[sample_id] for sample_id in sample_ids]
 
 
+def _load_reusable_snapshot_manifest(
+    snapshot_dir: Path,
+    *,
+    stage_name: str,
+    sample_ids: list,
+    materialize_mode: str,
+    background_ratio: float,
+    background_seed: int,
+) -> dict | None:
+    """Return the persisted snapshot manifest when it matches this request.
+
+    Frozen ``D_n`` snapshots must be built once and then reused: rebuilding on
+    every invocation both wastes time and breaks result-reuse fingerprints
+    whenever any non-determinism slips into materialization. A snapshot is
+    reusable only when its manifest binds the same stage name, sample-ID
+    checksum, frozen order, materialization mode, and background selection
+    parameters, and its search corpus directory still exists on disk.
+    """
+    manifest_path = snapshot_dir / "corpus_snapshot_manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    expected_ids = [str(sample_id) for sample_id in sample_ids]
+    checks = [
+        (str(manifest.get("stage_name", "")), stage_name),
+        (str(manifest.get("sample_id_checksum", "")), compute_sample_id_checksum(expected_ids)),
+        (str(manifest.get("frozen_order_checksum", "")), compute_frozen_order_checksum(expected_ids)),
+        (str(manifest.get("materialize_mode", "")), str(materialize_mode)),
+    ]
+    background = manifest.get("background_selection_manifest") or {}
+    checks.append((str(background.get("seed", "")), str(background_seed)))
+    checks.append((str(background.get("background_ratio", "")), str(background_ratio)))
+    if any(str(observed) != str(expected) for observed, expected in checks):
+        return None
+    search_dir = manifest.get("search_corpus_dir", "")
+    if not search_dir or not Path(search_dir).exists():
+        return None
+    if not str(manifest.get("corpus_checksum", "")):
+        return None
+    return manifest
+
+
 def _generate_snapshot_table(corpus_manifests: list[dict], output_dir: Path) -> dict:
     from evaluation.dynamic_table_generator import DynamicPaperTableGenerator
     return {f"snapshot_{k}": v for k, v in DynamicPaperTableGenerator().generate_snapshot_audit_table(corpus_manifests, output_dir / "tables").items()}
@@ -506,16 +566,25 @@ def _prepare_reuse_gate(args, binding, stage_adapter, baselines, baseline_dir: P
             continue
         expected = _stage_execution_record(binding, stage_adapter, baseline, result_path)
         if not record_path.exists():
+            print(f"[reuse-gate] {baseline.name}: no stage execution record, dropping cached results", flush=True)
             result_path.unlink(missing_ok=True)
             continue
         try:
             record = json.loads(record_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
+            print(f"[reuse-gate] {baseline.name}: stage record unreadable, dropping cached results", flush=True)
             result_path.unlink(missing_ok=True)
             continue
         reuse = validate_result_reuse(expected, record)
         if not reuse.get("reusable"):
+            mismatches = {
+                key: item for key, item in (reuse.get("checks") or {}).items()
+                if not item.get("matched")
+            }
+            print(f"[reuse-gate] {baseline.name}: cache rejected, mismatched fields: {json.dumps(mismatches, ensure_ascii=False)}", flush=True)
             result_path.unlink(missing_ok=True)
+        else:
+            print(f"[reuse-gate] {baseline.name}: cached stage results accepted for reuse", flush=True)
 
 
 class _StageEnv:

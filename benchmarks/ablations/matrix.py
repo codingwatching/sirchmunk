@@ -25,7 +25,7 @@ def build_lens_ablation_baselines(
     include_full: bool = True,
     max_loops: int = 10,
     max_token_budget: int = 128_000,
-    top_k_files: int = 5,
+    top_k_files: int = 10,
 ) -> List[BaselineAdapter]:
     """Build BaselineAdapter instances for the core LENS ablation matrix.
 
@@ -60,7 +60,7 @@ def build_single_lens_ablation(
     *,
     max_loops: int = 10,
     max_token_budget: int = 128_000,
-    top_k_files: int = 5,
+    top_k_files: int = 10,
 ) -> BaselineAdapter:
     """Build one ablation baseline by canonical profile name.
 

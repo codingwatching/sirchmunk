@@ -29,7 +29,7 @@ class LensAblationAdapter(BaselineAdapter):
         *,
         max_loops: int = 10,
         max_token_budget: int = 128_000,
-        top_k_files: int = 5,
+        top_k_files: int = 10,
         name_prefix: str = "ablation",
     ) -> None:
         self._bm_adapter = bm_adapter

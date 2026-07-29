@@ -555,14 +555,26 @@ def _can_reuse_baseline_cache(path: Path, baseline: BaselineAdapter, golden_set:
     if not first:
         return False, "empty_or_unreadable_jsonl"
     expected = _baseline_cache_identity(baseline)
-    actual = first.get("baseline_cache_identity") if isinstance(first.get("baseline_cache_identity"), dict) else {}
+    # The identity block is persisted inside each record's metadata (and
+    # mirrored into telemetry), not at the record top level, so the reuse
+    # check must look there as well; otherwise every valid cache is judged
+    # stale and silently re-run.
+    actual: Dict[str, Any] = {}
+    metadata = first.get("metadata") if isinstance(first.get("metadata"), dict) else {}
+    telemetry = first.get("telemetry") if isinstance(first.get("telemetry"), dict) else {}
+    for source in (first, metadata, telemetry):
+        candidate = source.get("baseline_cache_identity")
+        if isinstance(candidate, dict) and candidate:
+            actual = candidate
+            break
     if not actual:
+        field_source = telemetry if telemetry.get("result_schema_version") else first
         actual = {
-            "result_schema_version": first.get("result_schema_version", ""),
-            "baseline_name": first.get("baseline_name", ""),
-            "citation_name": first.get("citation_name", first.get("system_name", "")),
-            "adapter_class": first.get("adapter_class", ""),
-            "config_hash": first.get("config_hash", ""),
+            "result_schema_version": field_source.get("result_schema_version", ""),
+            "baseline_name": field_source.get("baseline_name", ""),
+            "citation_name": field_source.get("citation_name", field_source.get("system_name", "")),
+            "adapter_class": field_source.get("adapter_class", ""),
+            "config_hash": field_source.get("config_hash", ""),
         }
     for key, expected_value in expected.items():
         actual_value = str(actual.get(key, ""))

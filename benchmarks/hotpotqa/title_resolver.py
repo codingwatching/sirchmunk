@@ -185,6 +185,12 @@ class HotpotQATitleResolver:
                 if key not in seen:
                     seen.add(key)
                     hinted_shards.append(path)
+            # shard_hint is assembled from set-ordered lookups, so its value
+            # order is hash-randomized per process. Titles that occur in more
+            # than one shard resolve to whichever shard is scanned first, so
+            # the scan order must be deterministic for snapshots (and their
+            # checksums) to be reproducible across runs and machines.
+            hinted_shards.sort(key=str)
         scan_order = hinted_shards + [
             path for path in self.candidate_files() if path not in set(hinted_shards)
         ] if hinted_shards else self.candidate_files()
@@ -311,13 +317,18 @@ def _flatten_text(value: Any) -> List[str]:
 def _materialize_record(record: Dict[str, Any], title: str, source: Path, record_idx: int, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = safe_title_filename(title, fallback=f"record_{record_idx}")
-    digest = hashlib.sha256(f"{source}:{record_idx}:{title}".encode("utf-8")).hexdigest()[:8]
+    # Use the shard's stable relative identity (parent dir + filename) instead
+    # of its absolute path so materialized article filenames — and every
+    # checksum derived from them — are reproducible across machines and
+    # dataset mount points.
+    shard_key = f"{source.parent.name}/{source.name}"
+    digest = hashlib.sha256(f"{shard_key}:{record_idx}:{title}".encode("utf-8")).hexdigest()[:8]
     path = out_dir / f"{stem}_{digest}.txt"
     if path.exists():
         return path
     body = {
         "title": title,
-        "source_path": str(source),
+        "source_path": shard_key,
         "record_idx": record_idx,
     }
     text = _record_text(record)

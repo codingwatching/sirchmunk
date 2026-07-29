@@ -598,7 +598,12 @@ def _materialize_source(source: Path, docs_dir: Path, title: str, role: str, mat
     if materialize_mode == "manifest":
         return source
     suffix = source.suffix or ".txt"
-    digest = hashlib.sha256(str(source.resolve()).encode("utf-8")).hexdigest()[:8]
+    # The digest must be reproducible across output directories and machines,
+    # so it is derived from the stable article identity (title/role) and the
+    # source *filename* rather than any absolute filesystem path. Absolute
+    # paths made snapshot filenames — and therefore corpus checksums — drift
+    # between hosts and between rebuild locations.
+    digest = hashlib.sha256(f"{role}:{title}:{source.name}".encode("utf-8")).hexdigest()[:8]
     target = docs_dir / role / f"{safe_title_filename(title)}_{digest}{suffix}"
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() or target.is_symlink():
