@@ -1,6 +1,7 @@
 """HotpotQA evidence utilities."""
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set
@@ -14,19 +15,40 @@ def evaluate_supporting_facts(
     evidence_sources: Iterable[str] | None = None,
     evidence_texts: Iterable[str] | None = None,
     context: Any = None,
+    resolved_title_paths: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
     """Compute lightweight supporting-fact recall from retrieved file paths.
 
-    P0 does not yet inspect sentence-level snippets from the search pipeline, so
-    this evaluator measures title-level supporting fact coverage. It is still
-    valuable for fullwiki runs because failures can be separated into answer
-    synthesis errors vs. evidence discovery misses.
+    Title-level coverage is derived from three complementary signals so it stays
+    correct across both corpus layouts used by the protocol:
+
+    - filename-title match: dynamic ``G_n/D_n`` snapshots materialize one file
+      per article with the title in the filename, so the article title can be
+      recovered from the read path directly.
+    - resolved shard-path match: the raw enwiki dump packs many articles into a
+      single multi-article shard whose filename carries no title. ``resolved_
+      title_paths`` maps each gold title to the absolute shard that contains it
+      (via the cached corpus title index), so a gold title counts as retrieved
+      when the system read the shard holding it.
+    - sentence-level match: when the system exposes evidence snippets, the gold
+      supporting sentence is matched against snippet content directly.
     """
     gold_facts = _attach_supporting_sentences(_extract_facts(supporting_facts), context)
     gold_titles = {fact["title"] for fact in gold_facts}
     retrieved_titles = _titles_from_paths(read_file_ids or [])
     retrieved_titles.update(_titles_from_paths(evidence_sources or []))
     retrieved_titles.update(_titles_from_retrieval_logs(retrieval_logs or []))
+
+    # Resolve which gold titles were retrieved by shard path. In the raw enwiki
+    # dump the filename carries no title, so this is the only reliable title
+    # signal for the frozen main experiment.
+    read_path_set = _normalized_path_set(read_file_ids or [])
+    read_path_set |= _normalized_path_set(evidence_sources or [])
+    read_path_set |= _normalized_paths_from_retrieval_logs(retrieval_logs or [])
+    shard_hit_titles: Set[str] = set()
+    for norm_title, shard_path in (resolved_title_paths or {}).items():
+        if shard_path and _normalize_path(shard_path) in read_path_set:
+            shard_hit_titles.add(_normalize_title(norm_title))
 
     if not gold_titles:
         return {
@@ -51,6 +73,7 @@ def evaluate_supporting_facts(
         title for title in gold_titles
         if any(_title_matches(title, retrieved) for retrieved in retrieved_titles)
     }
+    title_hits |= (gold_titles & shard_hit_titles)
     fact_hits = [fact for fact in gold_facts if fact["title"] in title_hits]
     sentence_facts = [fact for fact in gold_facts if fact.get("sentence")]
     sentence_hits = [
@@ -214,6 +237,40 @@ def _sentence_matches(gold_sentence: str, evidence_text: str) -> bool:
         return False
     overlap = len(gold_tokens & evidence_tokens) / max(len(gold_tokens), 1)
     return overlap >= 0.6
+
+
+def _normalize_path(raw: Any) -> str:
+    """Return a canonical absolute path for read/evidence overlap checks."""
+    if not raw:
+        return ""
+    try:
+        return os.path.realpath(os.path.abspath(str(raw)))
+    except (OSError, ValueError):
+        return str(raw)
+
+
+def _normalized_path_set(paths: Iterable[Any]) -> Set[str]:
+    result: Set[str] = set()
+    for raw in paths:
+        normalized = _normalize_path(raw)
+        if normalized:
+            result.add(normalized)
+    return result
+
+
+def _normalized_paths_from_retrieval_logs(logs: Iterable[Dict[str, Any]]) -> Set[str]:
+    result: Set[str] = set()
+    for log in logs:
+        metadata = log.get("metadata", {}) if isinstance(log, dict) else {}
+        for key in ("path", "file", "file_path", "files", "file_paths"):
+            value = metadata.get(key) if isinstance(metadata, dict) else None
+            if isinstance(value, list):
+                result |= _normalized_path_set(value)
+            elif value:
+                normalized = _normalize_path(value)
+                if normalized:
+                    result.add(normalized)
+    return result
 
 
 def _titles_from_retrieval_logs(logs: Iterable[Dict[str, Any]]) -> Set[str]:

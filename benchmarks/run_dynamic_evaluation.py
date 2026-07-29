@@ -62,6 +62,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--force-recreate-golden", action="store_true")
     parser.add_argument("--run-baselines", action="store_true", help="Run built-in baselines for each G/D stage")
     parser.add_argument("--baselines", default="bm25_rag,hybrid_rag,react", help="Comma separated: bm25_rag,hybrid_rag,react,lens_full,lens_no_prior,lens_no_seq,lightrag_v136,lightrag_v136_<mode>")
+    parser.add_argument("--baseline-max-files", type=int, default=50000, help="Max corpus files indexed by BM25-RAG/Hybrid-RAG per stage; must cover the largest D_n snapshot so evidence files are never truncated out of the index")
     parser.add_argument("--lightrag-query-mode", default="hybrid", choices=["naive", "local", "global", "hybrid", "mix"], help="Default LightRAG v1.3.6 query mode")
     parser.add_argument("--lightrag-max-files", type=int, default=0, help="LightRAG v1.3.6 max indexed files, 0=unlimited")
     parser.add_argument("--lightrag-max-file-chars", type=int, default=300000, help="LightRAG v1.3.6 max chars per indexed file")
@@ -452,12 +453,13 @@ class _StageAdapter:
 
 def _baseline_by_name(spec: str, bm_adapter, args=None):
     lower = spec.strip().lower()
+    max_files = int(getattr(args, "baseline_max_files", 50000) or 50000) if args is not None else 50000
     if lower == "bm25_rag":
         from baselines import BM25RAGBaseline
-        return BM25RAGBaseline()
+        return BM25RAGBaseline(max_files=max_files)
     if lower == "hybrid_rag":
         from baselines import HybridRAGBaseline
-        return HybridRAGBaseline()
+        return HybridRAGBaseline(max_files=max_files)
     if lower == "react":
         from baselines import ReActSearchBaseline
         return ReActSearchBaseline()
@@ -575,8 +577,12 @@ def _dynamic_result_row(binding, baseline, results: list) -> dict:
         "official_em": _avg_metric(metric_payloads, "official_em") * 100,
         "official_f1": _avg_metric(metric_payloads, "official_f1") * 100,
         "evidence_recall": _avg_metric(metric_payloads, "evidence_recall") * 100,
-        "evidence_trace_coverage": evidence_trace_count / max(n, 1) * 100,
-        "evidence_trace_count": sum(len(_evidence_traces_of_result(result)) for result in results),
+        # Source-grounded answer rate: the fraction of samples whose answer is
+        # backed by retrieved gold evidence. The previous "has any trace" count
+        # was trivially 100% for every system that read at least one file and
+        # carried no discriminative signal for the paper table.
+        "evidence_trace_coverage": _avg_metric(metric_payloads, "answer_source_grounded") * 100,
+        "evidence_trace_count": evidence_trace_count,
         "avg_latency": sum(float(getattr(result, "elapsed", 0.0) or 0.0) for result in results) / max(n, 1),
         "avg_tokens": sum(int(getattr(result, "tokens_used", 0) or 0) + int(getattr(result, "judge_tokens", 0) or 0) for result in results) / max(n, 1),
         "avg_oracle_calls": query_budget_summary.get("avg_oracle_calls", 0.0),

@@ -12,6 +12,7 @@
 #
 # Usage:
 #   bash scripts/run_paper_experiments.sh <stage>
+#   TRIAL=1 bash scripts/run_paper_experiments.sh <stage>   # small trial (n=10)
 #   stages: smoke | sync | sampling | validate | assets | dynamic | main | report | status | ablation | all
 #
 # Notes:
@@ -20,6 +21,10 @@
 #   - Sampling is gated on raw-corpus synchronization: `create` resolves every
 #     supporting-fact article against the enwiki dump and records the dump
 #     fingerprint (wiki_corpus_fingerprint) in the sample-ids metadata.
+#   - Dynamic baselines include lens_full: the dynamic task does not run LENS
+#     implicitly, and the stale-index arm needs LENS as the index-free control.
+#   - TRIAL=1 exercises every link with n=10, stages 5,10, and a separate
+#     output root (output/trial) so formal artifacts are never touched.
 #   - "all" runs the full frozen path in order; smoke is excluded (exploration only).
 # =============================================================================
 set -euo pipefail
@@ -29,11 +34,26 @@ cd "$ROOT"
 
 ENV_EXPLORATION="benchmarks/hotpotqa/.env.hotpotqa.exploration"
 ENV_FROZEN="benchmarks/hotpotqa/.env.hotpotqa.frozen"
-OUTPUT_DIR="benchmarks/hotpotqa/output"
+
+TRIAL="${TRIAL:-0}"
+if [[ "$TRIAL" == "1" ]]; then
+  OUTPUT_DIR="benchmarks/hotpotqa/output/trial"
+  TARGET_N=10
+  DYNAMIC_STAGES="5,10"
+  STALENESS_MAX=10
+  REPORT_TITLE="HotpotQA Fullwiki ResearchOps Trial Report"
+else
+  OUTPUT_DIR="benchmarks/hotpotqa/output"
+  TARGET_N=500
+  DYNAMIC_STAGES="125,250,500"
+  STALENESS_MAX=200
+  REPORT_TITLE="HotpotQA Fullwiki ResearchOps Report"
+fi
+
+DYNAMIC_BASELINES="bm25_rag,hybrid_rag,react,lens_full"
 SAMPLING_DIR="$OUTPUT_DIR/main/sampling"
-SAMPLE_IDS="$SAMPLING_DIR/sampling_stratified_42_500_sample_ids.json"
-SAMPLE_MANIFEST="$SAMPLING_DIR/sampling_stratified_42_500_manifest.json"
-REPORT_TITLE="HotpotQA Fullwiki ResearchOps Report"
+SAMPLE_IDS="$SAMPLING_DIR/sampling_stratified_42_${TARGET_N}_sample_ids.json"
+SAMPLE_MANIFEST="$SAMPLING_DIR/sampling_stratified_42_${TARGET_N}_manifest.json"
 
 log() { printf '\n=== [%s] %s ===\n' "$(date '+%F %T')" "$*"; }
 
@@ -89,12 +109,12 @@ stage_sampling() {
   if sample_ids_fingerprinted; then
     log "Stage 1: fingerprinted frozen sample IDs already exist, skipping create: $SAMPLE_IDS"
   else
-    log "Stage 1: create frozen stratified sample IDs (n=500, seed=42, corpus-sync gated)"
+    log "Stage 1: create frozen stratified sample IDs (n=$TARGET_N, seed=42, corpus-sync gated)"
     python benchmarks/run_sampling.py create \
       --benchmark hotpotqa \
       --env "$ENV_FROZEN" \
       --method stratified \
-      --target-n 500 \
+      --target-n "$TARGET_N" \
       --seed 42 \
       --strata type,supporting_fact_bucket \
       --allocation proportional \
@@ -157,21 +177,26 @@ stage_assets() {
 # Nested stages 125/250/500 with the stale-index arm enabled.
 # -----------------------------------------------------------------------------
 stage_dynamic() {
-  log "Stage 3: dynamic G_n/D_n evaluation with stale-index arm"
+  log "Stage 3: dynamic G_n/D_n evaluation with stale-index arm (baselines: $DYNAMIC_BASELINES)"
+  # copy materialization is required for retrieval correctness: ripgrep-based
+  # search (LENS rga channel, ReAct keyword search) does not follow symlinks,
+  # so a symlink snapshot silently blinds every grep-backed system.
   python benchmarks/run_benchmark.py dynamic \
     --benchmark hotpotqa \
     --env "$ENV_FROZEN" \
-    --golden-n 500 \
+    --output-dir "$OUTPUT_DIR/dynamic_eval" \
+    --golden-n "$TARGET_N" \
     --seed 42 \
-    --stages 125,250,500 \
+    --stages "$DYNAMIC_STAGES" \
     --strata type,supporting_fact_bucket \
-    --materialize symlink \
+    --materialize copy \
     --background-ratio 3.0 \
     --background-seed 42 \
     --run-baselines \
-    --baselines bm25_rag,hybrid_rag,react \
+    --baselines "$DYNAMIC_BASELINES" \
+    --baseline-max-files 50000 \
     --stale-index-arm \
-    --staleness-max-samples 200
+    --staleness-max-samples "$STALENESS_MAX"
 }
 
 # -----------------------------------------------------------------------------
@@ -180,7 +205,10 @@ stage_dynamic() {
 # -----------------------------------------------------------------------------
 stage_main() {
   log "Stage 4: frozen main experiment (Sirchmunk + bm25_rag,hybrid_rag,react)"
-  python benchmarks/run_benchmark.py main \
+  # cold cache must actually clear caches, otherwise Gate 5 cache_policy errors
+  # ("cold cache requested but allow_clear=False"). Clearing is restricted to
+  # cache dirs under work_path by CacheManager.
+  CACHE_ALLOW_CLEAR=true python benchmarks/run_benchmark.py main \
     --benchmark hotpotqa \
     --env "$ENV_FROZEN" \
     --output-dir "$OUTPUT_DIR" \
@@ -206,16 +234,29 @@ stage_main() {
 # -----------------------------------------------------------------------------
 stage_report() {
   local run_id="${RUN_ID:-}"
-  if [[ -z "$run_id" ]]; then
-    run_id="$(ls -1t "$OUTPUT_DIR/main/runs" 2>/dev/null | head -1 || true)"
+  if [[ -z "$run_id" && -f "$OUTPUT_DIR/main/main_summary.json" ]]; then
+    # main_summary.json is the authoritative run-status artifact
+    run_id="$(python -c "import json;print(json.load(open('$OUTPUT_DIR/main/main_summary.json')).get('control_run_id',''))")"
   fi
   if [[ -z "$run_id" ]]; then
-    echo "No main run found under $OUTPUT_DIR/main/runs; run stage 'main' first." >&2
+    echo "No main run recorded in $OUTPUT_DIR/main/main_summary.json; run stage 'main' first." >&2
     exit 1
   fi
-  log "Stage 5: regenerate report for run $run_id"
+  # Sirchmunk run artifacts live under HOTPOT_OUTPUT_DIR (frozen profile:
+  # output/frozen/runs), not under the facade --output-dir main/runs.
+  local run_dir=""
+  for candidate in \
+    "$OUTPUT_DIR/main/runs/$run_id" \
+    "benchmarks/hotpotqa/output/frozen/runs/$run_id"; do
+    if [[ -d "$candidate" ]]; then run_dir="$candidate"; break; fi
+  done
+  if [[ -z "$run_dir" ]]; then
+    echo "Run directory for '$run_id' not found under main/runs or frozen/runs." >&2
+    exit 1
+  fi
+  log "Stage 5: regenerate report for run $run_id ($run_dir)"
   python benchmarks/run_benchmark.py report \
-    --run-dir "$OUTPUT_DIR/main/runs/$run_id" \
+    --run-dir "$run_dir" \
     --table-json "$OUTPUT_DIR/main/evaluation/paper_table.json" \
     --output-dir "$OUTPUT_DIR/main/report" \
     --title "$REPORT_TITLE" \
@@ -231,21 +272,31 @@ stage_status() {
 }
 
 # -----------------------------------------------------------------------------
-# Stage 6: frozen mechanism ablation (tab:ablation).
-# Core variants: lens_full / lens_no_prior / lens_no_seq (lens_no_reuse stays
-# appendix-only per paper design).
+# Stage 6: frozen mechanism ablation (paper tab:ablation).
+# Runs the three semantic LENS profiles (lens_full / lens_no_prior /
+# lens_no_seq) through the same evaluation suite and frozen sample IDs as the
+# main experiment. This intentionally avoids the env-grid ablation matrix:
+# several of its axes are not wired to the search pipeline, so its variants do
+# not correspond to the paper's prior/sequential mechanism design.
 # -----------------------------------------------------------------------------
 stage_ablation() {
-  log "Stage 6: frozen LENS mechanism ablation"
-  python benchmarks/run_benchmark.py ablation \
+  log "Stage 6: frozen LENS mechanism ablation (lens_full,lens_no_prior,lens_no_seq)"
+  CACHE_ALLOW_CLEAR=true python benchmarks/run_evaluation.py \
     --benchmark hotpotqa \
     --env "$ENV_FROZEN" \
     --sample-ids-file "$SAMPLE_IDS" \
-    --cache-mode cold \
-    --max-combinations 16 \
-    --run \
-    --max-concurrent 1 \
-    --replace
+    --baselines lens_full,lens_no_prior,lens_no_seq \
+    --ours-name "LENS" \
+    --output-dir "$OUTPUT_DIR/ablation" \
+    --baseline-sample-timeout 0 \
+    --baseline-max-runtime 0 \
+    --baseline-max-total-tokens 0 \
+    --baseline-max-api-cost-usd 0 \
+    --baseline-max-disk-bytes 0 \
+    --baseline-min-free-disk-bytes 0 \
+    --context-corpus-provenance wiki \
+    --context-corpus-risk raw_wiki \
+    --generate-report
 }
 
 usage() {

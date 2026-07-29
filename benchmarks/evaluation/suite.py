@@ -649,6 +649,21 @@ def _merge_prediction_telemetry(telemetry: Dict[str, Any], metadata: Dict[str, A
             value = source.get(key) if isinstance(source, dict) else None
             if value and not telemetry.get(key):
                 telemetry[key] = value
+    # Promote scalar query-budget signals so query-budget normalization can see
+    # them. Agentic baselines (ReAct, LENS ablation adapter) report loop_count
+    # and llm_calls under metadata or metadata['telemetry'] rather than at the
+    # top telemetry level; without this promotion oracle_calls/llm_calls collapse
+    # to zero in the budget tables.
+    for source in (nested, metadata):
+        if not isinstance(source, dict):
+            continue
+        for key in ("loop_count", "llm_calls", "total_llm_calls", "oracle_calls",
+                    "num_files_read", "search_history_count", "total_tokens"):
+            value = source.get(key)
+            if value in (None, ""):
+                continue
+            if telemetry.get(key) in (None, "", 0, 0.0):
+                telemetry[key] = value
     top_items = []
     for key in ("top_chunks", "top_docs"):
         value = metadata.get(key)

@@ -217,7 +217,7 @@ passed                        = True
 
 Evidence closure is blocking because a question whose supporting-fact article is absent cannot be answered from a snapshot at all. Context-distractor closure is reported but non-blocking, since a missing distractor only makes a snapshot slightly easier. Use `--allow-corpus-desync` to freeze anyway when you accept that the run is not main-table eligible.
 
-The first check scans the dump once (about 30s) and caches a title index keyed by the dump fingerprint under `benchmarks/hotpotqa/.work/.cache/corpus_index/`; later checks and stage builds reuse it in about a second. `--rebuild-corpus-index` forces a rescan. The dump identity is recorded as `wiki_corpus_fingerprint` in the dataset manifest and as `wiki_corpus_fingerprint` in the sample-ids metadata, so replacing, truncating, or extending the dump changes the recorded fingerprint instead of silently passing.
+The first check scans the dump once (about 30s) and caches a title index keyed by the dump fingerprint under `benchmarks/hotpotqa/.work/corpus_index/`; later checks and stage builds reuse it in about a second. The title index is a deterministic dump-derived artifact, so it deliberately lives outside `.cache` and survives cold-cache clearing. `--rebuild-corpus-index` forces a rescan. The dump identity is recorded as `wiki_corpus_fingerprint` in the dataset manifest and as `wiki_corpus_fingerprint` in the sample-ids metadata, so replacing, truncating, or extending the dump changes the recorded fingerprint instead of silently passing.
 
 ```bash
 python benchmarks/run_sampling.py create \
@@ -434,6 +434,8 @@ baseline_index_scope is not evaluation_set_sample_context
 validator has no error-level issue
 ```
 
+Cold cache is only *applied* when clearing is explicitly authorized: export `CACHE_ALLOW_CLEAR=true` for frozen `main`/ablation runs, otherwise the cache report records `cold cache requested but allow_clear=False` and Gate 5 blocks the run. Clearing is restricted by `CacheManager` to cache directories under the benchmark work path; the dump-derived corpus title index lives outside `.cache` and deliberately survives cold clearing. `CACHE_DRY_RUN=true` records intended actions without deleting.
+
 The academic validator treats corpus boundary violations as blocking issues. `sample_context_corpus` means the table used answerable HotpotQA sample contexts rather than the raw corpus. `evaluation_set_context_index` means at least one baseline indexed the evaluation-set sample context. `hybrid_context_corpus` is a warning that sample+wiki results need separate claim wording and should not be compared directly with raw-corpus rows.
 
 <details>
@@ -482,7 +484,7 @@ python benchmarks/run_benchmark.py assets scaling \
   --scales 10k:10000,100k:100000,fullwiki:0 \
   --limit 20 \
   --seed 42 \
-  --materialize symlink \
+  --materialize copy \
   --build-timeout 86400 \
   --max-ram-bytes 0 \
   --max-disk-bytes 500000000000 \
@@ -503,7 +505,7 @@ python benchmarks/run_benchmark.py assets update-readiness \
   --delta-docs-dir /path/to/delta/docs \
   --doc-ids doc_a.txt,doc_b.txt \
   --mutation-ratio 0.0 \
-  --materialize symlink \
+  --materialize copy \
   --limit 20 \
   --seed 42 \
   --bm25-max-files 20000 \
@@ -526,7 +528,7 @@ python benchmarks/run_benchmark.py dynamic \
   --seed 42 \
   --stages 125,250,500 \
   --strata type,supporting_fact_bucket \
-  --materialize symlink \
+  --materialize copy \
   --background-ratio 3.0 \
   --background-seed 42 \
   --run-baselines \
@@ -546,7 +548,7 @@ python benchmarks/run_benchmark.py dynamic \
   --seed 42 \
   --stages 125,250,500 \
   --strata type,supporting_fact_bucket \
-  --materialize symlink \
+  --materialize copy \
   --background-ratio 3.0 \
   --background-seed 42 \
   --run-baselines \
@@ -557,7 +559,7 @@ python benchmarks/run_benchmark.py dynamic \
 
 Report scaling and update cost separately from warm-query accuracy. A full-corpus index that is not `READY` should not appear as a warm-query baseline without a feasibility caveat.
 
-Dynamic task outputs include the default paper-facing baselines `bm25_rag,hybrid_rag,react` unless `--baselines` is explicitly set:
+Dynamic task outputs include the default paper-facing baselines `bm25_rag,hybrid_rag,react` unless `--baselines` is explicitly set. The dynamic task does not run LENS implicitly: paper-facing `G_n/D_n` main tables need `lens_full` added explicitly (recommended: `--baselines bm25_rag,hybrid_rag,react,lens_full`), which also gives the stale-index arm its measured index-free LENS control row. Use `--materialize copy` for paper-facing runs: ripgrep-based retrieval (the LENS rga channel and ReAct keyword search) does not follow symlinks, so a symlink snapshot silently blinds every grep-backed system. Keep `--baseline-max-files` at least as large as the biggest `D_n` snapshot so fixed-index baselines never truncate the evidence directory out of their index:
 
 ```text
 benchmarks/hotpotqa/output/dynamic_eval/tables/dynamic_main_results.*
@@ -579,7 +581,7 @@ python benchmarks/run_benchmark.py dynamic \
   --seed 42 \
   --stages 125,250,500 \
   --strata type,supporting_fact_bucket \
-  --materialize symlink \
+  --materialize copy \
   --run-baselines \
   --baselines bm25_rag,hybrid_rag,react \
   --stale-index-arm \

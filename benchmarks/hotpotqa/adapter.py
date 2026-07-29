@@ -189,8 +189,17 @@ class HotpotQAAdapter(BenchmarkAdapter):
         return validate_hotpotqa_corpus(Path(self._wiki_dir()))
 
     def get_corpus_index_cache_dir(self) -> str:
-        """Directory holding cached raw-corpus title indexes."""
-        path = Path(self.get_work_path()) / ".cache" / "corpus_index"
+        """Directory holding cached raw-corpus title indexes.
+
+        This lives directly under ``work_path`` (not under ``.cache``) on
+        purpose: the raw-corpus title index is a deterministic artifact keyed by
+        the immutable dump fingerprint, not per-run evaluation state, so it must
+        survive cold-cache clearing. Cold runs clear ``.cache`` and its nested
+        caches; keeping the dump-derived title index outside that scope avoids a
+        full dump rescan on every frozen run and keeps evidence-recall title
+        resolution available after a cold clear.
+        """
+        path = Path(self.get_work_path()) / "corpus_index"
         path.mkdir(parents=True, exist_ok=True)
         return str(path)
 
@@ -272,6 +281,8 @@ class HotpotQAAdapter(BenchmarkAdapter):
             "require_context_answerable": self._require_context_answerable(),
             "reuse_knowledge":  self._get_bool("HOTPOT_REUSE_KNOWLEDGE", False),
             "cache_mode":       self._get("HOTPOT_CACHE_MODE", "cold"),
+            "cache_allow_clear": self._get_bool("CACHE_ALLOW_CLEAR", False),
+            "cache_dry_run":    self._get_bool("CACHE_DRY_RUN", False),
             "sample_timeout_seconds": self._get_int("SAMPLE_TIMEOUT_SECONDS", 0),
             "system_timeout_seconds": self._get_int("SYSTEM_TIMEOUT_SECONDS", 0),
             "benchmark_timeout_seconds": self._get_int("BENCHMARK_TIMEOUT_SECONDS", 0),
@@ -471,15 +482,74 @@ class HotpotQAAdapter(BenchmarkAdapter):
         )
 
     def enrich_telemetry(self, sample, prediction, telemetry, **kwargs) -> Dict[str, Any]:
+        supporting_facts = sample.metadata.get("supporting_facts", [])
         return evaluate_supporting_facts(
-            sample.metadata.get("supporting_facts", []),
+            supporting_facts,
             read_file_ids=telemetry.get("read_file_ids", []),
             prediction=prediction,
             retrieval_logs=telemetry.get("retrieval_logs", []),
             evidence_sources=telemetry.get("evidence_sources", []),
             evidence_texts=telemetry.get("evidence_snippets", []),
             context=sample.metadata.get("context"),
+            resolved_title_paths=self._resolve_evidence_shard_paths(supporting_facts),
         )
+
+    def _resolve_evidence_shard_paths(self, supporting_facts: Any) -> Dict[str, str]:
+        """Map gold supporting-fact titles to their absolute raw-corpus shard.
+
+        The raw enwiki dump packs many articles per shard and the filename
+        carries no title, so filename-based title recall is impossible in the
+        frozen main experiment. This resolves each gold title to the shard that
+        holds it using the read-only cached corpus title index built by the
+        raw-corpus synchronization gate. It no-ops (returns ``{}``) when no
+        covering cached index exists, e.g. dynamic snapshots or sample smoke
+        runs, where per-article filenames already carry the title.
+        """
+        from hotpotqa.evidence import _extract_facts
+        titles = sorted({
+            str(fact.get("title")).strip()
+            for fact in _extract_facts(supporting_facts)
+            if str(fact.get("title") or "").strip()
+        })
+        if not titles:
+            return {}
+        index = self._load_evidence_title_index(titles)
+        if index is None:
+            return {}
+        resolved: Dict[str, str] = {}
+        wiki_dir = Path(self._wiki_dir())
+        for title in titles:
+            shard = index.absolute_shard_for(title)
+            if shard is None:
+                relative = index.shard_for(title)
+                shard = (wiki_dir / relative) if relative else None
+            if shard is not None:
+                resolved[title] = str(shard)
+        return resolved
+
+    def _load_evidence_title_index(self, titles: List[str]):
+        """Return a cached covering title index, memoized on the adapter.
+
+        Read-only: it never triggers a dump scan. When no covering cached index
+        exists (dynamic per-article snapshots, sample smoke runs) it returns
+        ``None`` and the caller falls back to filename-based title recall, which
+        is already precise for those layouts.
+        """
+        cached = getattr(self, "_evidence_title_index", "__unset__")
+        if cached != "__unset__" and (cached is None or cached.covers(titles)):
+            return cached
+        try:
+            from hotpotqa.corpus_index import load_covering_index
+            index = load_covering_index(
+                self._wiki_dir(),
+                titles,
+                cache_dir=self.get_corpus_index_cache_dir(),
+            )
+        except Exception:
+            index = None
+        if index is not None:
+            self._evidence_title_index = index
+        return index
 
     def get_analysis_schema(self) -> Dict[str, Any]:
         return {

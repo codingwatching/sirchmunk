@@ -217,7 +217,7 @@ passed                        = True
 
 evidence 闭合是阻断性的，因为 supporting-fact 文章缺失的问题根本无法从快照中作答；context distractor 闭合会报告但不阻断，因为缺少 distractor 只会让快照略变简单。若接受“本次运行不具备主表资格”，可用 `--allow-corpus-desync` 强行冻结。
 
-首次检查会扫描 dump 一次（约 30s），并在 `benchmarks/hotpotqa/.work/.cache/corpus_index/` 下缓存一份以 dump fingerprint 为键的标题索引；后续检查与 stage 构建在约 1s 内复用它。`--rebuild-corpus-index` 强制重扫。dump 身份会以 `wiki_corpus_fingerprint` 记录在 dataset manifest 和 sample-ids metadata 中，因此替换、截断或扩展 dump 都会改变记录的 fingerprint，而不会静默通过。
+首次检查会扫描 dump 一次（约 30s），并在 `benchmarks/hotpotqa/.work/corpus_index/` 下缓存一份以 dump fingerprint 为键的标题索引；后续检查与 stage 构建在约 1s 内复用它。标题索引是由 dump 确定性派生的产物，因此刻意放在 `.cache` 之外，可在 cold-cache 清理后存活。`--rebuild-corpus-index` 强制重扫。dump 身份会以 `wiki_corpus_fingerprint` 记录在 dataset manifest 和 sample-ids metadata 中，因此替换、截断或扩展 dump 都会改变记录的 fingerprint，而不会静默通过。
 
 ```bash
 python benchmarks/run_sampling.py create \
@@ -434,6 +434,8 @@ baseline_index_scope is not evaluation_set_sample_context
 validator has no error-level issue
 ```
 
+cold cache 只有在显式授权清理时才会真正生效：对 frozen `main`/ablation 运行需导出 `CACHE_ALLOW_CLEAR=true`，否则 cache report 会记录 `cold cache requested but allow_clear=False`，Gate 5 会阻断该运行。清理范围由 `CacheManager` 限制在 benchmark work path 下的缓存目录；由 dump 派生的 corpus title index 位于 `.cache` 之外，刻意在 cold 清理后存活。`CACHE_DRY_RUN=true` 只记录动作不删除。
+
 Academic validator 会将 corpus boundary violations 视为 blocking issues。`sample_context_corpus` 表示表格使用了 answerable HotpotQA sample contexts，而不是 raw corpus。`evaluation_set_context_index` 表示至少一个 baseline 索引了 evaluation-set sample context。`hybrid_context_corpus` 是 warning，表示 sample+wiki 结果需要单独措辞，不能直接与 raw-corpus rows 对比。
 
 <details>
@@ -482,7 +484,7 @@ python benchmarks/run_benchmark.py assets scaling \
   --scales 10k:10000,100k:100000,fullwiki:0 \
   --limit 20 \
   --seed 42 \
-  --materialize symlink \
+  --materialize copy \
   --build-timeout 86400 \
   --max-ram-bytes 0 \
   --max-disk-bytes 500000000000 \
@@ -503,7 +505,7 @@ python benchmarks/run_benchmark.py assets update-readiness \
   --delta-docs-dir /path/to/delta/docs \
   --doc-ids doc_a.txt,doc_b.txt \
   --mutation-ratio 0.0 \
-  --materialize symlink \
+  --materialize copy \
   --limit 20 \
   --seed 42 \
   --bm25-max-files 20000 \
@@ -526,7 +528,7 @@ python benchmarks/run_benchmark.py dynamic \
   --seed 42 \
   --stages 125,250,500 \
   --strata type,supporting_fact_bucket \
-  --materialize symlink \
+  --materialize copy \
   --background-ratio 3.0 \
   --background-seed 42 \
   --run-baselines \
@@ -546,7 +548,7 @@ python benchmarks/run_benchmark.py dynamic \
   --seed 42 \
   --stages 125,250,500 \
   --strata type,supporting_fact_bucket \
-  --materialize symlink \
+  --materialize copy \
   --background-ratio 3.0 \
   --background-seed 42 \
   --run-baselines \
@@ -557,7 +559,7 @@ python benchmarks/run_benchmark.py dynamic \
 
 Scaling 和 update cost 应与 warm-query accuracy 分开报告。full-corpus index 未达到 `READY` 的系统，不应在没有 feasibility caveat 的情况下进入 warm-query baseline。
 
-Dynamic task 默认包含 paper-facing baselines `bm25_rag,hybrid_rag,react`；显式传入 `--baselines` 时以 CLI 参数为准。输出包括：
+Dynamic task 默认包含 paper-facing baselines `bm25_rag,hybrid_rag,react`；显式传入 `--baselines` 时以 CLI 参数为准。dynamic task 不会隐式运行 LENS：面向论文的 `G_n/D_n` 主表需要显式加入 `lens_full`（推荐 `--baselines bm25_rag,hybrid_rag,react,lens_full`），这也为 stale-index arm 提供了实测的 index-free LENS 对照行。面向论文的运行请使用 `--materialize copy`：基于 ripgrep 的检索（LENS 的 rga 通道、ReAct 关键词搜索）不会跟随符号链接，symlink 快照会静默致盲所有 grep 系统。`--baseline-max-files` 需不小于最大 `D_n` 快照的文件数，避免固定索引 baseline 把 evidence 目录截断在索引之外。输出包括：
 
 ```text
 benchmarks/hotpotqa/output/dynamic_eval/tables/dynamic_main_results.*
@@ -579,7 +581,7 @@ python benchmarks/run_benchmark.py dynamic \
   --seed 42 \
   --stages 125,250,500 \
   --strata type,supporting_fact_bucket \
-  --materialize symlink \
+  --materialize copy \
   --run-baselines \
   --baselines bm25_rag,hybrid_rag,react \
   --stale-index-arm \
