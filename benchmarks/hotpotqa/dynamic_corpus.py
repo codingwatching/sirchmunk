@@ -302,14 +302,15 @@ def build_dynamic_corpus_snapshot(
     existing_paths = {str(path.resolve()) for _, path, _ in selected_sources if path.exists()}
     existing_paths.update(resolved_source_paths)
     background_count = max(0, int(round(len(selected_sources) * max(background_ratio, 0.0))))
-    background_sources = _select_background_documents(
+    background_articles = _select_background_articles(
         title_resolver.candidate_files(),
-        exclude_paths=existing_paths,
+        exclude_titles=evidence_titles | context_titles,
         count=background_count,
         seed=background_seed,
+        out_dir=snapshot_dir / "_background_articles",
     )
-    for path in background_sources:
-        selected_sources.append((path.stem or path.name, path, "background"))
+    for title, path in background_articles:
+        selected_sources.append((title, path, "background"))
 
     materialized_paths: List[str] = []
     document_records: List[Dict[str, Any]] = []
@@ -345,9 +346,10 @@ def build_dynamic_corpus_snapshot(
         "seed": background_seed,
         "background_ratio": background_ratio,
         "requested_background_count": background_count,
-        "selected_background_count": len(background_sources),
-        "selected_background_paths": [str(p) for p in background_sources],
-        "selection_strategy": "deterministic_shuffled_prefix",
+        "selected_background_count": len(background_articles),
+        "selected_background_titles": [title for title, _ in background_articles[:200]],
+        "selection_granularity": "article",
+        "selection_strategy": "seeded_shard_order_article_prefix",
     }
     validation = {
         "evidence_articles_fully_resolved": not missing_evidence,
@@ -405,7 +407,7 @@ def build_dynamic_corpus_snapshot(
         article_count=len(materialized_paths),
         evidence_article_count=sum(1 for _, _, role in selected_sources if role == "evidence"),
         context_distractor_count=sum(1 for _, _, role in selected_sources if role == "context_distractor"),
-        background_article_count=len(background_sources),
+        background_article_count=len(background_articles),
         selected_article_titles=selected_titles,
         selected_document_paths=materialized_paths,
         missing_evidence_titles=missing_evidence,
@@ -543,6 +545,53 @@ def _select_background_documents(
     # Taking a deterministic shuffled prefix makes larger stage selections
     # monotonic for the same candidate universe and seed.
     return shuffled[: min(count, len(shuffled))]
+
+
+def _select_background_articles(
+    candidates: Sequence[Path],
+    *,
+    exclude_titles: Set[str],
+    count: int,
+    seed: int,
+    out_dir: Path,
+) -> List[tuple[str, Path]]:
+    """Sample individual background articles and materialize one file each.
+
+    The raw enwiki dump packs hundreds of articles per shard file, so sampling
+    whole shard files would inflate the snapshot by two to three orders of
+    magnitude beyond the declared background article pool and bury the
+    evidence articles. This walks shards in a seeded deterministic order and
+    takes articles in shard order until ``count`` articles are materialized,
+    skipping any title already present as evidence or context distractor. Each
+    selected article is written as a standalone text file in the same format
+    the title resolver uses for evidence articles, so every snapshot document
+    has one article per file regardless of role.
+    """
+    from hotpotqa.title_resolver import _iter_article_records, _materialize_record, _record_title
+
+    if count <= 0 or not candidates:
+        return []
+    excluded = {normalize_title(title) for title in exclude_titles if title}
+    rng = random.Random(seed)
+    shards = list(candidates)
+    rng.shuffle(shards)
+
+    selected: List[tuple[str, Path]] = []
+    seen_titles: Set[str] = set()
+    for shard in shards:
+        if len(selected) >= count:
+            break
+        for record_idx, record in enumerate(_iter_article_records(shard, 2_000_000)):
+            if len(selected) >= count:
+                break
+            title = _record_title(record)
+            normalized = normalize_title(title)
+            if not normalized or normalized in excluded or normalized in seen_titles:
+                continue
+            seen_titles.add(normalized)
+            article_path = _materialize_record(record, title, shard, record_idx, out_dir)
+            selected.append((title, article_path))
+    return selected
 
 
 def _materialize_source(source: Path, docs_dir: Path, title: str, role: str, materialize_mode: str) -> Path:
