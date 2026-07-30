@@ -162,7 +162,7 @@ class SearchContext:
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize context state to a plain dict safe for ``json.dumps``."""
-        return {
+        payload = {
             "answer": self.answer,
             "cluster": self.cluster.to_dict() if self.cluster else None,
             "max_token_budget": self.max_token_budget,
@@ -177,6 +177,16 @@ class SearchContext:
             "loop_count": self.loop_count,
             "start_time": self.start_time.isoformat(),
         }
+        # Pipeline stages attach ad-hoc diagnostic fields (bridge re-search,
+        # forced-guess, early-exit markers) onto ``context.telemetry``; export
+        # them so downstream evaluation artifacts can attribute mechanism
+        # trigger rates instead of silently dropping the keys. Fixed fields
+        # above win on name collisions.
+        extra = getattr(self, "telemetry", None)
+        if isinstance(extra, dict):
+            for key, value in extra.items():
+                payload.setdefault(key, value)
+        return payload
 
     def summary(self) -> str:
         """Human-readable one-line summary of context state."""

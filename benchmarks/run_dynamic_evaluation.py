@@ -766,6 +766,33 @@ async def _run_staleness_arm(
     baselines = list(previous_baselines.values())
     stale_dir = Path(to_binding.output_dir) / "staleness"
     stale_dir.mkdir(parents=True, exist_ok=True)
+
+    # Rebuild the stale index on the PREVIOUS snapshot before answering.
+    # When the main stage reused cached JSONL under --skip-existing, the kept
+    # baseline instances never ran prepare(), so their in-memory index is
+    # empty; querying that with skip_prepare would not measure staleness but a
+    # broken index. Index-required systems are therefore prepared here against
+    # D_{n-1} under the from-stage environment, which is exactly the stale index
+    # definition: built on the old snapshot, queried on the new delta. Index-
+    # free systems (e.g. ReAct) declare no index and are left untouched.
+    prev_samples = _select_sample_dicts(golden_set.samples, previous_sample_ids)
+    prev_golden = _StageGoldenSet(
+        prev_samples,
+        from_binding,
+        stage_name=f"{from_binding.stage_name}_stale_source",
+        sample_id_checksum=compute_sample_id_checksum(previous_sample_ids),
+        frozen_order_checksum=compute_frozen_order_checksum(previous_sample_ids),
+    )
+    with _stage_environment(from_binding):
+        for baseline in baselines:
+            if not baseline.is_index_required():
+                continue
+            setup = await baseline.prepare(golden_set=prev_golden, bm_adapter=stage_adapter)
+            logger.info(
+                "[Staleness] rebuilt stale index for '%s' on %s: docs=%d",
+                baseline.name, from_binding.d_stage, setup.indexed_documents,
+            )
+
     suite = BaselineEvaluationSuite(
         bm_adapter=stage_adapter,
         baselines=baselines,

@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
 import ast
+import contextlib
+import contextvars
 import hashlib
 import json
 import logging
@@ -277,6 +279,47 @@ class _TreeNavCache:
         self._store[self._key(file_path, query)] = leaves
 
 
+class _PhaseTaggedUsageList(list):
+    """A usage list that stamps each appended usage with the active phase.
+
+    The DEEP pipeline appends LLM usage dicts from ~20 call sites. Rather than
+    thread a phase label through every one, this list reads the owner's
+    ``_current_phase`` at append time and attaches it as a ``_phase`` key on a
+    shallow copy of the usage. Token accounting that sums ``total_tokens`` is
+    unaffected; only an extra string key is added, enabling per-phase token
+    attribution downstream. Non-dict usages are stored unchanged.
+    """
+
+    def __init__(self, owner: Any) -> None:
+        super().__init__()
+        self._owner = owner
+
+    def append(self, usage: Any) -> None:  # type: ignore[override]
+        phase = getattr(self._owner, "_current_phase", "unattributed")
+        if isinstance(usage, dict):
+            tagged = dict(usage)
+            tagged.setdefault("_phase", phase)
+            super().append(tagged)
+        else:
+            super().append(usage)
+
+
+# Per-search usage/phase isolation. The searcher instance is shared across
+# concurrently evaluated samples (each an asyncio Task), so an instance-level
+# usage list and phase string are contaminated across tasks: one sample's
+# token slice would swallow the appends of every concurrent sample, inflating
+# reported tokens/calls by the concurrency degree. asyncio copies the
+# contextvars context at task creation, so backing these with ContextVars and
+# rebinding them at each ``search()`` entry gives every task its own isolated
+# usage buffer and phase marker without touching the many append call sites.
+_USAGE_CONTEXT: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar(
+    "sirchmunk_llm_usages", default=None,
+)
+_PHASE_CONTEXT: contextvars.ContextVar = contextvars.ContextVar(
+    "sirchmunk_current_phase", default="unattributed",
+)
+
+
 class AgenticSearch(BaseSearch):
 
     def __init__(
@@ -335,7 +378,14 @@ class AgenticSearch(BaseSearch):
 
         self.verbose: bool = verbose
 
-        self.llm_usages: List[Dict[str, Any]] = []
+        # Phase-tagged, per-search-isolated usage accounting. The concrete
+        # list and the active phase live in ContextVars (see module top), so
+        # concurrent evaluation tasks never share a buffer. ``search()`` rebinds
+        # a fresh list per call; the ``llm_usages`` / ``_current_phase``
+        # properties resolve to the current task's values, keeping the ~20
+        # append sites and token-slice logic unchanged.
+        _USAGE_CONTEXT.set(_PhaseTaggedUsageList(self))
+        _PHASE_CONTEXT.set("unattributed")
 
         # Maximum number of queries to keep per cluster (FIFO strategy)
         self.max_queries_per_cluster: int = 5
@@ -446,7 +496,33 @@ class AgenticSearch(BaseSearch):
         self.knowledge_base._log = create_logger(log_callback=log_callback, enable_async=True)
 
         # Reset per-request token accounting
-        self.llm_usages = []
+        self.llm_usages = _PhaseTaggedUsageList(self)
+
+    @property
+    def llm_usages(self) -> "_PhaseTaggedUsageList":
+        """Per-task LLM usage buffer, isolated across concurrent searches.
+
+        Backed by a ContextVar so each asyncio task (one per evaluated sample)
+        accumulates only its own usages. Auto-initializes a fresh buffer on
+        first access within a context that has none.
+        """
+        buf = _USAGE_CONTEXT.get()
+        if buf is None:
+            buf = _PhaseTaggedUsageList(self)
+            _USAGE_CONTEXT.set(buf)
+        return buf
+
+    @llm_usages.setter
+    def llm_usages(self, value: Any) -> None:
+        _USAGE_CONTEXT.set(value)
+
+    @property
+    def _current_phase(self) -> str:
+        return _PHASE_CONTEXT.get()
+
+    @_current_phase.setter
+    def _current_phase(self, value: str) -> None:
+        _PHASE_CONTEXT.set(value)
 
     def _resolve_paths(
         self,
@@ -2065,6 +2141,13 @@ class AgenticSearch(BaseSearch):
             max_token_budget=max_token_budget,
             max_loops=max_loops,
         )
+        # Rebind a fresh per-task usage buffer and reset the phase marker.
+        # asyncio copies the context by reference at task creation, so without
+        # an explicit rebind here every concurrent search would still share the
+        # one buffer set at construction. Rebinding makes this task's usages,
+        # token slice, and phase tags fully isolated from sibling tasks.
+        self.llm_usages = _PhaseTaggedUsageList(self)
+        self._current_phase = "unattributed"
         _llm_usage_start = len(self.llm_usages)
 
         # --- Adaptive compile artifact detection (shared with FAST) ---
@@ -2098,17 +2181,18 @@ class AgenticSearch(BaseSearch):
         await self._logger.info("[Phase 1] Parallel probing: keywords + dir_scan + knowledge + spec_cache + tree_index")
         context.increment_loop()
 
-        phase1_results = await asyncio.gather(
-            self._probe_keywords(query),
-            self._probe_dir_scan(paths, enable_dir_scan),
-            self._probe_knowledge_cache(query),
-            self._load_spec_context(paths, stale_hours=spec_stale_hours),
-            self._probe_tree_index(query, scope=_scope),
-            self._probe_compile_hints([query], scope=_scope),
-            self._probe_summary_index(query, artifacts, scope=_scope),    # GAP 2: zero-LLM BM25
-            self._probe_catalog_for_deep(query, artifacts),  # GAP 4: zero-LLM keyword overlap
-            return_exceptions=True,
-        )
+        with self._phase("phase1_probe"):
+            phase1_results = await asyncio.gather(
+                self._probe_keywords(query),
+                self._probe_dir_scan(paths, enable_dir_scan),
+                self._probe_knowledge_cache(query),
+                self._load_spec_context(paths, stale_hours=spec_stale_hours),
+                self._probe_tree_index(query, scope=_scope),
+                self._probe_compile_hints([query], scope=_scope),
+                self._probe_summary_index(query, artifacts, scope=_scope),    # GAP 2: zero-LLM BM25
+                self._probe_catalog_for_deep(query, artifacts),  # GAP 4: zero-LLM keyword overlap
+                return_exceptions=True,
+            )
 
         kw_result = phase1_results[0] if not isinstance(phase1_results[0], Exception) else ({}, [])
         scan_result = phase1_results[1] if not isinstance(phase1_results[1], Exception) else None
@@ -2202,7 +2286,8 @@ class AgenticSearch(BaseSearch):
             else:
                 phase2_tasks.append(self._async_noop([]))
 
-            phase2_results = await asyncio.gather(*phase2_tasks, return_exceptions=True)
+            with self._phase("phase2_retrieve_rank"):
+                phase2_results = await asyncio.gather(*phase2_tasks, return_exceptions=True)
 
             keyword_files = phase2_results[0] if not isinstance(phase2_results[0], Exception) else []
             dir_scan_files = phase2_results[1] if not isinstance(phase2_results[1], Exception) else []
@@ -2230,17 +2315,18 @@ class AgenticSearch(BaseSearch):
                 + len(summary_index_hits) + len(knowledge_probe.file_paths)
             )
             if _probe_hits == 0:
-                rescue_keyword_files, rescue_scan_files = await self._zero_hit_rescue(
-                    query,
-                    initial_keywords,
-                    paths,
-                    scan_result,
-                    enable_dir_scan=enable_dir_scan,
-                    max_depth=max_depth,
-                    include=include,
-                    exclude=exclude,
-                    context=context,
-                )
+                with self._phase("zero_hit_rescue"):
+                    rescue_keyword_files, rescue_scan_files = await self._zero_hit_rescue(
+                        query,
+                        initial_keywords,
+                        paths,
+                        scan_result,
+                        enable_dir_scan=enable_dir_scan,
+                        max_depth=max_depth,
+                        include=include,
+                        exclude=exclude,
+                        context=context,
+                    )
                 keyword_files = rescue_keyword_files or keyword_files
                 dir_scan_files = rescue_scan_files or dir_scan_files
 
@@ -2248,8 +2334,10 @@ class AgenticSearch(BaseSearch):
         # Phase 3: Query analysis + file selection
         # ==============================================================
         context.increment_loop()
-        _query_complexity, _query_intent = await self._classify_query_intent(query)
-        data_reqs = await self._analyze_data_requirements(query, _query_intent)
+        with self._phase("phase3_intent"):
+            _query_complexity, _query_intent = await self._classify_query_intent(query)
+        with self._phase("phase3_data_reqs"):
+            data_reqs = await self._analyze_data_requirements(query, _query_intent)
         context.increment_loop()
 
         await self._logger.info(
@@ -2299,9 +2387,10 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         # Phase 4: Agentic retrieval loop
         # ==============================================================
-        retrieval = await self._agentic_retrieve(
-            query, data_reqs, target_files, context,
-        )
+        with self._phase("phase4_retrieve"):
+            retrieval = await self._agentic_retrieve(
+                query, data_reqs, target_files, context,
+            )
 
         await self._logger.info(
             f"[Phase 4] Retrieval: {retrieval.rounds_used} rounds, "
@@ -2312,19 +2401,31 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         # Phase 4.5: Synthesis
         # ==============================================================
-        answer, should_save, cluster = await self._synthesize_from_retrieval(
-            query, _query_intent, retrieval, merged_files,
-            formula=data_reqs.formula,
-            background_context=spec_context,
-            data_reqs=data_reqs,
-            context=context,
-        )
+        with self._phase("phase4_5_synthesis"):
+            answer, should_save, cluster = await self._synthesize_from_retrieval(
+                query, _query_intent, retrieval, merged_files,
+                formula=data_reqs.formula,
+                background_context=spec_context,
+                data_reqs=data_reqs,
+                context=context,
+            )
 
         # ==============================================================
         # Phase 4.6: Self-correction (conditional)
         # ==============================================================
+        # Seed the mechanism markers so downstream telemetry always carries an
+        # explicit False, letting analysis distinguish "mechanism did not fire"
+        # from "attribution key was dropped". The mechanisms below overwrite
+        # these with richer values when they actually run.
+        self._record_context_telemetry(
+            context,
+            self_correct_entered=False,
+            bridge_research_used=False,
+            forced_guess_used=False,
+        )
         sc_retrieval: Optional[RetrievalResult] = None
         if answer == _NO_RESULTS_MESSAGE:
+            self._record_context_telemetry(context, self_correct_entered=True)
             sc_retrieval = await self._deep_agentic_self_correct(
                 query, data_reqs, retrieval,
                 merged_files, target_files, context,
@@ -5968,6 +6069,7 @@ class AgenticSearch(BaseSearch):
         new_files = [fp for fp in found if str(fp) not in excluded][: self._AGENTIC_MAX_FILES]
         self._record_context_telemetry(
             context,
+            bridge_research_used=True,
             bridge_research_terms=terms,
             bridge_research_files=new_files,
         )
@@ -7802,6 +7904,21 @@ class AgenticSearch(BaseSearch):
         ranked = with_tree + without_tree
         limit = max_files if max_files and max_files > 0 else self._AGENTIC_MAX_FILES
         return ranked[:limit]
+
+    @contextlib.contextmanager
+    def _phase(self, label: str):
+        """Tag LLM usages appended within this block with *label*.
+
+        Restores the previous phase on exit so nested or sequential phases
+        attribute correctly. Purely observational: it only affects the
+        ``_phase`` key stamped onto usage dicts, never control flow or budget.
+        """
+        previous = getattr(self, "_current_phase", "unattributed")
+        self._current_phase = label
+        try:
+            yield
+        finally:
+            self._current_phase = previous
 
     @staticmethod
     def _record_context_telemetry(context: Optional["SearchContext"], **fields: Any) -> None:
