@@ -147,6 +147,19 @@ class _PathScope:
 # When enabled, search relies solely on tree index navigation, skipping rga keyword search.
 _PURE_TREE_SEARCH: bool = os.getenv("SIRCHMUNK_PURE_TREE_SEARCH", "false").lower() == "true"
 
+# Zero-hit rescue: when every retrieval probe returns empty, retry once with
+# decomposed (unigram/bigram) keywords and a relaxed dir-scan acceptance level.
+_ZERO_HIT_RESCUE: bool = os.getenv("LENS_ZERO_HIT_RESCUE", "true").lower() == "true"
+
+# ReAct exploration fallback (SelfCorrect S5): when all recovery strategies are
+# exhausted with zero evidence, run a bounded free-exploration ReAct session to
+# discover candidate files, then re-extract evidence through the DEEP chain.
+_REACT_EXPLORE_FALLBACK: bool = os.getenv("LENS_REACT_EXPLORE_FALLBACK", "true").lower() == "true"
+
+# Answer span calibration: one lightweight LLM pass that replaces the final
+# answer span with the minimal span copied verbatim from the gathered evidence.
+_SPAN_CALIBRATION: bool = os.getenv("LENS_SPAN_CALIBRATION", "true").lower() == "true"
+
 # Common English stop-words filtered out during keyword coverage computation.
 _STOP_WORDS: frozenset = frozenset({
     "the", "is", "a", "an", "of", "in", "for", "to", "and", "or",
@@ -304,6 +317,7 @@ class AgenticSearch(BaseSearch):
         self.grep_retriever: GrepRetriever = GrepRetriever(work_path=self.work_path)
 
         # Create bound logger with callback - returns AsyncLogger instance
+        self._log_callback: LogCallback = log_callback
         self._logger = create_logger(log_callback=log_callback, enable_async=True)
 
         # Pass log_callback to KnowledgeBase so it can also log through the same callback
@@ -422,6 +436,7 @@ class AgenticSearch(BaseSearch):
         having to reconstruct heavy resources (embedding model, knowledge
         storage, etc.).
         """
+        self._log_callback = log_callback
         self._logger = create_logger(log_callback=log_callback, enable_async=True)
 
         self.llm._logger = create_logger(log_callback=log_callback, enable_async=False)
@@ -2201,6 +2216,34 @@ class AgenticSearch(BaseSearch):
             f"dir_scan_files={len(dir_scan_files)}"
         )
 
+        # --- Phase 2.5: Zero-hit rescue --------------------------------
+        # Compound keyword phrases ("hardcore punk origins") can miss every
+        # literal match while the corpus does contain the constituent terms,
+        # and a high-only dir_scan gate can reject every candidate. When all
+        # probes come up empty the pipeline would otherwise reach synthesis
+        # with zero files, so retry once with decomposed keywords and a
+        # relaxed acceptance level before giving up.
+        if _ZERO_HIT_RESCUE and not _PURE_TREE_SEARCH:
+            _probe_hits = (
+                len(keyword_files) + len(dir_scan_files) + len(tree_hits)
+                + len(catalog_deep_hits) + len(compile_hints.file_paths)
+                + len(summary_index_hits) + len(knowledge_probe.file_paths)
+            )
+            if _probe_hits == 0:
+                rescue_keyword_files, rescue_scan_files = await self._zero_hit_rescue(
+                    query,
+                    initial_keywords,
+                    paths,
+                    scan_result,
+                    enable_dir_scan=enable_dir_scan,
+                    max_depth=max_depth,
+                    include=include,
+                    exclude=exclude,
+                    context=context,
+                )
+                keyword_files = rescue_keyword_files or keyword_files
+                dir_scan_files = rescue_scan_files or dir_scan_files
+
         # ==============================================================
         # Phase 3: Query analysis + file selection
         # ==============================================================
@@ -2280,10 +2323,12 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         # Phase 4.6: Self-correction (conditional)
         # ==============================================================
+        sc_retrieval: Optional[RetrievalResult] = None
         if answer == _NO_RESULTS_MESSAGE:
             sc_retrieval = await self._deep_agentic_self_correct(
                 query, data_reqs, retrieval,
                 merged_files, target_files, context,
+                paths=paths,
             )
             if sc_retrieval is not None:
                 answer, should_save, cluster = (
@@ -2296,6 +2341,17 @@ class AgenticSearch(BaseSearch):
                     )
                 )
 
+        # Benchmark-gated last resort: a refusal scores as a wrong answer in
+        # benchmarks with no abstention reward, so make one best-effort
+        # attempt from whatever evidence was gathered.
+        if answer == _NO_RESULTS_MESSAGE:
+            best_effort_source = sc_retrieval if sc_retrieval is not None else retrieval
+            guessed = await self._forced_guess_answer(
+                query, best_effort_source, data_reqs, context,
+            )
+            if guessed:
+                answer, should_save, cluster = guessed, False, None
+
         # ==============================================================
         # Phase 4.75: Computation verification
         # ==============================================================
@@ -2303,6 +2359,19 @@ class AgenticSearch(BaseSearch):
             answer, was_corrected = await self._verify_computation(query, answer)
             if was_corrected:
                 _, should_save, _ = self._parse_summary_response(answer)
+
+        # ==============================================================
+        # Phase 4.8: Answer span calibration
+        # ==============================================================
+        if answer and answer != _NO_RESULTS_MESSAGE and _query_intent != "computation":
+            _calibration_source = sc_retrieval if sc_retrieval is not None else retrieval
+            answer = await self._calibrate_answer_span(
+                query,
+                answer,
+                (_calibration_source.evidence or "") if _calibration_source else "",
+                data_reqs=data_reqs,
+                context=context,
+            )
 
         # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
@@ -5836,6 +5905,91 @@ class AgenticSearch(BaseSearch):
 
         return None
 
+    _BRIDGE_MAX_TERMS: int = 2
+    """Maximum bridge entities mined from partial evidence per re-search."""
+
+    async def _bridge_research(
+        self,
+        query: str,
+        data_reqs: "DataRequirements",
+        initial_retrieval: "RetrievalResult",
+        exclude_files: List[str],
+        context: "SearchContext",
+        paths: Optional[List[str]] = None,
+    ) -> Optional["RetrievalResult"]:
+        """One posterior-driven corpus-wide re-search for bridge entities.
+
+        Multi-hop questions frequently die in a specific way: the first-hop
+        evidence names the entity the answer depends on ("the author is Will
+        Self"), but that entity was never part of the initial keyword prior,
+        so its own document is never retrieved and synthesis refuses. This
+        step mines up to ``_BRIDGE_MAX_TERMS`` such entities from the gathered
+        evidence with one LLM call, searches the raw corpus for them, and
+        extracts from the newly discovered files. The second-hop evidence is
+        merged with the first-hop evidence so synthesis sees both hops. All
+        LLM usage stays inside the normal budget accounting.
+        """
+        evidence = (initial_retrieval.evidence or "").strip()
+        if not evidence or not paths:
+            return None
+        missing = ", ".join(str(dp) for dp in (data_reqs.data_points or [])[:6]) or query
+        prompt = (
+            "The evidence below is relevant to the question but incomplete.\n"
+            f"Question: {query}\n"
+            f"Information still needed: {missing}\n\n"
+            f"Evidence so far:\n{evidence[:6000]}\n\n"
+            "From the evidence, identify up to 2 named entities (person, work, "
+            "organization, place) that the answer depends on but whose own "
+            "details are NOT present in the evidence. Return ONLY a JSON array "
+             'of short search strings, e.g. ["Will Self"]. Return [] if none.'
+        )
+        try:
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+            raw = (resp.content or "").strip()
+            start, end = raw.find("["), raw.rfind("]")
+            terms = json.loads(raw[start:end + 1]) if 0 <= start < end else []
+        except Exception as exc:
+            await self._logger.warning(f"[DEEP:Bridge] term mining failed: {exc}")
+            return None
+        terms = [str(t).strip() for t in terms if str(t).strip()][: self._BRIDGE_MAX_TERMS]
+        if not terms:
+            return None
+        await self._logger.info(f"[DEEP:Bridge] re-searching corpus for: {terms}")
+
+        try:
+            found = await self._retrieve_by_keywords(terms, paths)
+        except Exception as exc:
+            await self._logger.warning(f"[DEEP:Bridge] corpus re-search failed: {exc}")
+            return None
+        excluded = {str(fp) for fp in exclude_files or []}
+        new_files = [fp for fp in found if str(fp) not in excluded][: self._AGENTIC_MAX_FILES]
+        self._record_context_telemetry(
+            context,
+            bridge_research_terms=terms,
+            bridge_research_files=new_files,
+        )
+        if not new_files:
+            return None
+
+        bridge = await self._agentic_retrieve(query, data_reqs, new_files, context)
+        if not bridge.evidence.strip():
+            return None
+        combined = (
+            f"{evidence}\n\n[Bridge evidence: {', '.join(terms)}]\n\n{bridge.evidence}"
+        )[: self._AGENTIC_EVIDENCE_MAX_CHARS]
+        pages = {fp: sorted(ps) for fp, ps in initial_retrieval.pages_extracted.items()}
+        for fp, ps in bridge.pages_extracted.items():
+            pages[fp] = sorted(set(pages.get(fp, [])) | set(ps))
+        return RetrievalResult(
+            evidence=combined,
+            pages_extracted=pages,
+            is_complete=bridge.is_complete or initial_retrieval.is_complete,
+            rounds_used=initial_retrieval.rounds_used + bridge.rounds_used,
+        )
+
     async def _deep_agentic_self_correct(
         self,
         query: str,
@@ -5844,11 +5998,19 @@ class AgenticSearch(BaseSearch):
         merged_files: List[str],
         target_files: List[str],
         context: "SearchContext",
+        paths: Optional[List[str]] = None,
     ) -> Optional["RetrievalResult"]:
         """Recover evidence when DEEP synthesis is rejected.
 
         Strategies (tried in order, first success short-circuits):
 
+        S0 — Bridge re-search: when the gathered evidence names a bridge
+             entity the query depends on but never retrieved (the classic
+             multi-hop second hop), derive that entity from the evidence and
+             run one corpus-wide keyword search for it, then extract from the
+             newly discovered files. Selection stays posterior-driven: the
+             extra oracle calls are only spent once the posterior says the
+             evidence is incomplete.
         S1 — Expand candidate files: run agentic retrieval on files
              ranked below the initial ``target_files`` cut-off.
         S2 — Broaden page extraction on the same target files by
@@ -5862,6 +6024,16 @@ class AgenticSearch(BaseSearch):
              tree cache exists).
         """
         _min_evidence_len = 100
+
+        # S0: bridge re-search over the whole corpus for a second-hop entity
+        bridge_retrieval = await self._bridge_research(
+            query, data_reqs, initial_retrieval, target_files, context, paths,
+        )
+        if bridge_retrieval is not None and len(bridge_retrieval.evidence.strip()) >= _min_evidence_len:
+            await self._logger.info(
+                "[DEEP:SelfCorrect] S0 succeeded: bridge re-search"
+            )
+            return bridge_retrieval
 
         # S1: try next-ranked files not in the initial target set
         target_set = set(target_files)
@@ -5955,10 +6127,99 @@ class AgenticSearch(BaseSearch):
                         rounds_used=0,
                     )
 
+        # S5: bounded free-exploration ReAct fallback (corpus-wide discovery)
+        if _REACT_EXPLORE_FALLBACK:
+            await self._logger.info("[DEEP:SelfCorrect] S5: ReAct exploration")
+            explored = await self._react_explore_files(query, paths, context)
+            explored = [fp for fp in explored if fp not in target_set]
+            if explored:
+                react_retrieval = await self._agentic_retrieve(
+                    query, data_reqs, explored[: self._AGENTIC_MAX_FILES], context,
+                )
+                if len(react_retrieval.evidence.strip()) >= _min_evidence_len:
+                    await self._logger.info(
+                        "[DEEP:SelfCorrect] S5 succeeded: ReAct exploration"
+                    )
+                    self._record_context_telemetry(
+                        context,
+                        react_explore_fallback_used=True,
+                        react_explore_files=explored[:10],
+                    )
+                    return react_retrieval
+
         await self._logger.info(
             "[DEEP:SelfCorrect] All strategies exhausted"
         )
         return None
+
+    async def _react_explore_files(
+        self,
+        query: str,
+        paths: Optional[List[str]],
+        context: "SearchContext",
+        *,
+        max_loops: int = 6,
+    ) -> List[str]:
+        """Discover candidate files through a bounded free-exploration session.
+
+        S0–S4 all reason over files the pipeline has *already* shortlisted, so
+        they cannot recover when Phase 2 shortlisted nothing at all. This
+        fallback hands the query to the ReAct loop, whose LLM-driven query
+        reformulation can find files that a single literal keyword pass misses.
+
+        Only the *file discovery* is delegated: the returned paths are fed back
+        through the DEEP extraction chain so evidence provenance, page-level
+        traces and telemetry stay owned by the DEEP pipeline.
+
+        Returns:
+            Discovered file paths (possibly empty), capped for downstream use.
+        """
+        from sirchmunk.agentic.react_agent import ReActAgent
+
+        search_paths = list(paths or [])
+        if not search_paths:
+            return []
+
+        registry = self._ensure_tool_registry(search_paths, enable_dir_scan=True)
+        agent = ReActAgent(
+            llm=self.llm,
+            tool_registry=registry,
+            max_loops=max_loops,
+            max_token_budget=max(8_000, context.budget_remaining),
+            log_callback=self._log_callback,
+        )
+        relaxed = self._relax_keywords([], query)
+        try:
+            _answer, react_ctx = await agent.run(
+                query, initial_keywords=relaxed[:5] or None,
+            )
+        except Exception as exc:
+            await self._logger.warning(
+                f"[DEEP:SelfCorrect] S5 ReAct exploration failed: {exc}"
+            )
+            return []
+
+        # Charge the exploration's LLM spend to the DEEP session budget.
+        for usage in react_ctx.llm_usages:
+            if isinstance(usage, dict):
+                total = usage.get("total_tokens", 0) or (
+                    usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                )
+                context.add_llm_tokens(total, usage=usage)
+
+        discovered: List[str] = []
+        for log_entry in react_ctx.retrieval_logs:
+            for fp in log_entry.metadata.get("files_discovered", []) or []:
+                if fp not in discovered:
+                    discovered.append(fp)
+        for fp in react_ctx.read_file_ids:
+            if fp not in discovered:
+                discovered.append(fp)
+
+        await self._logger.info(
+            f"[DEEP:SelfCorrect] S5 exploration discovered {len(discovered)} files"
+        )
+        return discovered[: self._AGENTIC_MAX_FILES]
 
     @staticmethod
     def _parse_fast_json(text: str) -> Dict[str, Any]:
@@ -6739,6 +7000,123 @@ class AgenticSearch(BaseSearch):
         )
         return discovered
 
+    @staticmethod
+    def _relax_keywords(keywords: List[str], query: str) -> List[str]:
+        """Decompose compound keyword phrases into literal-matchable terms.
+
+        Multi-word probe keywords such as ``"hardcore punk origins"`` are
+        searched literally, so a corpus that only ever writes ``hardcore
+        punk`` (or just ``nintendocore``) yields zero matches. This helper
+        expands every phrase into its constituent unigrams plus adjacent
+        bigrams, which keeps entity phrases intact while still allowing
+        single-term recall. Query tokens are appended as a final safety net
+        so that rescue never depends solely on the extracted keywords.
+
+        Args:
+            keywords: Original probe keywords (may contain phrases).
+            query: Raw user query, used as a fallback term source.
+
+        Returns:
+            Ordered, de-duplicated list of relaxed search terms.
+        """
+        relaxed: List[str] = []
+
+        def _push(term: str) -> None:
+            cleaned = term.strip().strip("\"'`.,;:!?()[]{}").strip()
+            if len(cleaned) < 3:
+                return
+            if cleaned.lower() in _STOP_WORDS:
+                return
+            if cleaned not in relaxed:
+                relaxed.append(cleaned)
+
+        for keyword in keywords or []:
+            tokens = [t for t in re.split(r"\s+", str(keyword).strip()) if t]
+            if len(tokens) <= 1:
+                _push(str(keyword))
+                continue
+            # Adjacent bigrams first: they preserve entity boundaries and are
+            # far more selective than single words.
+            for i in range(len(tokens) - 1):
+                _push(f"{tokens[i]} {tokens[i + 1]}")
+            for token in tokens:
+                _push(token)
+
+        # Fallback: capitalised or long tokens straight from the query.
+        for token in re.split(r"[^\w\u4e00-\u9fff]+", query or ""):
+            if token and (token[0].isupper() or len(token) >= 6):
+                _push(token)
+
+        return relaxed[:16]
+
+    async def _zero_hit_rescue(
+        self,
+        query: str,
+        initial_keywords: List[str],
+        paths: List[str],
+        scan_result,
+        *,
+        enable_dir_scan: bool = False,
+        max_depth: Optional[int] = 5,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        context: Optional["SearchContext"] = None,
+    ) -> Tuple[List[str], List[str]]:
+        """Recover candidate files when every Phase 1/2 probe returned nothing.
+
+        Two relaxations are applied, both bounded to a single extra attempt:
+
+        R1 — keyword decomposition: re-run the rga search with phrases split
+             into unigrams and bigrams (see :meth:`_relax_keywords`).
+        R2 — dir-scan gate relaxation: re-rank the already-scanned candidates
+             accepting ``medium`` relevance in addition to ``high``, which
+             costs one LLM ranking call and no additional filesystem walk.
+
+        Returns:
+            ``(keyword_files, dir_scan_files)`` — either may be empty.
+        """
+        rescue_keywords = self._relax_keywords(initial_keywords, query)
+        await self._logger.warning(
+            f"[Phase 2.5:ZeroHitRescue] All probes empty; retrying with "
+            f"{len(rescue_keywords)} relaxed terms: {rescue_keywords[:8]}"
+        )
+
+        keyword_files: List[str] = []
+        if rescue_keywords:
+            try:
+                keyword_files = await self._retrieve_by_keywords(
+                    rescue_keywords, paths,
+                    max_depth=max_depth, include=include, exclude=exclude,
+                )
+            except Exception as exc:
+                await self._logger.warning(
+                    f"[Phase 2.5:ZeroHitRescue] relaxed keyword search failed: {exc}"
+                )
+
+        dir_scan_files: List[str] = []
+        if not keyword_files and scan_result is not None and enable_dir_scan:
+            try:
+                dir_scan_files = await self._rank_dir_scan_candidates(
+                    query, scan_result, include_medium=True,
+                )
+            except Exception as exc:
+                await self._logger.warning(
+                    f"[Phase 2.5:ZeroHitRescue] relaxed dir_scan rank failed: {exc}"
+                )
+
+        recovered = len(keyword_files) + len(dir_scan_files)
+        await self._logger.info(
+            f"[Phase 2.5:ZeroHitRescue] Recovered {recovered} files "
+            f"(keywords={len(keyword_files)}, dir_scan={len(dir_scan_files)})"
+        )
+        self._record_context_telemetry(
+            context,
+            zero_hit_rescue_used=True,
+            zero_hit_rescue_terms=rescue_keywords,
+            zero_hit_rescue_recovered_files=recovered,
+        )
+        return keyword_files, dir_scan_files
+
     async def _rank_dir_scan_candidates(
         self,
         query: str,
@@ -6887,7 +7265,6 @@ class AgenticSearch(BaseSearch):
                 lines.append(f"- Constraint: {constraint}")
         if lines:
             lines.append("- PRECISE_ANSWER must be the minimal answer span only; do not include explanations, multiple candidates, or SHOULD_ANSWER=false as the answer text.")
-            lines.append("- PRECISE_ANSWER must be copied verbatim from the evidence text: keep the exact surface form, spelling, word order, and number/ordinal style as written in the evidence; do not paraphrase, translate, or normalize it.")
             lines.append("- If evidence is relevant but partial, provide the best supported concise answer instead of refusing.")
         return "\n".join(lines)
 
@@ -7076,6 +7453,173 @@ class AgenticSearch(BaseSearch):
             split = re.split(r"\s*(?:,|;|\n|\band\b|\bor\b)\s*", cleaned, maxsplit=1, flags=re.I)
         return split[0].strip() if split and split[0].strip() else cleaned
 
+    @staticmethod
+    def _refusal_fallback_enabled() -> bool:
+        return os.environ.get("SIRCHMUNK_REFUSAL_FALLBACK", "").strip().lower() in {"1", "true", "yes", "on"}
+
+    _SPAN_CALIBRATION_INTENTS: frozenset = frozenset({"lookup", "factoid", "comparison", "extraction"})
+
+    @staticmethod
+    def _is_verbatim_span(span: str, evidence: str) -> bool:
+        """Check that *span* occurs verbatim in *evidence*.
+
+        Comparison is whitespace- and case-insensitive so that reflowed or
+        re-cased extractions still count, while any span the model invented
+        (not present in the sources) is rejected. This keeps calibration
+        inside the source-fidelity contract.
+        """
+        if not span or not evidence:
+            return False
+        norm_span = re.sub(r"\s+", " ", span).strip().lower()
+        norm_ev = re.sub(r"\s+", " ", evidence).lower()
+        return bool(norm_span) and norm_span in norm_ev
+
+    async def _calibrate_answer_span(
+        self,
+        query: str,
+        answer: str,
+        evidence: str,
+        data_reqs: Optional["DataRequirements"] = None,
+        context: Optional["SearchContext"] = None,
+    ) -> str:
+        """Align the final answer span with the wording of its source evidence.
+
+        Synthesis tends to paraphrase: it expands a span with helpful context
+        ("Stadio Olimpico in Rome, Italy"), contracts it to a head noun
+        ("Allure"), or re-inflects it ("Pizza" for "pizzas"). All three carry
+        the right information yet diverge from the source wording, which any
+        span-overlap metric penalises.
+
+        One bounded LLM pass therefore re-selects the *minimal contiguous span
+        copied verbatim from the evidence* that answers the question. The
+        candidate is accepted only when it really is present in the evidence
+        (see :meth:`_is_verbatim_span`), so calibration can tighten wording but
+        never introduce unsourced text. On any failure the original answer is
+        returned unchanged.
+        """
+        if not _SPAN_CALIBRATION:
+            return answer
+        if not answer or answer == _NO_RESULTS_MESSAGE or not evidence.strip():
+            return answer
+
+        intent = (data_reqs.intent if data_reqs else "") or ""
+        if intent and intent.lower() not in self._SPAN_CALIBRATION_INTENTS:
+            return answer
+
+        current = self._extract_answer_span(answer)
+        if not current or self._is_no_answer_value(current):
+            return answer
+
+        expected = (data_reqs.expected_answer_type if data_reqs else "") or "unconstrained"
+        prompt = (
+            "You are aligning an answer span with its source wording.\n\n"
+            f"Question: {query}\n"
+            f"Current answer: {current}\n"
+            f"Expected answer type: {expected}\n\n"
+            f"Evidence:\n{evidence[: self._AGENTIC_EVIDENCE_MAX_CHARS]}\n\n"
+            "Return the shortest contiguous span, copied VERBATIM from the "
+            "evidence, that fully answers the question.\n"
+            "Rules:\n"
+            "- Copy characters exactly as they appear in the evidence; do not "
+            "paraphrase, translate, re-inflect or re-case.\n"
+            "- Include every word the answer needs, and no extra descriptive "
+            "context, qualifiers or trailing location/date clauses.\n"
+            "- Keep an entity's canonical full form when the evidence writes it "
+            "that way.\n"
+            "- If the current answer is already the best verbatim span, repeat it.\n"
+            "Reply with exactly one line: **Answer: <span>**"
+        )
+        try:
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+        except Exception as exc:
+            await self._logger.warning(f"[Phase 4.8] span calibration failed: {exc}")
+            return answer
+
+        candidate = self._clean_answer_candidate(
+            self._extract_answer_span(resp.content or "")
+        )
+        if (
+            not candidate
+            or candidate == current
+            or self._is_no_answer_value(candidate)
+            or self._is_reserved_answer_span(candidate)
+            or not self._is_verbatim_span(candidate, evidence)
+        ):
+            return answer
+
+        await self._logger.info(
+            f"[Phase 4.8] Span calibrated: {current[:60]!r} -> {candidate[:60]!r}"
+        )
+        self._record_context_telemetry(
+            context,
+            span_calibration_used=True,
+            span_calibration_before=current,
+            span_calibration_after=candidate,
+        )
+        return re.sub(
+            r"^\*\*Answer:\s*.*?\*\*",
+            f"**Answer: {candidate}**",
+            answer,
+            count=1,
+            flags=re.DOTALL,
+        ) if answer.startswith("**Answer:") else f"**Answer: {candidate}**\n\n{answer}"
+
+    async def _forced_guess_answer(
+        self,
+        query: str,
+        retrieval: "RetrievalResult",
+        data_reqs: Optional["DataRequirements"],
+        context: Optional["SearchContext"] = None,
+    ) -> str:
+        """Best-effort answer for benchmarks that give no abstention credit.
+
+        Disabled unless ``SIRCHMUNK_REFUSAL_FALLBACK`` is set, so interactive
+        and product behavior keeps the honest "no results" contract. When
+        enabled, one extra synthesis call asks for the most plausible answer
+        span supported by the partial evidence. The result is flagged in
+        telemetry and never persisted as knowledge, so a guessed answer cannot
+        contaminate the knowledge store or later warm-start priors.
+        """
+        if not self._refusal_fallback_enabled():
+            return ""
+        evidence = (retrieval.evidence or "").strip() if retrieval is not None else ""
+        if not evidence:
+            return ""
+        expected = (data_reqs.expected_answer_type if data_reqs else "") or "unconstrained"
+        target_slot = (data_reqs.target_slot if data_reqs else "") or ""
+        prompt = (
+            "Answer the question with the single most plausible span supported "
+            "by the evidence. The evidence may be incomplete; do not refuse and "
+            "do not explain. If several candidates fit, pick the best supported "
+            "one.\n\n"
+            f"Question: {query}\n"
+            f"Expected answer type: {expected}\n"
+            + (f"Target relation: {target_slot}\n" if target_slot else "")
+            + f"\nEvidence:\n{evidence[: self._AGENTIC_EVIDENCE_MAX_CHARS]}\n\n"
+            "Reply with exactly one line: **Answer: <span>**"
+        )
+        try:
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+        except Exception as exc:
+            await self._logger.warning(f"[Phase 4.6] forced-guess failed: {exc}")
+            return ""
+        candidate = self._clean_answer_candidate(
+            self._extract_answer_span(resp.content or "")
+        )
+        if not candidate or self._is_no_answer_value(candidate) or self._is_reserved_answer_span(candidate):
+            return ""
+        self._record_context_telemetry(
+            context, forced_guess_used=True, forced_guess_answer=candidate,
+        )
+        await self._logger.info(f"[Phase 4.6] forced-guess answer: {candidate[:60]}")
+        return f"**Answer: {candidate}**"
+
     @classmethod
     def _refusal_fallback_answer(
         cls,
@@ -7092,7 +7636,7 @@ class AgenticSearch(BaseSearch):
         span is returned instead of refusing. The fallback is recorded in
         telemetry and the caller must not persist such answers as knowledge.
         """
-        if os.environ.get("SIRCHMUNK_REFUSAL_FALLBACK", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        if not cls._refusal_fallback_enabled():
             return None
         if not (evidence or "").strip() or not answer or answer == _NO_RESULTS_MESSAGE:
             return None

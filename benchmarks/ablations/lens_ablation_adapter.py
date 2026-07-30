@@ -10,6 +10,7 @@ ReAct Search 相同的 BaselineEvaluationSuite / PaperTableGenerator 流程。
 """
 from __future__ import annotations
 
+import os
 import types
 from pathlib import Path
 import time
@@ -161,6 +162,17 @@ class LensAblationAdapter(BaselineAdapter):
 
     def _build_profile_searcher(self):
         from sirchmunk.search import AgenticSearch
+
+        # Benchmark env files load into the adapter's private env dict, but the
+        # search layer reads policy switches from os.environ. Bridge the
+        # refusal-fallback switch explicitly, mirroring the _StageEnv pattern,
+        # so a profile-level SIRCHMUNK_REFUSAL_FALLBACK actually reaches
+        # synthesis instead of silently staying off.
+        getter = getattr(self._bm_adapter, "_get", None)
+        if callable(getter):
+            fallback = str(getter("SIRCHMUNK_REFUSAL_FALLBACK", "") or "").strip()
+            if fallback:
+                os.environ["SIRCHMUNK_REFUSAL_FALLBACK"] = fallback
 
         base_searcher = self._bm_adapter.build_searcher()
         llm = getattr(base_searcher, "llm", None)
