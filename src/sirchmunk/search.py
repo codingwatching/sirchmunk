@@ -2389,7 +2389,7 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         with self._phase("phase4_retrieve"):
             retrieval = await self._agentic_retrieve(
-                query, data_reqs, target_files, context,
+                query, data_reqs, target_files, context, paths=paths,
             )
 
         await self._logger.info(
@@ -2908,6 +2908,11 @@ class AgenticSearch(BaseSearch):
     """Section map depth for agentic page selection."""
     _AGENTIC_EVIDENCE_MAX_CHARS: int = 40_000
     """Maximum evidence characters to feed to synthesis prompt."""
+    _EVIDENCE_SNIPPET_MAX_CHARS: int = 4_000
+    """Per-read cap on evidence text mirrored into telemetry for sentence-level
+    evidence metrics. Bounds telemetry size independent of document length."""
+    _EVIDENCE_SNIPPET_MAX_COUNT: int = 20
+    """Overall cap on evidence snippets retained in telemetry per query."""
     _TWO_STAGE_INTENTS: frozenset = frozenset({"computation", "comparison"})
     """Intents that benefit from a two-stage (extraction + synthesis) answer
     pipeline. Other intents skip Stage 1 to avoid redundant LLM cost."""
@@ -7367,6 +7372,7 @@ class AgenticSearch(BaseSearch):
                 lines.append(f"- Constraint: {constraint}")
         if lines:
             lines.append("- PRECISE_ANSWER must be the minimal answer span only; do not include explanations, multiple candidates, or SHOULD_ANSWER=false as the answer text.")
+            lines.append("- Align PRECISE_ANSWER to how the evidence names the answer entity: copy the complete form the evidence uses for that entity, without adding qualifiers the evidence does not attach to it and without dropping parts of the name the evidence includes. Do not lengthen or shorten it beyond that surface form.")
             lines.append("- If evidence is relevant but partial, provide the best supported concise answer instead of refusing.")
         return "\n".join(lines)
 
@@ -8322,7 +8328,16 @@ class AgenticSearch(BaseSearch):
         *,
         source: str,
     ) -> None:
-        """Record DEEP-mode evidence reads for downstream benchmark telemetry."""
+        """Record DEEP-mode evidence reads for downstream benchmark telemetry.
+
+        Besides marking the file read and logging the retrieval op, a bounded
+        snippet of the extracted text is accumulated on the context telemetry
+        under ``evidence_snippets``. Sentence-level evidence metrics need the
+        actual extracted text to match gold supporting sentences against;
+        without it, sentence recall is structurally always zero. The snippet is
+        length-capped per read and count-capped overall so telemetry stays
+        bounded regardless of corpus size.
+        """
         context.mark_file_read(file_path)
         context.add_log(
             tool_name="deep_file_extract",
@@ -8333,6 +8348,87 @@ class AgenticSearch(BaseSearch):
                 "source": source,
             },
         )
+        text = (content or "").strip()
+        if not text:
+            return
+        telemetry = getattr(context, "telemetry", None)
+        if not isinstance(telemetry, dict):
+            telemetry = {}
+            setattr(context, "telemetry", telemetry)
+        snippets = telemetry.setdefault("evidence_snippets", [])
+        if len(snippets) < AgenticSearch._EVIDENCE_SNIPPET_MAX_COUNT:
+            snippets.append(text[: AgenticSearch._EVIDENCE_SNIPPET_MAX_CHARS])
+
+    _BRIDGE_PROBE_MAX_ROUNDS: int = 2
+    """Maximum corpus-level re-probe rounds driven by unresolved requirements."""
+    _BRIDGE_PROBE_MAX_TERMS: int = 3
+    """Maximum probe terms mined per round from gathered evidence."""
+    _BRIDGE_PROBE_MAX_FILES: int = 3
+    """Maximum newly discovered files admitted per re-probe round."""
+
+    async def _belief_probe_new_files(
+        self,
+        query: str,
+        missing: List[str],
+        evidence: str,
+        known_files: Set[str],
+        paths: List[str],
+        context: Optional["SearchContext"] = None,
+    ) -> List[str]:
+        """Mine probe terms for unresolved requirements and re-search the corpus.
+
+        Multi-hop requirements fail in a specific way: the evidence gathered so
+        far names the entity a remaining requirement depends on, but that
+        entity was absent from the initial keyword prior, so its own document
+        was never a retrieval candidate. This step asks which terms would
+        locate the missing facts — letting the model draw on entities the
+        evidence just revealed — then searches the raw corpus for them and
+        returns files not already read. Selection stays posterior-driven: the
+        extra probe is spent only while requirements remain unresolved.
+        """
+        if not missing or not paths:
+            return []
+        prompt = (
+            "Some information needed to answer the question is still missing.\n"
+            f"Question: {query}\n"
+            "Still missing:\n"
+            + "\n".join(f"- {m}" for m in missing[:5])
+            + f"\n\nEvidence gathered so far:\n{evidence[:6000]}\n\n"
+            "Name the search terms most likely to locate the missing information "
+            "in a document collection. Prefer specific names of entities that the "
+            "evidence above mentions but does not describe in detail, since their "
+            "own documents are probably where the missing facts live.\n"
+            f"Return ONLY a JSON array of at most {self._BRIDGE_PROBE_MAX_TERMS} "
+            'short search strings, e.g. ["Some Entity"]. Return [] if none apply.'
+        )
+        try:
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+            terms = self._extract_json_array((resp.content or "").strip()) or []
+        except Exception as exc:
+            await self._logger.warning(f"[Phase 4:BeliefProbe] term mining failed: {exc}")
+            return []
+        terms = [str(t).strip() for t in terms if str(t).strip()][: self._BRIDGE_PROBE_MAX_TERMS]
+        if not terms:
+            return []
+        try:
+            found = await self._retrieve_by_keywords(terms, paths)
+        except Exception as exc:
+            await self._logger.warning(f"[Phase 4:BeliefProbe] corpus re-probe failed: {exc}")
+            return []
+        new_files = [fp for fp in found if str(fp) not in known_files][: self._BRIDGE_PROBE_MAX_FILES]
+        await self._logger.info(
+            f"[Phase 4:BeliefProbe] terms={terms} -> {len(new_files)} new files"
+        )
+        self._record_context_telemetry(
+            context,
+            belief_probe_used=True,
+            belief_probe_terms=terms,
+            belief_probe_new_files=new_files,
+        )
+        return new_files
 
     async def _agentic_retrieve(
         self,
@@ -8340,8 +8436,18 @@ class AgenticSearch(BaseSearch):
         data_reqs: DataRequirements,
         target_files: List[str],
         context: "SearchContext",
+        paths: Optional[List[str]] = None,
     ) -> RetrievalResult:
-        """Core agentic retrieval loop: select pages → extract → check → repeat."""
+        """Core agentic retrieval loop: select pages → extract → check → repeat.
+
+        When *paths* is provided, the non-paginated fast path becomes a
+        belief-driven loop instead of an unconditional early return: evidence
+        is checked against the per-fact data requirements, and unresolved
+        requirements trigger corpus-level re-probes seeded with bridge terms
+        mined from the evidence gathered so far. This keeps the action space
+        open after initial file selection — the posterior over unresolved
+        facts decides whether to keep extracting or to probe the corpus again.
+        """
         indexer = self._get_tree_indexer()
         evidence_parts: List[str] = []
         pages_extracted: Dict[str, set] = {}
@@ -8451,13 +8557,52 @@ class AgenticSearch(BaseSearch):
 
         if not outline_target_files and evidence_parts:
             combined = "\n\n".join(evidence_parts)
+            is_complete = True
+            probe_rounds = 0
+            if paths and data_reqs.data_points:
+                is_complete, missing = await self._check_data_requirements(
+                    query, data_reqs, combined,
+                )
+                known_files = {str(fp) for fp in target_files}
+                while (
+                    not is_complete
+                    and missing
+                    and probe_rounds < self._BRIDGE_PROBE_MAX_ROUNDS
+                ):
+                    new_files = await self._belief_probe_new_files(
+                        query, missing, combined, known_files, paths, context,
+                    )
+                    if not new_files:
+                        break
+                    probe_rounds += 1
+                    for fp in new_files:
+                        known_files.add(str(fp))
+                        remaining = self._AGENTIC_EVIDENCE_MAX_CHARS - len(combined)
+                        if remaining <= 0:
+                            break
+                        content = await self._extract_non_paginated_content(
+                            fp, query, max_chars=remaining,
+                        )
+                        if content:
+                            evidence_parts.append(content)
+                            pages_extracted[fp] = set()
+                            self._record_deep_evidence_read(
+                                context, fp, content, source="bridge_probe",
+                            )
+                    combined = "\n\n".join(evidence_parts)
+                    is_complete, missing = await self._check_data_requirements(
+                        query, data_reqs, combined,
+                    )
+                self._record_context_telemetry(
+                    context, bridge_probe_rounds=probe_rounds,
+                )
             return RetrievalResult(
                 evidence=combined[:self._AGENTIC_EVIDENCE_MAX_CHARS],
                 pages_extracted={
                     fp: sorted(ps) for fp, ps in pages_extracted.items()
                 },
-                is_complete=True,
-                rounds_used=0,
+                is_complete=is_complete,
+                rounds_used=probe_rounds,
             )
 
         for round_idx in range(self._AGENTIC_MAX_ROUNDS):
