@@ -165,6 +165,17 @@ class ReActSearchBaseline(BaselineAdapter):
             tool_registry=registry,
             max_loops=self._max_loops,
             max_token_budget=self._max_token_budget,
+            # Align the answer register with the LENS answer contract so EM and
+            # judge metrics compare systems at the same output granularity:
+            # verbose answers are penalized by EM yet favored by semantic
+            # judges, which otherwise contaminates both readings.
+            answer_style_instruction=(
+                "Your final answer inside <ANSWER></ANSWER> must be the minimal "
+                "concise answer span only (a name, date, phrase, or yes/no) — "
+                "no explanations, no full sentences, no multiple candidates. "
+                "If evidence is partial, give the best supported concise answer "
+                "instead of refusing."
+            ),
         )
         answer, ctx = await agent.run(query=question)
         elapsed = time.monotonic() - start

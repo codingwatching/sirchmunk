@@ -35,7 +35,7 @@ Retrieved evidence chunks:
 Instructions:
 - Answer only using the retrieved evidence.
 - Return a concise final answer span when possible.
-- If evidence is insufficient, say you cannot determine the answer from the provided evidence.
+- If evidence is insufficient, provide the most plausible concise answer supported by the retrieved evidence instead of refusing; answer with your best supported candidate.
 """
 
 

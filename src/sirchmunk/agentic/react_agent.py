@@ -133,11 +133,17 @@ class ReActSearchAgent:
         max_loops: int = 10,
         max_token_budget: int = 64000,
         log_callback: LogCallback = None,
+        answer_style_instruction: str = "",
     ) -> None:
         self.llm = llm
         self.registry = tool_registry
         self.max_loops = max_loops
         self.max_token_budget = max_token_budget
+        # Optional caller-supplied constraint appended to the system prompt
+        # (e.g. a minimal-answer-span contract so evaluated systems share the
+        # same output register). Empty by default: behavior is unchanged
+        # unless the caller opts in.
+        self.answer_style_instruction = (answer_style_instruction or "").strip()
         self._logger = create_logger(log_callback=log_callback, enable_async=True)
 
     # ---- Public API ----
@@ -320,10 +326,9 @@ class ReActSearchAgent:
         """
         return await self.llm.achat(messages=messages, stream=False)
 
-    @staticmethod
-    def _build_system_prompt(context: SearchContext, tool_descriptions: str) -> str:
+    def _build_system_prompt(self, context: SearchContext, tool_descriptions: str) -> str:
         """Format the system prompt with tool descriptions and context state."""
-        return REACT_SYSTEM_PROMPT.format(
+        prompt = REACT_SYSTEM_PROMPT.format(
             tool_descriptions=tool_descriptions,
             budget_remaining=context.budget_remaining,
             files_read=len(context.read_file_ids),
@@ -331,6 +336,9 @@ class ReActSearchAgent:
             loop_count=context.loop_count,
             max_loops=context.max_loops,
         )
+        if self.answer_style_instruction:
+            prompt += f"\n## Answer Style\n{self.answer_style_instruction}\n"
+        return prompt
 
     @staticmethod
     def _build_user_message(

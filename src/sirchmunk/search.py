@@ -245,6 +245,11 @@ class RetrievalResult:
     pages_extracted: Dict[str, List[int]]
     is_complete: bool
     rounds_used: int
+    ledger: Optional[List[Dict[str, Any]]] = None
+    """Per-requirement facts resolved during evidence digestion; each entry
+    carries requirement, value, a verbatim support quote, and source file so
+    synthesis can assemble the answer along a pre-digested reasoning chain
+    instead of rebuilding it from the raw evidence pile."""
 
 
 class _TreeNavCache:
@@ -2906,8 +2911,10 @@ class AgenticSearch(BaseSearch):
     """Maximum files to process through agentic retrieval."""
     _AGENTIC_SECTION_MAP_DEPTH: int = 8
     """Section map depth for agentic page selection."""
-    _AGENTIC_EVIDENCE_MAX_CHARS: int = 40_000
-    """Maximum evidence characters to feed to synthesis prompt."""
+    _AGENTIC_EVIDENCE_MAX_CHARS: int = 60_000
+    """Maximum evidence characters to feed to synthesis prompt. Sized for
+    long-context backends: small-file corpora are digested as full text
+    rather than compressed excerpts."""
     _EVIDENCE_SNIPPET_MAX_CHARS: int = 4_000
     """Per-read cap on evidence text mirrored into telemetry for sentence-level
     evidence metrics. Bounds telemetry size independent of document length."""
@@ -8359,6 +8366,102 @@ class AgenticSearch(BaseSearch):
         if len(snippets) < AgenticSearch._EVIDENCE_SNIPPET_MAX_COUNT:
             snippets.append(text[: AgenticSearch._EVIDENCE_SNIPPET_MAX_CHARS])
 
+    async def _digest_evidence(
+        self,
+        query: str,
+        data_reqs: DataRequirements,
+        evidence: str,
+        context: Optional["SearchContext"] = None,
+    ) -> Tuple[bool, List[str], List[str], List[Dict[str, Any]]]:
+        """One long-context digestion pass over the gathered evidence.
+
+        Progressive digestion moves understanding into the retrieval loop:
+        instead of checking only what is missing (and discarding what was
+        found), a single call over the full evidence text resolves each data
+        requirement early — value, verbatim support quote, and source — while
+        also naming what is still missing and which search terms would locate
+        it. Downstream synthesis then assembles the answer along this fact
+        ledger rather than rebuilding all reasoning from the raw pile, and the
+        probe terms drive corpus re-exploration without a separate mining
+        call.
+
+        Returns ``(is_complete, missing, probe_terms, ledger)``.
+        """
+        if not (evidence or "").strip():
+            return False, [str(dp) for dp in data_reqs.data_points[:5]], [], []
+        prompt = (
+            "Digest the evidence below against the information requirements.\n"
+            f"Question: {query}\n"
+            "Required information:\n"
+            + "\n".join(f"- {dp}" for dp in data_reqs.data_points[:8])
+            + f"\n\nEvidence (each block starts with [filename]):\n{evidence[: self._AGENTIC_EVIDENCE_MAX_CHARS]}\n\n"
+            "For every requirement that the evidence resolves, record the exact "
+            "value, a short verbatim quote from the evidence that supports it, "
+            "and the source filename. List requirements the evidence does not "
+            "resolve as missing. For probe_terms, give ONLY short entity names "
+            "(1-4 words each: a person, work, organization, or place named in "
+            "the evidence but not described in detail) whose own documents "
+            "would contain the missing facts — never full questions, never "
+            "descriptive phrases.\n"
+            "Reply ONLY with JSON:\n"
+            '{"resolved": [{"requirement": "...", "value": "...", '
+            '"support": "verbatim quote", "source": "filename"}], '
+            '"missing": ["..."], "probe_terms": ["..."], "complete": true/false}'
+        )
+        try:
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+            data = self._extract_json_object((resp.content or "").strip()) or {}
+        except Exception as exc:
+            await self._logger.warning(f"[Phase 4:Digest] digestion failed: {exc}")
+            return True, [], [], []
+        ledger = [
+            {
+                "requirement": str(item.get("requirement") or ""),
+                "value": str(item.get("value") or ""),
+                "support": str(item.get("support") or ""),
+                "source": str(item.get("source") or ""),
+            }
+            for item in (data.get("resolved") or [])
+            if isinstance(item, dict) and (item.get("value") or "").strip()
+        ]
+        missing = [str(m) for m in (data.get("missing") or []) if str(m).strip()][:5]
+        # Mechanical guard: keyword search needs short entity names; question-
+        # style phrases mined by the model rarely match raw text and would
+        # blind the probe, so overlong terms are dropped regardless of prompt
+        # compliance.
+        probe_terms = [
+            str(t).strip() for t in (data.get("probe_terms") or [])
+            if str(t).strip() and len(str(t).strip().split()) <= 4
+        ][: self._BRIDGE_PROBE_MAX_TERMS]
+        is_complete = bool(data.get("complete", not missing)) and not missing
+        await self._logger.info(
+            f"[Phase 4:Digest] resolved={len(ledger)} missing={len(missing)} "
+            f"probe_terms={probe_terms}"
+        )
+        return is_complete, missing, probe_terms, ledger
+
+    @staticmethod
+    def _format_fact_ledger(ledger: Optional[List[Dict[str, Any]]]) -> str:
+        """Render digested facts as a synthesis-ready block, empty when none."""
+        if not ledger:
+            return ""
+        lines = ["[Confirmed Facts — digested from the evidence below]"]
+        for item in ledger[:12]:
+            req = item.get("requirement") or ""
+            val = item.get("value") or ""
+            sup = (item.get("support") or "")[:220]
+            src = item.get("source") or ""
+            lines.append(f'- {req}: {val} — "{sup}" ({src})')
+        lines.append(
+            "Use these confirmed facts as the primary reasoning chain; verify "
+            "against the full evidence and trust the evidence text if a fact "
+            "conflicts with it. Keep SUMMARY brief."
+        )
+        return "\n".join(lines)
+
     _BRIDGE_PROBE_MAX_ROUNDS: int = 2
     """Maximum corpus-level re-probe rounds driven by unresolved requirements."""
     _BRIDGE_PROBE_MAX_TERMS: int = 3
@@ -8374,6 +8477,7 @@ class AgenticSearch(BaseSearch):
         known_files: Set[str],
         paths: List[str],
         context: Optional["SearchContext"] = None,
+        terms: Optional[List[str]] = None,
     ) -> List[str]:
         """Mine probe terms for unresolved requirements and re-search the corpus.
 
@@ -8388,29 +8492,33 @@ class AgenticSearch(BaseSearch):
         """
         if not missing or not paths:
             return []
-        prompt = (
-            "Some information needed to answer the question is still missing.\n"
-            f"Question: {query}\n"
-            "Still missing:\n"
-            + "\n".join(f"- {m}" for m in missing[:5])
-            + f"\n\nEvidence gathered so far:\n{evidence[:6000]}\n\n"
-            "Name the search terms most likely to locate the missing information "
-            "in a document collection. Prefer specific names of entities that the "
-            "evidence above mentions but does not describe in detail, since their "
-            "own documents are probably where the missing facts live.\n"
-            f"Return ONLY a JSON array of at most {self._BRIDGE_PROBE_MAX_TERMS} "
-            'short search strings, e.g. ["Some Entity"]. Return [] if none apply.'
-        )
-        try:
-            resp = await self.llm.achat(
-                messages=[{"role": "user", "content": prompt}], stream=False,
+        terms = [str(t).strip() for t in (terms or []) if str(t).strip()][: self._BRIDGE_PROBE_MAX_TERMS]
+        if not terms:
+            # No digested probe terms supplied — fall back to a dedicated
+            # mining call over the current evidence.
+            prompt = (
+                "Some information needed to answer the question is still missing.\n"
+                f"Question: {query}\n"
+                "Still missing:\n"
+                + "\n".join(f"- {m}" for m in missing[:5])
+                + f"\n\nEvidence gathered so far:\n{evidence[:6000]}\n\n"
+                "Name the search terms most likely to locate the missing information "
+                "in a document collection. Prefer specific names of entities that the "
+                "evidence above mentions but does not describe in detail, since their "
+                "own documents are probably where the missing facts live.\n"
+                f"Return ONLY a JSON array of at most {self._BRIDGE_PROBE_MAX_TERMS} "
+                'short search strings, e.g. ["Some Entity"]. Return [] if none apply.'
             )
-            self.llm_usages.append(resp.usage)
-            terms = self._extract_json_array((resp.content or "").strip()) or []
-        except Exception as exc:
-            await self._logger.warning(f"[Phase 4:BeliefProbe] term mining failed: {exc}")
-            return []
-        terms = [str(t).strip() for t in terms if str(t).strip()][: self._BRIDGE_PROBE_MAX_TERMS]
+            try:
+                resp = await self.llm.achat(
+                    messages=[{"role": "user", "content": prompt}], stream=False,
+                )
+                self.llm_usages.append(resp.usage)
+                mined = self._extract_json_array((resp.content or "").strip()) or []
+            except Exception as exc:
+                await self._logger.warning(f"[Phase 4:BeliefProbe] term mining failed: {exc}")
+                return []
+            terms = [str(t).strip() for t in mined if str(t).strip()][: self._BRIDGE_PROBE_MAX_TERMS]
         if not terms:
             return []
         try:
@@ -8559,9 +8667,15 @@ class AgenticSearch(BaseSearch):
             combined = "\n\n".join(evidence_parts)
             is_complete = True
             probe_rounds = 0
+            ledger: List[Dict[str, Any]] = []
             if paths and data_reqs.data_points:
-                is_complete, missing = await self._check_data_requirements(
-                    query, data_reqs, combined,
+                # Progressive digestion: one long-context pass resolves facts
+                # early (value + verbatim support + source), names what is
+                # missing, and yields the probe terms — replacing the
+                # check-only requirements call plus the separate term-mining
+                # call of the previous loop.
+                is_complete, missing, probe_terms, ledger = await self._digest_evidence(
+                    query, data_reqs, combined, context,
                 )
                 known_files = {str(fp) for fp in target_files}
                 while (
@@ -8571,6 +8685,7 @@ class AgenticSearch(BaseSearch):
                 ):
                     new_files = await self._belief_probe_new_files(
                         query, missing, combined, known_files, paths, context,
+                        terms=probe_terms,
                     )
                     if not new_files:
                         break
@@ -8590,11 +8705,16 @@ class AgenticSearch(BaseSearch):
                                 context, fp, content, source="bridge_probe",
                             )
                     combined = "\n\n".join(evidence_parts)
-                    is_complete, missing = await self._check_data_requirements(
-                        query, data_reqs, combined,
+                    # Re-digest over the full evidence so the ledger always
+                    # reflects everything gathered, including bridge files.
+                    is_complete, missing, probe_terms, ledger = await self._digest_evidence(
+                        query, data_reqs, combined, context,
                     )
                 self._record_context_telemetry(
-                    context, bridge_probe_rounds=probe_rounds,
+                    context,
+                    bridge_probe_rounds=probe_rounds,
+                    fact_ledger_size=len(ledger),
+                    fact_ledger=ledger[:12],
                 )
             return RetrievalResult(
                 evidence=combined[:self._AGENTIC_EVIDENCE_MAX_CHARS],
@@ -8603,6 +8723,7 @@ class AgenticSearch(BaseSearch):
                 },
                 is_complete=is_complete,
                 rounds_used=probe_rounds,
+                ledger=ledger or None,
             )
 
         for round_idx in range(self._AGENTIC_MAX_ROUNDS):
@@ -8857,6 +8978,13 @@ class AgenticSearch(BaseSearch):
             return _NO_RESULTS_MESSAGE, False, None
 
         evidence = retrieval.evidence
+        # D4: prepend the digested fact ledger so synthesis assembles the
+        # answer along a pre-verified reasoning chain instead of rebuilding it
+        # from the raw pile; the full evidence stays in context as the
+        # source-grounded fallback.
+        ledger_block = self._format_fact_ledger(retrieval.ledger)
+        if ledger_block:
+            evidence = f"{ledger_block}\n\n{evidence}"
         if formula and intent == "computation":
             evidence = f"[Required Formula: {formula}]\n\n{evidence}"
 
