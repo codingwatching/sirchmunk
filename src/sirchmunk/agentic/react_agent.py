@@ -153,6 +153,8 @@ class ReActSearchAgent:
         query: str,
         images: Optional[List[str]] = None,
         initial_keywords: Optional[List[str]] = None,
+        preloaded_observations: Optional[str] = None,
+        subgoals: Optional[List[str]] = None,
     ) -> Tuple[str, SearchContext]:
         """Execute a full ReAct search session.
 
@@ -161,6 +163,13 @@ class ReActSearchAgent:
             images: Optional image URLs (reserved for future multimodal support).
             initial_keywords: Optional pre-extracted keywords to use for the
                 first keyword_search call, bypassing the LLM's first turn.
+            preloaded_observations: Optional evidence block (e.g. prior-warmed
+                retrieval results) injected as the first observation so the
+                answering agent starts from gathered evidence instead of an
+                empty context. The agent still owns every subsequent action.
+            subgoals: Optional explicit per-fact requirements the answer must
+                satisfy, listed for the agent as a checklist. Complements the
+                free-form reasoning with a structured target set.
 
         Returns:
             Tuple of (final_answer_text, search_context).
@@ -181,7 +190,7 @@ class ReActSearchAgent:
             },
             {
                 "role": "user",
-                "content": self._build_user_message(query, images),
+                "content": self._build_user_message(query, images, subgoals),
             },
         ]
 
@@ -191,6 +200,37 @@ class ReActSearchAgent:
 
         tool_names = self.registry.tool_names
         final_answer: Optional[str] = None
+
+        # Prior-warmed start: inject gathered evidence as the first observation.
+        # The agent reads it as if it had just retrieved it, then decides the
+        # next action itself — this raises the starting evidence quality without
+        # taking control away from the answering agent.
+        if preloaded_observations and preloaded_observations.strip():
+            context.increment_loop()
+            messages.append({
+                "role": "assistant",
+                "content": (
+                    "I'll begin from the evidence already gathered for this "
+                    "question, then decide what else is needed."
+                ),
+            })
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"**Preloaded evidence** (starting leads from a broad prior "
+                    f"retrieval — it may be incomplete and may contain unrelated "
+                    f"files):\n{preloaded_observations}\n\n"
+                    "Treat this as leads, not conclusions. For each thing you "
+                    "still need to establish that is not already stated "
+                    "verbatim above, issue a keyword_search with the specific "
+                    "entity name to confirm it before answering — do not answer "
+                    "from the leads alone if a required fact is unconfirmed.\n\n"
+                    f"{self._build_continuation_prompt(context)}"
+                ),
+            })
+            await self._logger.info(
+                f"[ReAct] Prior-warmed with {len(preloaded_observations)} chars of evidence"
+            )
 
         # Optionally execute pre-extracted keywords before the first LLM call
         if initial_keywords and "keyword_search" in tool_names:
@@ -344,9 +384,17 @@ class ReActSearchAgent:
     def _build_user_message(
         query: str,
         images: Optional[List[str]] = None,
+        subgoals: Optional[List[str]] = None,
     ) -> str:
         """Build the initial user message."""
         parts = [query]
+        if subgoals:
+            checklist = "\n".join(f"- {g}" for g in subgoals if str(g).strip())
+            if checklist:
+                parts.append(
+                    "\nTo answer this, you need to establish each of the "
+                    f"following from the evidence:\n{checklist}"
+                )
         if images:
             parts.append(f"\n[Attached {len(images)} image(s) — multimodal analysis not yet supported]")
         return "\n".join(parts)

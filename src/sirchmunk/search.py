@@ -149,6 +149,13 @@ class _PathScope:
 # When enabled, search relies solely on tree index navigation, skipping rga keyword search.
 _PURE_TREE_SEARCH: bool = os.getenv("SIRCHMUNK_PURE_TREE_SEARCH", "false").lower() == "true"
 
+# Prior-warmed agentic loop for DEEP synthesis. When enabled (default), the
+# parallel prior (Phases 1-3) warm-starts a single stateful agent loop that
+# both retrieves and answers, replacing the split extract-then-synthesize
+# path (Phase 4 digestion + Phase 4.5 synthesis). Set to "false" to fall back
+# to the legacy split pipeline for ablation/regression comparison.
+_AGENTIC_LOOP_MODE: bool = os.getenv("SIRCHMUNK_AGENTIC_LOOP", "true").lower() == "true"
+
 # Zero-hit rescue: when every retrieval probe returns empty, retry once with
 # decomposed (unigram/bigram) keywords and a relaxed dir-scan acceptance level.
 _ZERO_HIT_RESCUE: bool = os.getenv("LENS_ZERO_HIT_RESCUE", "true").lower() == "true"
@@ -2395,34 +2402,46 @@ class AgenticSearch(BaseSearch):
         )
 
         # ==============================================================
-        # Phase 4: Agentic retrieval loop
+        # Phase 4-4.5: Retrieval + synthesis
         # ==============================================================
-        with self._phase("phase4_retrieve"):
-            retrieval = await self._agentic_retrieve(
-                query, data_reqs, target_files, context, paths=paths,
-                match_snippets=match_snippets,
+        # Prior-warmed agentic loop (default): the parallel prior seeds a
+        # single stateful agent that both retrieves and answers, so the
+        # reasoning linking evidence to the question survives to the answer.
+        # Legacy split path (flag off) retained for ablation.
+        retrieval: Optional[RetrievalResult] = None
+        if _AGENTIC_LOOP_MODE:
+            with self._phase("phase4_loop"):
+                answer, should_save = await self._agentic_loop_search(
+                    query, data_reqs, target_files, context, paths=paths,
+                    match_snippets=match_snippets,
+                    max_token_budget=max_token_budget,
+                )
+            answer = self._finalize_answer(query, answer, data_reqs)
+            cluster = None
+            self._record_context_telemetry(context, agentic_loop_used=True)
+            await self._logger.info("[Phase 4] Prior-warmed agentic loop complete")
+        else:
+            with self._phase("phase4_retrieve"):
+                retrieval = await self._agentic_retrieve(
+                    query, data_reqs, target_files, context, paths=paths,
+                    match_snippets=match_snippets,
+                )
+            await self._logger.info(
+                f"[Phase 4] Retrieval: {retrieval.rounds_used} rounds, "
+                f"complete={retrieval.is_complete}, "
+                f"{sum(len(ps) for ps in retrieval.pages_extracted.values())} pages"
             )
-
-        await self._logger.info(
-            f"[Phase 4] Retrieval: {retrieval.rounds_used} rounds, "
-            f"complete={retrieval.is_complete}, "
-            f"{sum(len(ps) for ps in retrieval.pages_extracted.values())} pages"
-        )
-
-        # ==============================================================
-        # Phase 4.5: Synthesis
-        # ==============================================================
-        with self._phase("phase4_5_synthesis"):
-            answer, should_save, cluster = await self._synthesize_from_retrieval(
-                query, _query_intent, retrieval, merged_files,
-                formula=data_reqs.formula,
-                background_context=spec_context,
-                data_reqs=data_reqs,
-                context=context,
-            )
+            with self._phase("phase4_5_synthesis"):
+                answer, should_save, cluster = await self._synthesize_from_retrieval(
+                    query, _query_intent, retrieval, merged_files,
+                    formula=data_reqs.formula,
+                    background_context=spec_context,
+                    data_reqs=data_reqs,
+                    context=context,
+                )
 
         # ==============================================================
-        # Phase 4.6: Self-correction (conditional)
+        # Phase 4.6: Self-correction (conditional; legacy split path only)
         # ==============================================================
         # Seed the mechanism markers so downstream telemetry always carries an
         # explicit False, letting analysis distinguish "mechanism did not fire"
@@ -2435,7 +2454,7 @@ class AgenticSearch(BaseSearch):
             forced_guess_used=False,
         )
         sc_retrieval: Optional[RetrievalResult] = None
-        if answer == _NO_RESULTS_MESSAGE:
+        if not _AGENTIC_LOOP_MODE and answer == _NO_RESULTS_MESSAGE:
             self._record_context_telemetry(context, self_correct_entered=True)
             sc_retrieval = await self._deep_agentic_self_correct(
                 query, data_reqs, retrieval,
@@ -2455,8 +2474,9 @@ class AgenticSearch(BaseSearch):
 
         # Benchmark-gated last resort: a refusal scores as a wrong answer in
         # benchmarks with no abstention reward, so make one best-effort
-        # attempt from whatever evidence was gathered.
-        if answer == _NO_RESULTS_MESSAGE:
+        # attempt from whatever evidence was gathered. (Loop mode's answer
+        # contract already forbids refusing on partial evidence.)
+        if not _AGENTIC_LOOP_MODE and answer == _NO_RESULTS_MESSAGE:
             best_effort_source = sc_retrieval if sc_retrieval is not None else retrieval
             guessed = await self._forced_guess_answer(
                 query, best_effort_source, data_reqs, context,
@@ -2473,9 +2493,13 @@ class AgenticSearch(BaseSearch):
                 _, should_save, _ = self._parse_summary_response(answer)
 
         # ==============================================================
-        # Phase 4.8: Answer span calibration
+        # Phase 4.8: Answer span calibration (legacy split path only)
         # ==============================================================
-        if answer and answer != _NO_RESULTS_MESSAGE and _query_intent != "computation":
+        if (
+            not _AGENTIC_LOOP_MODE
+            and answer and answer != _NO_RESULTS_MESSAGE
+            and _query_intent != "computation"
+        ):
             _calibration_source = sc_retrieval if sc_retrieval is not None else retrieval
             answer = await self._calibrate_answer_span(
                 query,
@@ -8608,6 +8632,225 @@ class AgenticSearch(BaseSearch):
         if not block:
             return content
         return f"{block}\n{content}"
+
+    # LENS answer contract: the single output register shared with every
+    # evaluated system so EM / judge compare answers at the same granularity.
+    _LOOP_ANSWER_CONTRACT: str = (
+        "Your final answer inside <ANSWER></ANSWER> must be the minimal concise "
+        "answer span only (a name, date, phrase, or yes/no) — no explanations, "
+        "no full sentences, no multiple candidates. If evidence is partial, give "
+        "the best supported concise answer instead of refusing."
+    )
+    _LOOP_MAX_PRELOAD_CHARS: int = 60_000
+    """Cap on the prior-warmed evidence block handed to the agent loop."""
+
+    async def _build_prior_observations(
+        self,
+        query: str,
+        target_files: List[str],
+        match_snippets: Optional[Dict[str, List[str]]],
+        context: "SearchContext",
+    ) -> str:
+        """Extract the prior-selected files into one warm-start evidence block.
+
+        Each selected file is read once (matched lines surfaced above its text)
+        and concatenated under a ``[filename]`` header, reproducing what the
+        parallel prior already localized. The block seeds the agent loop's
+        first observation; extraction reads are mirrored into telemetry so
+        evidence metrics observe exactly the text handed to the agent.
+
+        Handing over full text rather than leads is deliberate: a leads-only
+        warm start measurably raises the agent's self-directed searching but
+        loses more evidence than the extra activity recovers within the loop's
+        budget.
+        """
+        parts: List[str] = []
+        used = 0
+        for fp in target_files:
+            if used >= self._LOOP_MAX_PRELOAD_CHARS:
+                break
+            remaining = self._LOOP_MAX_PRELOAD_CHARS - used
+            try:
+                content = await self._extract_non_paginated_content(
+                    fp, query, max_chars=remaining,
+                )
+            except Exception as exc:
+                await self._logger.warning(f"[LoopWarmup] extract failed for {fp}: {exc}")
+                content = None
+            if not content:
+                continue
+            content = self._annotate_matched_lines(fp, content, match_snippets)
+            name = Path(str(fp)).name
+            block = f"[{name}]\n{content}"
+            parts.append(block)
+            used += len(block)
+            self._record_deep_evidence_read(context, fp, content, source="loop_warmup")
+        return "\n\n".join(parts)
+
+    async def _agentic_loop_search(
+        self,
+        query: str,
+        data_reqs: DataRequirements,
+        target_files: List[str],
+        context: "SearchContext",
+        paths: List[str],
+        match_snippets: Optional[Dict[str, List[str]]] = None,
+        max_loops: int = 6,
+        max_token_budget: int = 128_000,
+    ) -> Tuple[str, bool]:
+        """Prior-warmed agentic loop that both retrieves and answers.
+
+        Replaces the split extract-then-synthesize path: a single stateful
+        agent thread starts from the parallel prior's evidence (warm start) and
+        the per-fact requirements (subgoals), then owns every further action —
+        re-searching the corpus with its own reformulated terms, reading more
+        files, and deciding when to answer. Because the agent that answers is
+        the same agent that retrieved, the reasoning that links each piece of
+        evidence to the question survives to the answer, which the split
+        pipeline lost at every stateless call boundary.
+
+        Returns ``(answer, should_save)``.
+        """
+        from sirchmunk.agentic.react_agent import ReActSearchAgent
+        from sirchmunk.agentic.tools import (
+            FileReadTool,
+            KeywordSearchTool,
+            ToolRegistry,
+        )
+
+        registry = ToolRegistry()
+        registry.register(KeywordSearchTool(
+            retriever=self.grep_retriever,
+            paths=paths,
+            max_results=20,
+        ))
+        registry.register(FileReadTool(max_chars_per_file=30_000))
+
+        preloaded = await self._build_prior_observations(
+            query, target_files, match_snippets, context,
+        )
+        subgoals = [str(dp) for dp in (data_reqs.data_points or []) if str(dp).strip()][:8]
+
+        agent = ReActSearchAgent(
+            llm=self.llm,
+            tool_registry=registry,
+            max_loops=max_loops,
+            max_token_budget=max_token_budget,
+            log_callback=self._log_callback,
+            answer_style_instruction=self._LOOP_ANSWER_CONTRACT,
+        )
+        answer, loop_ctx = await agent.run(
+            query=query,
+            preloaded_observations=preloaded,
+            subgoals=subgoals,
+        )
+        answer = self._collapse_repeated_span(answer)
+        self._merge_loop_telemetry(context, loop_ctx)
+        # Harvest evidence text for files the loop read itself (beyond the
+        # warm-start set) so sentence-level evidence metrics see everything the
+        # answering agent actually saw, not just the prior-selected files.
+        # Zero extra LLM cost — a bounded re-extraction of already-read files.
+        warm = {str(fp) for fp in target_files}
+        delta = [
+            fp for fp in (getattr(loop_ctx, "read_file_ids", set()) or set())
+            if str(fp) not in warm
+        ][: self._AGENTIC_MAX_FILES * 5]
+        for fp in delta:
+            try:
+                content = await self._extract_non_paginated_content(fp, query)
+            except Exception:
+                content = None
+            if content:
+                # Snippet only: the loop already logged the file_read, so
+                # avoid a second retrieval-log entry for the same read.
+                self._record_evidence_snippet(context, content)
+        should_save = bool(answer) and answer != _NO_RESULTS_MESSAGE
+        return answer, should_save
+
+    @staticmethod
+    def _collapse_repeated_span(answer: str) -> str:
+        """Collapse a degenerate answer that is one token/phrase repeated.
+
+        Agent decoding occasionally emits spans like ``egremont egremont
+        egremont``; exact match scores these as wrong even though the intended
+        answer is the single unit. When the whole span is an exact repetition
+        of the same word (or the same short phrase), it is reduced to one copy.
+        Any span that is not a clean full repetition is returned unchanged, so
+        legitimate multi-word answers are never truncated.
+        """
+        text = (answer or "").strip()
+        if not text:
+            return answer
+        words = text.split()
+        if len(words) < 2:
+            return answer
+        # All identical words -> one copy (case-insensitive comparison).
+        if len({w.lower() for w in words}) == 1:
+            return words[0]
+        # Whole span is an exact k-fold repetition of a base phrase.
+        n = len(words)
+        for unit in range(1, n // 2 + 1):
+            if n % unit:
+                continue
+            base = [w.lower() for w in words[:unit]]
+            if all(
+                [w.lower() for w in words[i:i + unit]] == base
+                for i in range(0, n, unit)
+            ):
+                return " ".join(words[:unit])
+        return answer
+
+    @staticmethod
+    def _record_evidence_snippet(context: "SearchContext", content: str) -> None:
+        """Append a bounded evidence snippet to telemetry without re-logging.
+
+        Used when the retrieval op was already logged elsewhere (e.g. the agent
+        loop's own file_read) but the extracted text still needs to reach
+        sentence-level evidence metrics.
+        """
+        text = (content or "").strip()
+        if not text:
+            return
+        telemetry = getattr(context, "telemetry", None)
+        if not isinstance(telemetry, dict):
+            telemetry = {}
+            setattr(context, "telemetry", telemetry)
+        snippets = telemetry.setdefault("evidence_snippets", [])
+        if len(snippets) < AgenticSearch._EVIDENCE_SNIPPET_MAX_COUNT:
+            snippets.append(text[: AgenticSearch._EVIDENCE_SNIPPET_MAX_CHARS])
+
+    def _merge_loop_telemetry(
+        self,
+        context: "SearchContext",
+        loop_ctx: "SearchContext",
+    ) -> None:
+        """Fold the agent loop's context into the DEEP context for telemetry.
+
+        The loop runs on its own SearchContext; its read files, retrieval
+        logs, token usage, and loop count are copied back so downstream
+        evidence / cost / provenance metrics read identically to the previous
+        pipeline.
+        """
+        try:
+            for fp in getattr(loop_ctx, "read_file_ids", set()) or set():
+                context.read_file_ids.add(str(fp))
+            for log in getattr(loop_ctx, "retrieval_logs", []) or []:
+                context.retrieval_logs.append(log)
+            for q in getattr(loop_ctx, "search_history", []) or []:
+                context.search_history.append(q)
+            loop_tokens = int(getattr(loop_ctx, "total_llm_tokens", 0) or 0)
+            if loop_tokens:
+                context.add_llm_tokens(loop_tokens)
+            for usage in getattr(loop_ctx, "llm_usages", []) or []:
+                context.llm_usages.append(usage)
+            self._record_context_telemetry(
+                context,
+                loop_iterations=getattr(loop_ctx, "loop_count", 0),
+            )
+        except Exception as exc:
+            # Telemetry merge must never break the answer path.
+            import logging
+            logging.getLogger(__name__).debug("loop telemetry merge failed: %s", exc)
 
     async def _agentic_retrieve(
         self,
