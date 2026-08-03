@@ -316,6 +316,7 @@ class KeywordSearchTool(BaseTool):
         # snippet when possible.
         output_lines: List[str] = []
         total_chars = 0
+        snippets_by_file: Dict[str, List[str]] = {}
         for path, matches in list(deduped.items())[: self._max_results]:
             selected = self._select_diverse_snippets(
                 matches, max_lines=self._max_snippet_lines,
@@ -324,6 +325,7 @@ class KeywordSearchTool(BaseTool):
                 block = f"[{path}]\n" + "\n".join(selected)
                 output_lines.append(block)
                 total_chars += len(block)
+                snippets_by_file[path] = list(selected)
 
         result_text = "\n\n".join(output_lines)
 
@@ -340,7 +342,16 @@ class KeywordSearchTool(BaseTool):
             },
         )
 
-        return result_text, {"keywords": keywords, "files_found": len(deduped), "tokens": approx_tokens}
+        # ``snippets_by_file`` exposes the matched lines per file in structured
+        # form. Callers that only need file discovery can ignore it, while
+        # retrieval pipelines can carry the match locations forward instead of
+        # rediscovering where in each file the keywords actually hit.
+        return result_text, {
+            "keywords": keywords,
+            "files_found": len(deduped),
+            "tokens": approx_tokens,
+            "snippets_by_file": snippets_by_file,
+        }
 
     @staticmethod
     def _select_diverse_snippets(

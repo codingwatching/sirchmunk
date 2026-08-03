@@ -2263,6 +2263,10 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         keyword_files: List[str] = []
         dir_scan_files: List[str] = []
+        # Matched lines per file from the keyword probe: the literal hit
+        # locations are carried forward so extraction and answer synthesis can
+        # anchor on them rather than rescanning each document.
+        match_snippets: Dict[str, List[str]] = {}
 
         if _PURE_TREE_SEARCH:
             # Pure tree search mode: skip rga and dir_scan, rely solely on tree hits
@@ -2276,13 +2280,13 @@ class AgenticSearch(BaseSearch):
 
             if initial_keywords:
                 phase2_tasks.append(
-                    self._retrieve_by_keywords(
+                    self._probe_keyword_matches(
                         initial_keywords, paths,
                         max_depth=max_depth, include=include, exclude=exclude,
                     )
                 )
             else:
-                phase2_tasks.append(self._async_noop([]))
+                phase2_tasks.append(self._async_noop(([], {})))
 
             if scan_result is not None and enable_dir_scan:
                 phase2_tasks.append(
@@ -2294,7 +2298,8 @@ class AgenticSearch(BaseSearch):
             with self._phase("phase2_retrieve_rank"):
                 phase2_results = await asyncio.gather(*phase2_tasks, return_exceptions=True)
 
-            keyword_files = phase2_results[0] if not isinstance(phase2_results[0], Exception) else []
+            keyword_probe = phase2_results[0] if not isinstance(phase2_results[0], Exception) else ([], {})
+            keyword_files, match_snippets = keyword_probe
             dir_scan_files = phase2_results[1] if not isinstance(phase2_results[1], Exception) else []
 
             for i, label in enumerate(["keyword_search", "dir_scan_rank"]):
@@ -2395,6 +2400,7 @@ class AgenticSearch(BaseSearch):
         with self._phase("phase4_retrieve"):
             retrieval = await self._agentic_retrieve(
                 query, data_reqs, target_files, context, paths=paths,
+                match_snippets=match_snippets,
             )
 
         await self._logger.info(
@@ -7087,9 +7093,30 @@ class AgenticSearch(BaseSearch):
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
     ) -> List[str]:
-        """Run keyword search via rga and return discovered file paths.
+        """Run keyword search via rga and return discovered file paths."""
+        discovered, _ = await self._probe_keyword_matches(
+            keywords, paths, max_depth=max_depth, include=include, exclude=exclude,
+        )
+        return discovered
 
-        Each keyword is searched concurrently (literal per-term strategy).
+    async def _probe_keyword_matches(
+        self,
+        keywords: List[str],
+        paths: List[str],
+        max_depth: Optional[int] = 5,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+    ) -> Tuple[List[str], Dict[str, List[str]]]:
+        """Run keyword search via rga, keeping both files and matched lines.
+
+        Each keyword is searched concurrently (literal per-term strategy). The
+        search already computes *where* in every file the keywords hit, which
+        is the highest-precision evidence pointer an index-free pipeline
+        produces; returning it alongside the file list lets downstream stages
+        anchor extraction and answer spans on those lines instead of rereading
+        each document blind.
+
+        Returns ``(file_paths, {file_path: matched_lines})``.
         """
         from sirchmunk.agentic.tools import KeywordSearchTool
 
@@ -7102,17 +7129,24 @@ class AgenticSearch(BaseSearch):
             exclude=exclude,
         )
         ctx = SearchContext()  # lightweight context for this probe
-        result_text, meta = await tool.execute(context=ctx, keywords=keywords)
+        _, meta = await tool.execute(context=ctx, keywords=keywords)
 
         # Extract discovered file paths from the tool's context logs
         discovered: List[str] = []
         for log_entry in ctx.retrieval_logs:
             discovered.extend(log_entry.metadata.get("files_discovered", []))
+        raw_snippets = meta.get("snippets_by_file") if isinstance(meta, dict) else None
+        snippets: Dict[str, List[str]] = {}
+        if isinstance(raw_snippets, dict):
+            for path, lines in raw_snippets.items():
+                if isinstance(lines, list) and lines:
+                    snippets[str(path)] = [str(line) for line in lines]
 
         await self._logger.info(
-            f"[Retrieve:Keywords] {len(discovered)} files from rga search"
+            f"[Retrieve:Keywords] {len(discovered)} files from rga search, "
+            f"{len(snippets)} with matched lines"
         )
-        return discovered
+        return discovered, snippets
 
     @staticmethod
     def _relax_keywords(keywords: List[str], query: str) -> List[str]:
@@ -8397,8 +8431,12 @@ class AgenticSearch(BaseSearch):
             + f"\n\nEvidence (each block starts with [filename]):\n{evidence[: self._AGENTIC_EVIDENCE_MAX_CHARS]}\n\n"
             "For every requirement that the evidence resolves, record the exact "
             "value, a short verbatim quote from the evidence that supports it, "
-            "and the source filename. List requirements the evidence does not "
-            "resolve as missing. For probe_terms, give ONLY short entity names "
+            "and the source filename. Lines prefixed with [matched] are the "
+            "lines where the search terms literally hit — prefer them as the "
+            "support quote when they carry the value, and copy the quote "
+            "verbatim from the evidence text. List requirements the evidence "
+            "does not resolve as missing. For probe_terms, give ONLY short "
+            "entity names "
             "(1-4 words each: a person, work, organization, or place named in "
             "the evidence but not described in detail) whose own documents "
             "would contain the missing facts — never full questions, never "
@@ -8478,6 +8516,7 @@ class AgenticSearch(BaseSearch):
         paths: List[str],
         context: Optional["SearchContext"] = None,
         terms: Optional[List[str]] = None,
+        match_snippets: Optional[Dict[str, List[str]]] = None,
     ) -> List[str]:
         """Mine probe terms for unresolved requirements and re-search the corpus.
 
@@ -8522,7 +8561,11 @@ class AgenticSearch(BaseSearch):
         if not terms:
             return []
         try:
-            found = await self._retrieve_by_keywords(terms, paths)
+            found, probe_matches = await self._probe_keyword_matches(terms, paths)
+            if match_snippets is not None and probe_matches:
+                # Keep bridge hits anchored too, so second-hop evidence arrives
+                # with its match locations rather than as plain full text.
+                match_snippets.update(probe_matches)
         except Exception as exc:
             await self._logger.warning(f"[Phase 4:BeliefProbe] corpus re-probe failed: {exc}")
             return []
@@ -8538,6 +8581,34 @@ class AgenticSearch(BaseSearch):
         )
         return new_files
 
+    @staticmethod
+    def _annotate_matched_lines(
+        file_path: str,
+        content: str,
+        match_snippets: Optional[Dict[str, List[str]]],
+    ) -> str:
+        """Surface the keyword-matched lines of a file above its full text.
+
+        The keyword probe already determined which lines of each file the query
+        terms hit. Passing only the file list downstream discards that pointer
+        and forces every later stage to relocate the evidence inside the whole
+        document. Prefixing the matched lines keeps the full text available for
+        context while telling extraction and synthesis exactly where the query
+        actually matched, so answer spans can be anchored on source lines.
+        Returns *content* unchanged when no match lines are known.
+        """
+        if not match_snippets or not content:
+            return content
+        lines = match_snippets.get(str(file_path))
+        if not lines:
+            return content
+        block = "\n".join(
+            f"[matched] {str(line).strip()}" for line in lines[:5] if str(line).strip()
+        )
+        if not block:
+            return content
+        return f"{block}\n{content}"
+
     async def _agentic_retrieve(
         self,
         query: str,
@@ -8545,6 +8616,7 @@ class AgenticSearch(BaseSearch):
         target_files: List[str],
         context: "SearchContext",
         paths: Optional[List[str]] = None,
+        match_snippets: Optional[Dict[str, List[str]]] = None,
     ) -> RetrievalResult:
         """Core agentic retrieval loop: select pages → extract → check → repeat.
 
@@ -8619,6 +8691,7 @@ class AgenticSearch(BaseSearch):
                 fp, query, max_chars=remaining,
             )
             if content:
+                content = self._annotate_matched_lines(fp, content, match_snippets)
                 evidence_parts.append(content)
                 pages_extracted[fp] = set()
                 self._record_deep_evidence_read(context, fp, content, source="non_paginated")
@@ -8685,7 +8758,7 @@ class AgenticSearch(BaseSearch):
                 ):
                     new_files = await self._belief_probe_new_files(
                         query, missing, combined, known_files, paths, context,
-                        terms=probe_terms,
+                        terms=probe_terms, match_snippets=match_snippets,
                     )
                     if not new_files:
                         break
@@ -8699,6 +8772,9 @@ class AgenticSearch(BaseSearch):
                             fp, query, max_chars=remaining,
                         )
                         if content:
+                            content = self._annotate_matched_lines(
+                                fp, content, match_snippets,
+                            )
                             evidence_parts.append(content)
                             pages_extracted[fp] = set()
                             self._record_deep_evidence_read(

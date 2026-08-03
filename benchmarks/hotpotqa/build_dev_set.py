@@ -107,6 +107,7 @@ def main() -> int:
     ap.add_argument("--sampling-dir", default=str(HERE / "output/dynamic_eval/sampling"))
     ap.add_argument("--pool", default="", help="fullwiki validation golden pool; defaults to parent-only exclusion source")
     ap.add_argument("--parquet-pool", default="", help="fullwiki validation parquet dir; questions bucketed with the same strata as the parent")
+    ap.add_argument("--exclude-ids", action="append", default=[], help="JSON file of sample ids to exclude; repeatable (e.g. an earlier dev set, so a fresh dev set stays decision-free)")
     ap.add_argument("-n", type=int, default=125)
     ap.add_argument("--seed", type=int, default=207)
     ap.add_argument("--out", default=str(HERE / "golden_set_dev_g125aligned.json"))
@@ -117,6 +118,20 @@ def main() -> int:
     parent = _samples(_load_json(Path(args.parent)))
     parent_ids = {str(s["sample_id"]) for s in parent}
     g125_ids = set(_g125_ids(Path(args.sampling_dir)))
+
+    # Ids that must not reappear: the frozen parent plus any earlier dev set.
+    # Excluding previous dev sets keeps a newly drawn set free of every
+    # question that already informed a keep/rollback decision, so it can serve
+    # as an independent check on tuning that was guided by those decisions.
+    excluded_extra: set = set()
+    for path in args.exclude_ids:
+        raw = _load_json(Path(path))
+        ids = raw.get("sample_ids") if isinstance(raw, dict) else raw
+        if isinstance(ids, dict):
+            ids = next(iter(ids.values()))
+        excluded_extra |= {str(x) for x in (ids or [])}
+    if excluded_extra:
+        print(f"excluding {len(excluded_extra)} ids from earlier dev sets", file=sys.stderr)
 
     # Target allocation: G_125 realized proportions over the strata.
     g125_samples = [s for s in parent if str(s["sample_id"]) in g125_ids]
@@ -134,8 +149,8 @@ def main() -> int:
         pool = [s for s in pool if str(s["sample_id"]) not in parent_ids]
         pool_note = f"external pool minus frozen parent (n={len(pool)})"
     elif args.parquet_pool:
-        pool = _load_parquet_pool(Path(args.parquet_pool), parent_ids)
-        pool_note = f"fullwiki validation parquet minus frozen parent (n={len(pool)})"
+        pool = _load_parquet_pool(Path(args.parquet_pool), parent_ids | excluded_extra)
+        pool_note = f"fullwiki validation parquet minus frozen parent and earlier dev sets (n={len(pool)})"
     else:
         pool = [s for s in parent if str(s["sample_id"]) not in g125_ids]
         pool_note = f"parent remainder minus G_125 (n={len(pool)})"
