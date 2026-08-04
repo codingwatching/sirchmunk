@@ -2129,6 +2129,25 @@ class AgenticSearch(BaseSearch):
     # DEEP mode — parallel multi-path retrieval with ReAct fallback
     # ------------------------------------------------------------------
 
+    async def _analyze_query_for_retrieval(
+        self,
+        query: str,
+    ) -> Tuple[Any, str, DataRequirements]:
+        """Classify intent and derive data requirements for *query*.
+
+        Grouped into one awaitable so the pair can be scheduled alongside the
+        retrieval probes: both steps read only the query, so nothing here has
+        to wait for retrieval output. The two calls stay sequential inside
+        because requirement analysis is conditioned on the detected intent.
+
+        Returns ``(complexity, intent, data_requirements)``.
+        """
+        with self._phase("phase3_intent"):
+            complexity, intent = await self._classify_query_intent(query)
+        with self._phase("phase3_data_reqs"):
+            data_reqs = await self._analyze_data_requirements(query, intent)
+        return complexity, intent, data_reqs
+
     async def _search_deep(
         self,
         query: str,
@@ -2192,6 +2211,16 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         await self._logger.info("[Phase 1] Parallel probing: keywords + dir_scan + knowledge + spec_cache + tree_index")
         context.increment_loop()
+
+        # Query analysis (intent + data requirements) depends only on the query
+        # text, never on retrieval output, yet it sat on the critical path
+        # between retrieval and file selection. Launch it here so it overlaps
+        # Phase 1-2 and is awaited in Phase 3, where its result is first
+        # needed. Touch the usage buffer first: the child task inherits a copy
+        # of the context whose ContextVar still points at this list object, so
+        # appends land in this search's accounting only if it already exists.
+        _ = self.llm_usages
+        analysis_task = asyncio.ensure_future(self._analyze_query_for_retrieval(query))
 
         with self._phase("phase1_probe"):
             phase1_results = await asyncio.gather(
@@ -2351,10 +2380,17 @@ class AgenticSearch(BaseSearch):
         # Phase 3: Query analysis + file selection
         # ==============================================================
         context.increment_loop()
-        with self._phase("phase3_intent"):
-            _query_complexity, _query_intent = await self._classify_query_intent(query)
-        with self._phase("phase3_data_reqs"):
-            data_reqs = await self._analyze_data_requirements(query, _query_intent)
+        try:
+            _query_complexity, _query_intent, data_reqs = await analysis_task
+        except Exception as exc:
+            # Never let the overlapped analysis break the pipeline: fall back to
+            # running it inline on the critical path.
+            await self._logger.warning(
+                f"[Phase 3] overlapped query analysis failed ({exc}); retrying inline"
+            )
+            _query_complexity, _query_intent, data_reqs = (
+                await self._analyze_query_for_retrieval(query)
+            )
         context.increment_loop()
 
         await self._logger.info(
