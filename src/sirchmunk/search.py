@@ -8650,42 +8650,43 @@ class AgenticSearch(BaseSearch):
         target_files: List[str],
         match_snippets: Optional[Dict[str, List[str]]],
         context: "SearchContext",
+        data_reqs: Optional[DataRequirements] = None,
     ) -> str:
         """Extract the prior-selected files into one warm-start evidence block.
 
-        Each selected file is read once (matched lines surfaced above its text)
-        and concatenated under a ``[filename]`` header, reproducing what the
-        parallel prior already localized. The block seeds the agent loop's
-        first observation; extraction reads are mirrored into telemetry so
-        evidence metrics observe exactly the text handed to the agent.
+        Delegates to the extraction machinery of ``_agentic_retrieve`` with
+        ``paths=None``, which performs text reads, page selection for paginated
+        documents, sibling expansion and evidence telemetry, while skipping the
+        requirement digest and corpus re-probe (those are the agent loop's job
+        now, and the digest only runs when ``paths`` is supplied). Reusing that
+        path keeps large documents on page-level selection with page-level
+        provenance instead of dumping whole files, which a text-only warm start
+        would lose.
 
-        Handing over full text rather than leads is deliberate: a leads-only
-        warm start measurably raises the agent's self-directed searching but
-        loses more evidence than the extra activity recovers within the loop's
-        budget.
+        Handing the agent full extracted text rather than leads is deliberate:
+        a leads-only warm start measurably raises the agent's self-directed
+        searching but loses more evidence than the extra activity recovers
+        within the loop's budget.
         """
-        parts: List[str] = []
-        used = 0
-        for fp in target_files:
-            if used >= self._LOOP_MAX_PRELOAD_CHARS:
-                break
-            remaining = self._LOOP_MAX_PRELOAD_CHARS - used
-            try:
-                content = await self._extract_non_paginated_content(
-                    fp, query, max_chars=remaining,
-                )
-            except Exception as exc:
-                await self._logger.warning(f"[LoopWarmup] extract failed for {fp}: {exc}")
-                content = None
-            if not content:
-                continue
-            content = self._annotate_matched_lines(fp, content, match_snippets)
-            name = Path(str(fp)).name
-            block = f"[{name}]\n{content}"
-            parts.append(block)
-            used += len(block)
-            self._record_deep_evidence_read(context, fp, content, source="loop_warmup")
-        return "\n\n".join(parts)
+        reqs = data_reqs or DataRequirements(
+            data_points=[], likely_sources=[], formula=None, time_period=None,
+            intent="lookup", expected_answer_type="", target_slot="",
+        )
+        retrieval = await self._agentic_retrieve(
+            query, reqs, target_files, context,
+            paths=None,
+            match_snippets=match_snippets,
+        )
+        if retrieval.pages_extracted:
+            self._record_context_telemetry(
+                context,
+                warm_start_pages_extracted={
+                    Path(str(fp)).name: pages
+                    for fp, pages in retrieval.pages_extracted.items()
+                    if pages
+                },
+            )
+        return (retrieval.evidence or "")[: self._LOOP_MAX_PRELOAD_CHARS]
 
     async def _agentic_loop_search(
         self,
@@ -8727,7 +8728,7 @@ class AgenticSearch(BaseSearch):
         registry.register(FileReadTool(max_chars_per_file=30_000))
 
         preloaded = await self._build_prior_observations(
-            query, target_files, match_snippets, context,
+            query, target_files, match_snippets, context, data_reqs=data_reqs,
         )
         subgoals = [str(dp) for dp in (data_reqs.data_points or []) if str(dp).strip()][:8]
 
