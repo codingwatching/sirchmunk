@@ -7911,9 +7911,22 @@ class AgenticSearch(BaseSearch):
         re.MULTILINE,
     )
     _SANITIZE_FORMAT_PATTERNS: list = [
-        re.compile(r"\*\*(?:Answer|Final Answer|ANSWER)(?:\s*:)?\*\*\s*"),
-        re.compile(r"^#+\s*(?:Answer|Final Answer)\s*:?\s*", re.MULTILINE),
+        # **Answer:** or **Answer ** or **Final Answer:** with bold markers
+        re.compile(r"\*\*(?:Answer|Final Answer|ANSWER)\s*(?::|\s)\s*\*\*\s*"),
+        # **Answer: xyz** — bold prefix without closing before content
+        re.compile(r"\*\*(?:Answer|Final Answer|ANSWER)\s*(?::|\s)\s*"),
+        # Markdown heading answer lines
+        re.compile(r"^#+\s*(?:Answer|Final Answer|ANSWER)\s*[:：]?\s*\n?", re.MULTILINE),
     ]
+    _SANITIZE_ANSWER_IS_PREFIX_RE = re.compile(
+        r"^(?:The answer is|My answer is|Final answer is|Answer is)\s*[:：]\s*",
+        re.IGNORECASE,
+    )
+    _SANITIZE_BOLD_WRAPPER_RE = re.compile(r"^\*\*(.+?)\*\*$", re.DOTALL)
+    _SANITIZE_TRAILING_REASONING_RE = re.compile(
+        r"\n+(?:(?:This|Based|I |The |According|From|Let me|Note|Source|Evidence).*)$",
+        re.DOTALL,
+    )
     _SANITIZE_MULTILINE_JSON_RE = re.compile(
         r"(?:\{[^{}]*\n[^{}]*\}|\[[^\[\]]*\n[^\[\]]*\])", re.DOTALL,
     )
@@ -7940,7 +7953,16 @@ class AgenticSearch(BaseSearch):
         for pat in self._SANITIZE_FORMAT_PATTERNS:
             cleaned = pat.sub("", cleaned)
 
-        # 4. Remove reasoning-trace lines only if they precede the substantive
+        # 4. Remove bold answer prefix patterns — strip remaining stray ** markers
+        #    that wrapped the entire answer (e.g. "**Hank Azaria**").
+        bold_match = self._SANITIZE_BOLD_WRAPPER_RE.match(cleaned.strip())
+        if bold_match:
+            cleaned = bold_match.group(1)
+
+        # 5. Remove "The answer is:" style prefix.
+        cleaned = self._SANITIZE_ANSWER_IS_PREFIX_RE.sub("", cleaned)
+
+        # 6. Remove reasoning-trace lines only if they precede the substantive
         #    answer (i.e. remove leading reasoning, not embedded references).
         lines = cleaned.split("\n")
         first_substantive = 0
@@ -7955,7 +7977,17 @@ class AgenticSearch(BaseSearch):
         if first_substantive > 0:
             cleaned = "\n".join(lines[first_substantive:])
 
-        # 5. Final whitespace cleanup.
+        # 7. Truncate trailing reasoning after newline — only when the first
+        #    line looks like a concise answer (< 100 chars) to avoid
+        #    over-truncating legitimate multi-line answers.
+        cleaned = cleaned.strip()
+        first_line = cleaned.split("\n", 1)[0] if "\n" in cleaned else cleaned
+        if len(first_line) < 100 and "\n" in cleaned:
+            truncated = self._SANITIZE_TRAILING_REASONING_RE.sub("", cleaned)
+            if truncated.strip():
+                cleaned = truncated
+
+        # 8. Final whitespace cleanup.
         cleaned = cleaned.strip()
 
         # Safety: never return empty if original had content.
