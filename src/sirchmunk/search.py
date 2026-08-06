@@ -184,6 +184,23 @@ _TYPED_COMPARISON: bool = os.getenv("LENS_TYPED_COMPARISON", "true").lower() == 
 # verifier rejects the answer's type.
 _SLOT_VERIFY_RETRY: bool = os.getenv("LENS_SLOT_VERIFY_RETRY", "true").lower() == "true"
 
+# P0-1: evidence triage — reduce warm-start noise before agentic loop.
+_EVIDENCE_TRIAGE: bool = os.getenv("LENS_EVIDENCE_TRIAGE", "true").lower() == "true"
+
+# Phase 1A: Format-agnostic retrieval — use snippet content (not filename
+# semantics) to score files and extract articles from JSON-lines shards.
+# Fixes catastrophic recall failure on corpora with meaningless filenames
+# (e.g. wiki_00, wiki_01) while preserving existing .txt-based behaviour.
+_FORMAT_AGNOSTIC_RETRIEVAL: bool = os.getenv("LENS_FORMAT_AGNOSTIC_RETRIEVAL", "true").lower() == "true"
+
+# Phase 2: Search Depth Enhancement + Hop-Aware Strategy. When enabled,
+# multi-hop queries dynamically receive expanded search budgets (more files,
+# more ReAct loops, more bridge probe rounds/terms), an evidence sufficiency
+# check drives continued exploration, and bridge questions get a forced
+# second-hop entity search. Disabling reverts all parameters to their
+# original conservative defaults.
+_SEARCH_DEPTH_ENHANCEMENT: bool = os.getenv("LENS_SEARCH_DEPTH_ENHANCEMENT", "true").lower() == "true"
+
 # Common English stop-words filtered out during keyword coverage computation.
 _STOP_WORDS: frozenset = frozenset({
     "the", "is", "a", "an", "of", "in", "for", "to", "and", "or",
@@ -257,6 +274,8 @@ class DataRequirements:
     expected_answer_type: str = ""
     target_slot: str = ""
     answer_constraints: List[str] = field(default_factory=list)
+    hop_type: str = "single"
+    """Query hop structure: 'single', 'bridge', or 'comparison'."""
 
 
 @dataclass
@@ -471,6 +490,13 @@ class AgenticSearch(BaseSearch):
         # Suppress noisy pypdf warnings about malformed PDF cross-references.
         # pypdf._reader emits logging.warning() for "Ignoring wrong pointing object".
         logging.getLogger("pypdf._reader").setLevel(logging.ERROR)
+
+        # ---- Format-agnostic retrieval state (Phase 1A) ----
+        # Maps shard file path -> list of article IDs discovered in snippets.
+        # Populated during snippet scoring, consumed during extraction.
+        self._snippet_article_map: Dict[str, List[str]] = {}
+        # Cache for _is_jsonlines_corpus detection results.
+        self._jsonlines_cache: Dict[str, bool] = {}
 
         # ---- Agentic (ReAct) components (lazy-initialised on first use) ----
         self._tool_registry = None
@@ -2194,6 +2220,9 @@ class AgenticSearch(BaseSearch):
         # token slice, and phase tags fully isolated from sibling tasks.
         self.llm_usages = _PhaseTaggedUsageList(self)
         self._current_phase = "unattributed"
+        # Reset per-search format-agnostic retrieval state.
+        self._snippet_article_map = {}
+        self._jsonlines_cache = {}
         _llm_usage_start = len(self.llm_usages)
 
         # --- Adaptive compile artifact detection (shared with FAST) ---
@@ -2428,6 +2457,7 @@ class AgenticSearch(BaseSearch):
             merged_files,
             query,
             data_reqs,
+            match_snippets=match_snippets,
         )
         if reranking_scores:
             self._record_context_telemetry(
@@ -2469,7 +2499,11 @@ class AgenticSearch(BaseSearch):
                 )
             answer = self._finalize_answer(query, answer, data_reqs)
             cluster = None
-            self._record_context_telemetry(context, agentic_loop_used=True)
+            self._record_context_telemetry(
+                context,
+                agentic_loop_used=True,
+                hop_type=data_reqs.hop_type,
+            )
             await self._logger.info("[Phase 4] Prior-warmed agentic loop complete")
             # Phase 4.9 (loop path): answer resolution stack. Restores the
             # exit-side answer-evidence alignment the legacy split path ran
@@ -7495,6 +7529,7 @@ class AgenticSearch(BaseSearch):
             if constraint:
                 lines.append(f"- Constraint: {constraint}")
         if lines:
+            lines.append("- Copy the answer span VERBATIM from evidence text \u2014 exact spelling, full name form, original punctuation.")
             lines.append("- PRECISE_ANSWER must be the minimal answer span only; do not include explanations, multiple candidates, or SHOULD_ANSWER=false as the answer text.")
             lines.append("- Align PRECISE_ANSWER to how the evidence names the answer entity: copy the complete form the evidence uses for that entity, without adding qualifiers the evidence does not attach to it and without dropping parts of the name the evidence includes. Do not lengthen or shorten it beyond that surface form.")
             lines.append("- If evidence is relevant but partial, provide the best supported concise answer instead of refusing.")
@@ -7860,6 +7895,72 @@ class AgenticSearch(BaseSearch):
             )
         return f"**Answer: {new_span}**\n\n{answer}"
 
+    # ------------------------------------------------------------------
+    # Phase 1B: Output Sanitization
+    # ------------------------------------------------------------------
+
+    # Pre-compiled patterns for tool-call / reasoning artifact removal.
+    _SANITIZE_TOOL_CALL_PATTERNS: list = [
+        re.compile(r"keyword_search\([^)]*\)", re.DOTALL),
+        re.compile(r"file_read\([^)]*\)", re.DOTALL),
+        re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL),
+        re.compile(r'\{\s*"tool"\s*:\s*"[^"]+".*?\}', re.DOTALL),
+    ]
+    _SANITIZE_REASONING_PREFIX_RE = re.compile(
+        r"^(Thought|Action|Observation|Let me|I need to|I'll|Based on).*$",
+        re.MULTILINE,
+    )
+    _SANITIZE_FORMAT_PATTERNS: list = [
+        re.compile(r"\*\*(?:Answer|Final Answer|ANSWER)(?:\s*:)?\*\*\s*"),
+        re.compile(r"^#+\s*(?:Answer|Final Answer)\s*:?\s*", re.MULTILINE),
+    ]
+    _SANITIZE_MULTILINE_JSON_RE = re.compile(
+        r"(?:\{[^{}]*\n[^{}]*\}|\[[^\[\]]*\n[^\[\]]*\])", re.DOTALL,
+    )
+
+    def _sanitize_answer_output(self, answer: str) -> str:
+        """Phase 1B: Remove tool-call artifacts and reasoning traces from *answer*.
+
+        A pure regex-based cleanup applied before D-layer answer resolution.
+        Conservative: if sanitization empties the string, the original is returned.
+        """
+        if not answer:
+            return answer
+
+        cleaned = answer
+
+        # 1. Remove tool call patterns.
+        for pat in self._SANITIZE_TOOL_CALL_PATTERNS:
+            cleaned = pat.sub("", cleaned)
+
+        # 2. Remove multi-line JSON blocks (objects/arrays spanning newlines).
+        cleaned = self._SANITIZE_MULTILINE_JSON_RE.sub("", cleaned)
+
+        # 3. Remove formatting headers ("**Answer:**", "## Answer", etc.).
+        for pat in self._SANITIZE_FORMAT_PATTERNS:
+            cleaned = pat.sub("", cleaned)
+
+        # 4. Remove reasoning-trace lines only if they precede the substantive
+        #    answer (i.e. remove leading reasoning, not embedded references).
+        lines = cleaned.split("\n")
+        first_substantive = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if self._SANITIZE_REASONING_PREFIX_RE.match(stripped):
+                first_substantive = i + 1
+            else:
+                break
+        if first_substantive > 0:
+            cleaned = "\n".join(lines[first_substantive:])
+
+        # 5. Final whitespace cleanup.
+        cleaned = cleaned.strip()
+
+        # Safety: never return empty if original had content.
+        return cleaned if cleaned else answer
+
     async def _resolve_loop_answer(
         self,
         query: str,
@@ -7897,6 +7998,8 @@ class AgenticSearch(BaseSearch):
         )
         if not answer or answer == _NO_RESULTS_MESSAGE:
             return answer
+        # Phase 1B: sanitize tool-call / reasoning artifacts before D-layers.
+        answer = self._sanitize_answer_output(answer)
         evidence = self._loop_evidence_text(context)
         if not evidence.strip():
             return answer
@@ -8563,6 +8666,49 @@ class AgenticSearch(BaseSearch):
     # Agentic retrieval pipeline (DEEP mode)
     # ------------------------------------------------------------------
 
+    import re as _re_module  # noqa: E402 – deferred to avoid top-level pollution
+
+    # Compiled patterns for hop-type detection (class-level, compiled once).
+    _HOP_COMPARISON_PATTERNS = [
+        _re_module.compile(r"\bwhich of the (two|2)\b", _re_module.IGNORECASE),
+        _re_module.compile(r"\bboth\s+.+?\s+and\s+", _re_module.IGNORECASE),
+        _re_module.compile(r"\bmore\b.+\bor\b.+\b(more|less)\b", _re_module.IGNORECASE),
+        _re_module.compile(r"\b(older|younger|taller|shorter|bigger|smaller|earlier|later|longer|shorter)\b", _re_module.IGNORECASE),
+        _re_module.compile(r"\bcompare\b", _re_module.IGNORECASE),
+        _re_module.compile(r"\b(which|who)\s+(is|was|were|are)\s+(the\s+)?(more|most|less|least|bigger|smaller|older|younger|earlier|later)\b", _re_module.IGNORECASE),
+        _re_module.compile(r"\b(are|is)\s+.+\b(the same|different)\b", _re_module.IGNORECASE),
+    ]
+    _HOP_BRIDGE_PATTERNS = [
+        _re_module.compile(r"\bthe\s+(director|author|writer|founder|creator|producer|composer|inventor|developer|designer|manager|owner|president|CEO|chairman|leader|star|actor|actress|singer|artist|painter|sculptor|architect|publisher|editor)\s+of\b", _re_module.IGNORECASE),
+        _re_module.compile(r"\b(who|that)\s+(wrote|directed|founded|created|produced|composed|invented|developed|designed|manages?|owns?|leads?|stars?\s+in|acted\s+in|painted|published|edited|built|sang|performed)\b", _re_module.IGNORECASE),
+        _re_module.compile(r"\bborn\s+in\s+the\s+same\s+(city|country|town|state|year)\s+as\b", _re_module.IGNORECASE),
+        _re_module.compile(r"\bthe\s+(city|country|town|state|university|school|company|band|team|film|movie|book|album|song|show)\s+(where|that|which|in which)\b", _re_module.IGNORECASE),
+        _re_module.compile(r"\b(member|employee|graduate|alumnus|alumna|resident|native|citizen)\s+of\s+the\s+same\b", _re_module.IGNORECASE),
+        _re_module.compile(r"\bthe\s+.{2,40}\s+of\s+the\s+.{2,40}\s+(who|that|which)\b", _re_module.IGNORECASE),
+        _re_module.compile(r"\bwhere\s+(did|does|was|is|were)\s+the\s+.{2,40}\s+(of|from|in)\b", _re_module.IGNORECASE),
+    ]
+
+    del _re_module  # clean up namespace after pattern compilation
+
+    @classmethod
+    def _detect_hop_type(cls, query: str) -> str:
+        """Heuristic hop-type detection based on query structure.
+
+        Uses compiled regex patterns to classify a query as 'comparison',
+        'bridge', or 'single' hop — no LLM call, deterministic and fast.
+        """
+        if not query:
+            return "single"
+        # Check comparison patterns first (higher specificity)
+        for pat in cls._HOP_COMPARISON_PATTERNS:
+            if pat.search(query):
+                return "comparison"
+        # Check bridge patterns
+        for pat in cls._HOP_BRIDGE_PATTERNS:
+            if pat.search(query):
+                return "bridge"
+        return "single"
+
     async def _analyze_data_requirements(
         self, query: str, intent: str,
     ) -> DataRequirements:
@@ -8576,7 +8722,7 @@ class AgenticSearch(BaseSearch):
             raw = (resp.content or "").strip()
             data = self._extract_json_object(raw)
             if data:
-                return DataRequirements(
+                reqs = DataRequirements(
                     data_points=data.get("data_points", [query]),
                     likely_sources=data.get("likely_sources", []),
                     formula=data.get("formula"),
@@ -8585,7 +8731,9 @@ class AgenticSearch(BaseSearch):
                     expected_answer_type=str(data.get("expected_answer_type") or ""),
                     target_slot=str(data.get("target_slot") or ""),
                     answer_constraints=[str(x) for x in data.get("answer_constraints", [])] if isinstance(data.get("answer_constraints"), list) else [],
+                    hop_type=self._detect_hop_type(query) if _SEARCH_DEPTH_ENHANCEMENT else "single",
                 )
+                return reqs
         except Exception as exc:
             await self._logger.warning(
                 f"[Phase 3] Data requirements analysis failed: {exc}"
@@ -8596,6 +8744,7 @@ class AgenticSearch(BaseSearch):
             expected_answer_type="",
             target_slot="",
             answer_constraints=[],
+            hop_type=self._detect_hop_type(query) if _SEARCH_DEPTH_ENHANCEMENT else "single",
         )
 
     def _select_target_files(
@@ -8679,18 +8828,48 @@ class AgenticSearch(BaseSearch):
         score = len(hits) + 0.5 * len(substring_hits - hits)
         return round(score / max(len(terms), 1), 4)
 
-    @classmethod
     def _rerank_files_for_evidence_coverage(
-        cls,
+        self,
         merged_files: List[str],
         query: str,
         data_reqs: Optional[DataRequirements],
+        match_snippets: Optional[Dict[str, List[str]]] = None,
     ) -> Tuple[List[str], Dict[str, float]]:
-        terms = cls._evidence_coverage_terms(query, data_reqs)
+        """Rerank files by evidence coverage using a dual scoring strategy.
+
+        For files with meaningful names (e.g. ``Moscow_State_University.txt``),
+        uses the existing filename-token scoring. For files with generic/
+        meaningless names (e.g. ``wiki_00``), uses snippet-content scoring
+        that examines the actual grep hit lines for query term coverage.
+
+        Final score per file = max(filename_score, snippet_score), ensuring
+        both .txt and JSON-shard scenarios produce useful rankings.
+        """
+        terms = self._evidence_coverage_terms(query, data_reqs)
         if not merged_files or not terms:
             return merged_files, {}
         order = {fp: idx for idx, fp in enumerate(merged_files)}
-        scores = {fp: cls._file_requirement_coverage_score(fp, terms) for fp in merged_files}
+
+        # Filename-based scores (existing logic, always computed)
+        filename_scores = {
+            fp: self._file_requirement_coverage_score(fp, terms)
+            for fp in merged_files
+        }
+
+        # Snippet-content scores (Phase 1A: format-agnostic)
+        snippet_scores: Dict[str, float] = {}
+        if _FORMAT_AGNOSTIC_RETRIEVAL and match_snippets:
+            snippet_scores = self._score_files_by_snippet_content(
+                match_snippets, query, data_reqs,
+            )
+
+        # Dual strategy: max(filename, snippet) per file
+        scores: Dict[str, float] = {}
+        for fp in merged_files:
+            fn_score = filename_scores.get(fp, 0.0)
+            sn_score = snippet_scores.get(fp, 0.0)
+            scores[fp] = max(fn_score, sn_score)
+
         if not any(score > 0 for score in scores.values()):
             return merged_files, {}
         ranked = sorted(
@@ -8837,8 +9016,11 @@ class AgenticSearch(BaseSearch):
     ) -> Optional[str]:
         """Extract content from a non-paginated file (text, markdown, etc.).
 
-        Uses two strategies in order:
+        Uses three strategies in order:
 
+        0. **JSON-lines article extraction** (Phase 1A) — for JSON-lines shards
+           with known target article IDs from snippet scoring, extracts only the
+           matching articles rather than reading the entire shard.
         1. **Text direct/window read** — for text-family files, including
            extensionless files whose byte sample looks like plain text, reads
            the full small file or query-matched context windows for large files.
@@ -8853,6 +9035,21 @@ class AgenticSearch(BaseSearch):
         path = Path(file_path)
         fname = path.name
         ext = path.suffix.lower()
+
+        # Strategy 0 (Phase 1A): targeted article extraction from JSON-lines.
+        # When snippet scoring has identified specific article IDs in this shard,
+        # extract only those articles instead of the whole file.
+        if _FORMAT_AGNOSTIC_RETRIEVAL:
+            article_ids = self._snippet_article_map.get(file_path)
+            if article_ids and self._is_jsonlines_corpus(file_path):
+                try:
+                    content = self._extract_articles_from_jsonlines(
+                        file_path, article_ids, query, budget,
+                    )
+                    if content and content.strip():
+                        return content[:budget]
+                except Exception:
+                    pass  # Fall through to generic strategies
 
         # Strategy 1: direct/window read for text-family files.  HotpotQA raw
         # wiki shards are extensionless plain-text files (e.g. ``wiki_55``),
@@ -8971,6 +9168,237 @@ class AgenticSearch(BaseSearch):
         tokens = re.findall(r"\b[a-z0-9]{3,}\b", query.lower())
         terms = sorted({t for t in tokens if t not in _STOP_WORDS}, key=len, reverse=True)
         return terms[:12]
+
+    # ------------------------------------------------------------------
+    # Phase 1A: Format-agnostic retrieval helpers
+    # ------------------------------------------------------------------
+
+    # Pattern matching generic/meaningless shard filenames where filename
+    # tokens carry no semantic signal about the article content inside.
+    _GENERIC_SHARD_RE = re.compile(
+        r"^(wiki|shard|chunk|part|split|segment|data|doc|file|corpus)"
+        r"[_\-]?\d*$",
+        re.IGNORECASE,
+    )
+
+    def _is_jsonlines_corpus(self, path: str) -> bool:
+        """Detect if *path* is a JSON-lines corpus shard.
+
+        Uses two heuristics (either sufficient):
+        1. Filename matches a generic shard pattern (no meaningful words).
+        2. First bytes of the file start with a JSON object containing an
+           ``"id"`` key — the standard format for HotpotQA wiki shards.
+
+        Results are cached per-file for the duration of the search.
+        """
+        if path in self._jsonlines_cache:
+            return self._jsonlines_cache[path]
+
+        p = Path(path)
+        stem = p.stem
+
+        # Heuristic 1: generic filename
+        if self._GENERIC_SHARD_RE.match(stem):
+            # Verify with a byte-probe that it looks like JSON-lines
+            try:
+                with p.open("rb") as fh:
+                    head = fh.read(512).lstrip()
+                if head.startswith(b"{") and b'"id"' in head[:256]:
+                    self._jsonlines_cache[path] = True
+                    return True
+            except Exception:
+                pass
+
+        # Heuristic 2: extensionless file whose first bytes are JSON objects
+        if not p.suffix:
+            try:
+                with p.open("rb") as fh:
+                    head = fh.read(512).lstrip()
+                if head.startswith(b"{") and b'"id"' in head[:256]:
+                    self._jsonlines_cache[path] = True
+                    return True
+            except Exception:
+                pass
+
+        self._jsonlines_cache[path] = False
+        return False
+
+    @staticmethod
+    def _has_meaningful_filename(file_path: str) -> bool:
+        """Return True if the filename carries semantic content.
+
+        Files like ``Moscow_State_University.txt`` have meaningful names;
+        files like ``wiki_00``, ``shard_3``, ``data_12`` do not. The existing
+        filename-based scoring is only useful for the former.
+        """
+        stem = Path(file_path).stem
+        # Strip leading numeric prefix (e.g. "001_Some_Document")
+        cleaned = re.sub(r"^\d+[_\-]", "", stem)
+        # After stripping, if only digits/generic tokens remain, not meaningful
+        if re.match(
+            r"^(wiki|shard|chunk|part|split|segment|data|doc|file|corpus)"
+            r"[_\-]?\d*$",
+            cleaned,
+            re.IGNORECASE,
+        ):
+            return False
+        # Must have at least one alphabetic run of 3+ chars to be meaningful
+        alpha_tokens = re.findall(r"[a-zA-Z]{3,}", cleaned)
+        return len(alpha_tokens) >= 1
+
+    def _score_files_by_snippet_content(
+        self,
+        keyword_results: Dict[str, List[str]],
+        query: str,
+        data_reqs: Optional["DataRequirements"],
+    ) -> Dict[str, float]:
+        """Score files by the semantic content of their match snippets.
+
+        For JSON-lines shards, parses snippet lines to extract article IDs
+        (the ``"id"`` or ``"title"`` fields), then scores by how many query/
+        data-requirement terms appear in those snippets. Also populates
+        ``self._snippet_article_map`` with discovered article IDs per shard
+        for downstream extraction.
+
+        Returns a dict of ``{file_path: score}``.
+        """
+        terms = self._evidence_coverage_terms(query, data_reqs)
+        if not terms:
+            return {}
+
+        scores: Dict[str, float] = {}
+
+        for file_path, snippet_lines in keyword_results.items():
+            if not snippet_lines:
+                continue
+
+            # Combine all snippet text for term matching
+            snippet_text = "\n".join(str(line) for line in snippet_lines).lower()
+            term_hits = sum(1 for t in terms if t in snippet_text)
+            line_count = len(snippet_lines)
+
+            # Extract article IDs from JSON-lines snippets
+            article_ids: List[str] = []
+            if self._is_jsonlines_corpus(file_path):
+                for line in snippet_lines:
+                    aid = self._extract_article_id_from_snippet(str(line))
+                    if aid and aid not in article_ids:
+                        article_ids.append(aid)
+                if article_ids:
+                    self._snippet_article_map[file_path] = article_ids
+
+            # Score: term coverage × line density
+            if term_hits > 0:
+                scores[file_path] = round(
+                    (term_hits / max(len(terms), 1)) * math.log2(line_count + 1),
+                    4,
+                )
+
+        return scores
+
+    @staticmethod
+    def _extract_article_id_from_snippet(line: str) -> Optional[str]:
+        """Try to extract an article ID or title from a JSON-lines snippet.
+
+        Handles both full JSON lines and grep-formatted partial lines.
+        Defensive: returns None on any parse failure.
+        """
+        # Try to find a JSON object in the line
+        start = line.find("{")
+        if start < 0:
+            return None
+        fragment = line[start:]
+
+        # Fast regex extraction for common patterns (avoids full JSON parse)
+        # Pattern: "id": "Some Article Title" or "title": "Some Title"
+        match = re.search(
+            r'"(?:id|title)"\s*:\s*"([^"]{1,200})"',
+            fragment,
+        )
+        if match:
+            return match.group(1).strip()
+
+        # Fallback: try full JSON parse (for well-formed lines)
+        try:
+            obj = json.loads(fragment)
+            if isinstance(obj, dict):
+                return str(obj.get("id") or obj.get("title") or "").strip() or None
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        return None
+
+    def _extract_articles_from_jsonlines(
+        self,
+        shard_path: str,
+        article_ids: List[str],
+        query: str,
+        budget: int,
+    ) -> str:
+        """Extract target articles from a JSON-lines shard file.
+
+        Reads the file line by line, parses each JSON object, and extracts
+        articles whose ``"id"`` (or ``"title"``) matches any entry in
+        *article_ids*. The article's ``"text"`` field (typically a list of
+        paragraphs) is joined into plain text. Respects *budget* (total chars).
+
+        Returns extracted text in a format consistent with other extraction
+        methods: ``[filename]\n<content>``.
+        """
+        target_set = set(article_ids)
+        parts: List[str] = []
+        chars = 0
+        fname = Path(shard_path).name
+
+        try:
+            with open(shard_path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if chars >= budget:
+                        break
+                    line = line.strip()
+                    if not line or not line.startswith("{"):
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+
+                    art_id = str(obj.get("id") or obj.get("title") or "").strip()
+                    if not art_id or art_id not in target_set:
+                        continue
+
+                    # Extract text content
+                    text_field = obj.get("text", "")
+                    if isinstance(text_field, list):
+                        # HotpotQA format: list of paragraphs (each may be a
+                        # list of sentences or a plain string)
+                        paragraphs: List[str] = []
+                        for para in text_field:
+                            if isinstance(para, list):
+                                paragraphs.append(" ".join(str(s) for s in para))
+                            elif isinstance(para, str):
+                                paragraphs.append(para)
+                        content = "\n".join(paragraphs)
+                    elif isinstance(text_field, str):
+                        content = text_field
+                    else:
+                        content = str(text_field)
+
+                    if content.strip():
+                        article_block = f"[Article: {art_id}]\n{content.strip()}"
+                        remaining = budget - chars
+                        parts.append(article_block[:remaining])
+                        chars += min(len(article_block), remaining)
+
+        except Exception:
+            # Defensive: on any I/O or parse failure, return what we have
+            pass
+
+        if not parts:
+            return ""
+        return f"[{fname}]\n" + "\n\n".join(parts)
 
     async def _expand_sibling_text_evidence(
         self,
@@ -9105,7 +9533,7 @@ class AgenticSearch(BaseSearch):
             "verbatim from the evidence text. List requirements the evidence "
             "does not resolve as missing. For probe_terms, give ONLY short "
             "entity names "
-            "(1-4 words each: a person, work, organization, or place named in "
+            "(1-6 words each: a person, work, organization, or place named in "
             "the evidence but not described in detail) whose own documents "
             "would contain the missing facts — never full questions, never "
             "descriptive phrases.\n"
@@ -9137,10 +9565,12 @@ class AgenticSearch(BaseSearch):
         # Mechanical guard: keyword search needs short entity names; question-
         # style phrases mined by the model rarely match raw text and would
         # blind the probe, so overlong terms are dropped regardless of prompt
-        # compliance.
+        # compliance. Phase 2 relaxes the limit from 4 to 6 words to allow
+        # multi-word proper nouns like "University of California, Berkeley".
+        _max_probe_term_words = 6 if _SEARCH_DEPTH_ENHANCEMENT else 4
         probe_terms = [
             str(t).strip() for t in (data.get("probe_terms") or [])
-            if str(t).strip() and len(str(t).strip().split()) <= 4
+            if str(t).strip() and len(str(t).strip().split()) <= _max_probe_term_words
         ][: self._BRIDGE_PROBE_MAX_TERMS]
         is_complete = bool(data.get("complete", not missing)) and not missing
         await self._logger.info(
@@ -9234,6 +9664,17 @@ class AgenticSearch(BaseSearch):
                 # Keep bridge hits anchored too, so second-hop evidence arrives
                 # with its match locations rather than as plain full text.
                 match_snippets.update(probe_matches)
+            # Phase 1A: populate article map for bridge-probed JSON-lines shards
+            if _FORMAT_AGNOSTIC_RETRIEVAL and probe_matches:
+                for fp, lines in probe_matches.items():
+                    if self._is_jsonlines_corpus(fp) and fp not in self._snippet_article_map:
+                        aids = []
+                        for ln in lines:
+                            aid = self._extract_article_id_from_snippet(str(ln))
+                            if aid and aid not in aids:
+                                aids.append(aid)
+                        if aids:
+                            self._snippet_article_map[fp] = aids
         except Exception as exc:
             await self._logger.warning(f"[Phase 4:BeliefProbe] corpus re-probe failed: {exc}")
             return []
@@ -9246,6 +9687,130 @@ class AgenticSearch(BaseSearch):
             belief_probe_used=True,
             belief_probe_terms=terms,
             belief_probe_new_files=new_files,
+        )
+        return new_files
+
+    def _check_evidence_sufficiency(
+        self,
+        data_reqs: DataRequirements,
+        ledger: List[Dict[str, Any]],
+        is_complete: bool,
+    ) -> str:
+        """Assess evidence coverage against data requirements.
+
+        Returns one of:
+        - ``'sufficient'``: all requirements resolved or flagged complete.
+        - ``'probe_missing'``: partial coverage (≥ 50%), trigger targeted probes.
+        - ``'continue_search'``: low coverage (< 50%), keep exploring.
+        """
+        if not _SEARCH_DEPTH_ENHANCEMENT:
+            return "sufficient" if is_complete else "probe_missing"
+        total = len(data_reqs.data_points) if data_reqs.data_points else 1
+        resolved = len(ledger) if ledger else 0
+        coverage_ratio = resolved / max(total, 1)
+        if is_complete or coverage_ratio >= 1.0:
+            return "sufficient"
+        if coverage_ratio >= 0.5:
+            return "probe_missing"
+        return "continue_search"
+
+    async def _force_bridge_second_hop(
+        self,
+        query: str,
+        data_reqs: DataRequirements,
+        first_hop_evidence: str,
+        known_files: Set[str],
+        paths: List[str],
+        context: Optional["SearchContext"] = None,
+        match_snippets: Optional[Dict[str, List[str]]] = None,
+    ) -> List[str]:
+        """Force a second-hop entity search for bridge questions.
+
+        Extracts named entities from the first-hop evidence that are NOT
+        already in the query (likely bridge entities), then searches the
+        corpus for those entities to discover their documents.
+
+        Only triggered when ``hop_type == 'bridge'`` and evidence is partial.
+        """
+        if not _SEARCH_DEPTH_ENHANCEMENT:
+            return []
+        if not first_hop_evidence or not paths:
+            return []
+        import re as _re
+        # Extract capitalized multi-word sequences as candidate entities
+        # Match sequences of 2+ capitalized words (proper nouns)
+        entity_pattern = _re.compile(
+            r'\b([A-Z][a-z]+(?:\s+(?:[A-Z][a-z]+|of|the|de|van|von|del|la|el|al))*'
+            r'(?:\s+[A-Z][a-z]+)+)\b'
+        )
+        candidates = entity_pattern.findall(first_hop_evidence)
+        # Also match single capitalized words that appear multiple times
+        single_cap = _re.compile(r'\b([A-Z][a-z]{2,})\b')
+        single_entities = single_cap.findall(first_hop_evidence)
+        # Count frequency for single-word entities
+        from collections import Counter
+        single_counts = Counter(single_entities)
+        # Filter: keep entities NOT already in the query
+        query_lower = query.lower()
+        novel_multi = [
+            e for e in candidates
+            if e.lower() not in query_lower and len(e) > 3
+        ]
+        novel_single = [
+            e for e, count in single_counts.most_common(10)
+            if e.lower() not in query_lower and count >= 2 and len(e) > 3
+        ]
+        # Deduplicate and rank by frequency in evidence
+        seen: Set[str] = set()
+        ranked: List[str] = []
+        for entity in novel_multi:
+            key = entity.lower()
+            if key not in seen:
+                seen.add(key)
+                ranked.append(entity)
+        for entity in novel_single:
+            key = entity.lower()
+            if key not in seen:
+                seen.add(key)
+                ranked.append(entity)
+        # Take top-3 bridge entity candidates
+        bridge_terms = ranked[:3]
+        if not bridge_terms:
+            return []
+        await self._logger.info(
+            f"[Phase 2:BridgeHop] Forcing second-hop search with entities: {bridge_terms}"
+        )
+        try:
+            found, probe_matches = await self._probe_keyword_matches(
+                bridge_terms, paths,
+            )
+            if match_snippets is not None and probe_matches:
+                match_snippets.update(probe_matches)
+            # Phase 1A: populate article map for bridge-probed JSON-lines shards
+            if _FORMAT_AGNOSTIC_RETRIEVAL and probe_matches:
+                for fp, lines in probe_matches.items():
+                    if self._is_jsonlines_corpus(fp) and fp not in self._snippet_article_map:
+                        aids = []
+                        for ln in lines:
+                            aid = self._extract_article_id_from_snippet(str(ln))
+                            if aid and aid not in aids:
+                                aids.append(aid)
+                        if aids:
+                            self._snippet_article_map[fp] = aids
+        except Exception as exc:
+            await self._logger.warning(
+                f"[Phase 2:BridgeHop] second-hop corpus search failed: {exc}"
+            )
+            return []
+        new_files = [fp for fp in found if str(fp) not in known_files][: self._BRIDGE_PROBE_MAX_FILES]
+        await self._logger.info(
+            f"[Phase 2:BridgeHop] bridge_terms={bridge_terms} -> {len(new_files)} new files"
+        )
+        self._record_context_telemetry(
+            context,
+            bridge_second_hop_used=True,
+            bridge_second_hop_terms=bridge_terms,
+            bridge_second_hop_new_files=new_files,
         )
         return new_files
 
@@ -9279,14 +9844,144 @@ class AgenticSearch(BaseSearch):
 
     # LENS answer contract: the single output register shared with every
     # evaluated system so EM / judge compare answers at the same granularity.
-    _LOOP_ANSWER_CONTRACT: str = (
+    _LOOP_ANSWER_CONTRACT_DEFAULT: str = (
         "Your final answer inside <ANSWER></ANSWER> must be the minimal concise "
-        "answer span only (a name, date, phrase, or yes/no) — no explanations, "
+        "answer span only (a name, date, phrase, or yes/no) \u2014 no explanations, "
         "no full sentences, no multiple candidates. If evidence is partial, give "
         "the best supported concise answer instead of refusing."
     )
     _LOOP_MAX_PRELOAD_CHARS: int = 60_000
     """Cap on the prior-warmed evidence block handed to the agent loop."""
+
+    def _build_loop_answer_contract(self, data_reqs: Optional["DataRequirements"] = None) -> str:
+        """Build dynamic answer contract with type constraints (P0-2 + P0-3)."""
+        parts = [
+            "Your final answer inside <ANSWER></ANSWER> must be the minimal concise "
+            "answer span only (a name, date, phrase, or yes/no) \u2014 no explanations, "
+            "no full sentences, no multiple candidates. If evidence is partial, give "
+            "the best supported concise answer instead of refusing.",
+            "",
+            "CRITICAL: Your answer MUST be copied verbatim from the evidence/tool results \u2014 "
+            "use the exact spelling, capitalization, and full form as it appears in the source text. "
+            "Do NOT paraphrase, abbreviate, or reformat entity names.",
+        ]
+        if data_reqs and data_reqs.expected_answer_type:
+            at = data_reqs.expected_answer_type
+            parts.append("")
+            if at == "yes_no":
+                parts.append(
+                    "HARD CONSTRAINT: This is a yes/no question. "
+                    "Your answer MUST be exactly 'yes' or 'no'."
+                )
+            else:
+                parts.append(
+                    f"HARD CONSTRAINT: Expected answer type is '{at}'. "
+                    f"Your answer must be a {at}."
+                )
+        if data_reqs and getattr(data_reqs, "target_slot", None):
+            parts.append(f"Target relation to fill: {data_reqs.target_slot}")
+        return "\n".join(parts)
+
+    _TRIAGE_TOP_K: int = 2
+    _TRIAGE_MAX_CHARS: int = 30_000
+    _TRIAGE_MIN_CHARS: int = 20_000
+    _TRIAGE_MIN_CHUNKS: int = 5
+
+    def _triage_evidence_for_loop(
+        self,
+        query: str,
+        data_reqs: Optional["DataRequirements"],
+        evidence_text: str,
+    ) -> str:
+        """P0-1: Trim warm-start evidence to the most query-relevant chunks.
+
+        A deterministic BM25-like heuristic that scores paragraph-level chunks
+        by term overlap with the query and data_reqs.data_points, keeping only
+        the top-K per data_point to reduce choice-overload for the agent.
+
+        Gated by LENS_EVIDENCE_TRIAGE env var (default true).
+
+        Phase 1B adaptation: also bypasses when evidence is scarce (< 20K chars
+        or fewer than 5 paragraph chunks) to prevent over-trimming in fullwiki
+        scenarios where evidence is already limited.
+        """
+        if not _EVIDENCE_TRIAGE:
+            return evidence_text
+        if not evidence_text or len(evidence_text) < self._TRIAGE_MIN_CHARS:
+            return evidence_text
+        if not data_reqs or not data_reqs.data_points:
+            return evidence_text
+
+        # Tokenize query + data_points into a term set.
+        import re as _re
+        all_terms: set = set()
+        for text in [query] + [str(dp) for dp in data_reqs.data_points]:
+            tokens = _re.findall(r"[a-zA-Z0-9\u4e00-\u9fff]+", text.lower())
+            all_terms.update(t for t in tokens if t not in _STOP_WORDS and len(t) > 1)
+        if not all_terms:
+            return evidence_text
+
+        # Split into paragraph-level chunks.
+        chunks = _re.split(r"\n{2,}|(?=^#{1,3} )", evidence_text, flags=_re.MULTILINE)
+        # Phase 1B: bypass if fewer than _TRIAGE_MIN_CHUNKS paragraphs
+        # (not enough to triage meaningfully; preserves scarce evidence).
+        if len(chunks) < self._TRIAGE_MIN_CHUNKS:
+            return evidence_text
+
+        # Score each chunk by normalized term overlap.
+        scored: list = []
+        for idx, chunk in enumerate(chunks):
+            chunk_lower = chunk.lower()
+            chunk_len = max(len(chunk_lower.split()), 1)
+            hits = sum(1 for t in all_terms if t in chunk_lower)
+            score = hits / (chunk_len ** 0.5) if hits else 0.0
+            scored.append((idx, score, chunk))
+
+        # Per data_point top-K selection.
+        kept_indices: set = set()
+        for dp in data_reqs.data_points:
+            dp_terms = set(
+                t for t in _re.findall(r"[a-zA-Z0-9\u4e00-\u9fff]+", str(dp).lower())
+                if t not in _STOP_WORDS and len(t) > 1
+            )
+            if not dp_terms:
+                continue
+            dp_scores = []
+            for idx, _, chunk in scored:
+                chunk_lower = chunk.lower()
+                dp_hits = sum(1 for t in dp_terms if t in chunk_lower)
+                if dp_hits:
+                    dp_scores.append((dp_hits, idx))
+            dp_scores.sort(reverse=True)
+            for _, idx in dp_scores[: self._TRIAGE_TOP_K]:
+                kept_indices.add(idx)
+
+        # Also keep any chunk above a threshold (top 30% by global score).
+        if scored:
+            scores_only = sorted((s for _, s, _ in scored), reverse=True)
+            threshold = scores_only[max(0, len(scores_only) // 3)] if scores_only else 0.0
+            for idx, score, _ in scored:
+                if score > threshold and score > 0:
+                    kept_indices.add(idx)
+
+        if not kept_indices:
+            return evidence_text
+
+        # Reassemble in original order, cap at max chars.
+        kept_indices_sorted = sorted(kept_indices)
+        result_parts: list = []
+        total_len = 0
+        for idx in kept_indices_sorted:
+            chunk = scored[idx][2]
+            if total_len + len(chunk) > self._TRIAGE_MAX_CHARS:
+                remaining = self._TRIAGE_MAX_CHARS - total_len
+                if remaining > 200:
+                    result_parts.append(chunk[:remaining])
+                break
+            result_parts.append(chunk)
+            total_len += len(chunk)
+
+        return "\n\n".join(result_parts) if result_parts else evidence_text
 
     async def _build_prior_observations(
         self,
@@ -9363,6 +10058,20 @@ class AgenticSearch(BaseSearch):
             ToolRegistry,
         )
 
+        # --- Phase 2: Dynamic loop parameters based on hop_type ---
+        hop_type = data_reqs.hop_type if _SEARCH_DEPTH_ENHANCEMENT else "single"
+        if hop_type == "bridge":
+            effective_max_loops = 8
+            effective_max_files = 5
+        elif hop_type == "comparison":
+            effective_max_loops = 7
+            effective_max_files = 4
+        else:
+            effective_max_loops = max_loops
+            effective_max_files = self._AGENTIC_MAX_FILES
+        # Override max_loops only if hop-aware expansion applies
+        effective_max_loops = max(max_loops, effective_max_loops)
+
         registry = ToolRegistry()
         registry.register(KeywordSearchTool(
             retriever=self.grep_retriever,
@@ -9372,17 +10081,19 @@ class AgenticSearch(BaseSearch):
         registry.register(FileReadTool(max_chars_per_file=30_000))
 
         preloaded = await self._build_prior_observations(
-            query, target_files, match_snippets, context, data_reqs=data_reqs,
+            query, target_files[:effective_max_files], match_snippets, context, data_reqs=data_reqs,
         )
+        # P0-1: Evidence triage — reduce noise for better synthesis
+        preloaded = self._triage_evidence_for_loop(query, data_reqs, preloaded)
         subgoals = [str(dp) for dp in (data_reqs.data_points or []) if str(dp).strip()][:8]
 
         agent = ReActSearchAgent(
             llm=self.llm,
             tool_registry=registry,
-            max_loops=max_loops,
+            max_loops=effective_max_loops,
             max_token_budget=max_token_budget,
             log_callback=self._log_callback,
-            answer_style_instruction=self._LOOP_ANSWER_CONTRACT,
+            answer_style_instruction=self._build_loop_answer_contract(data_reqs),
         )
         answer, loop_ctx = await agent.run(
             query=query,
@@ -9649,14 +10360,73 @@ class AgenticSearch(BaseSearch):
                     query, data_reqs, combined, context,
                 )
                 known_files = {str(fp) for fp in target_files}
+
+                # --- Phase 2: Evidence sufficiency check ---
+                sufficiency = self._check_evidence_sufficiency(
+                    data_reqs, ledger, is_complete,
+                )
+                # Dynamically adjust probe rounds based on hop_type
+                hop_type = data_reqs.hop_type if _SEARCH_DEPTH_ENHANCEMENT else "single"
+                if hop_type == "bridge":
+                    effective_probe_rounds = 3
+                    effective_probe_terms = 5
+                else:
+                    effective_probe_rounds = self._BRIDGE_PROBE_MAX_ROUNDS
+                    effective_probe_terms = self._BRIDGE_PROBE_MAX_TERMS
+                # Sufficiency-based expansion: if coverage is very low, allow
+                # one extra probe round beyond the hop-type default.
+                if sufficiency == "continue_search":
+                    effective_probe_rounds += 1
+
+                # Phase 2: Forced bridge second-hop for bridge questions with
+                # partial evidence. Triggers BEFORE the standard probe loop
+                # to inject second-hop entity files into the evidence pool.
+                if (
+                    _SEARCH_DEPTH_ENHANCEMENT
+                    and hop_type == "bridge"
+                    and sufficiency != "sufficient"
+                ):
+                    bridge_files = await self._force_bridge_second_hop(
+                        query, data_reqs, combined, known_files, paths,
+                        context, match_snippets=match_snippets,
+                    )
+                    for fp in bridge_files:
+                        known_files.add(str(fp))
+                        remaining = self._AGENTIC_EVIDENCE_MAX_CHARS - len(combined)
+                        if remaining <= 0:
+                            break
+                        content = await self._extract_non_paginated_content(
+                            fp, query, max_chars=remaining,
+                        )
+                        if content:
+                            content = self._annotate_matched_lines(
+                                fp, content, match_snippets,
+                            )
+                            evidence_parts.append(content)
+                            pages_extracted[fp] = set()
+                            self._record_deep_evidence_read(
+                                context, fp, content, source="bridge_second_hop",
+                            )
+                    if bridge_files:
+                        combined = "\n\n".join(evidence_parts)
+                        # Re-digest after bridge second-hop injection
+                        is_complete, missing, probe_terms, ledger = await self._digest_evidence(
+                            query, data_reqs, combined, context,
+                        )
+                        sufficiency = self._check_evidence_sufficiency(
+                            data_reqs, ledger, is_complete,
+                        )
+
+                # Standard belief-probe loop with dynamic limits
                 while (
                     not is_complete
                     and missing
-                    and probe_rounds < self._BRIDGE_PROBE_MAX_ROUNDS
+                    and probe_rounds < effective_probe_rounds
                 ):
                     new_files = await self._belief_probe_new_files(
                         query, missing, combined, known_files, paths, context,
-                        terms=probe_terms, match_snippets=match_snippets,
+                        terms=probe_terms[:effective_probe_terms],
+                        match_snippets=match_snippets,
                     )
                     if not new_files:
                         break
@@ -9684,6 +10454,43 @@ class AgenticSearch(BaseSearch):
                     is_complete, missing, probe_terms, ledger = await self._digest_evidence(
                         query, data_reqs, combined, context,
                     )
+                # Phase 2: If sufficiency says "probe_missing" but is_complete
+                # was True (LLM thought it was done), force one more probe.
+                if (
+                    _SEARCH_DEPTH_ENHANCEMENT
+                    and sufficiency == "probe_missing"
+                    and is_complete
+                    and probe_rounds < effective_probe_rounds
+                    and missing
+                ):
+                    extra_files = await self._belief_probe_new_files(
+                        query, missing, combined, known_files, paths, context,
+                        terms=probe_terms[:effective_probe_terms],
+                        match_snippets=match_snippets,
+                    )
+                    if extra_files:
+                        probe_rounds += 1
+                        for fp in extra_files:
+                            known_files.add(str(fp))
+                            remaining = self._AGENTIC_EVIDENCE_MAX_CHARS - len(combined)
+                            if remaining <= 0:
+                                break
+                            content = await self._extract_non_paginated_content(
+                                fp, query, max_chars=remaining,
+                            )
+                            if content:
+                                content = self._annotate_matched_lines(
+                                    fp, content, match_snippets,
+                                )
+                                evidence_parts.append(content)
+                                pages_extracted[fp] = set()
+                                self._record_deep_evidence_read(
+                                    context, fp, content, source="bridge_probe",
+                                )
+                        combined = "\n\n".join(evidence_parts)
+                        is_complete, missing, probe_terms, ledger = await self._digest_evidence(
+                            query, data_reqs, combined, context,
+                        )
                 self._record_context_telemetry(
                     context,
                     bridge_probe_rounds=probe_rounds,
