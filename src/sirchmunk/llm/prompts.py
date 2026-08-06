@@ -814,10 +814,9 @@ DEEP_DATA_REQUIREMENTS = """Given the user's question, identify the specific dat
 6. Identify the time period(s) required.
 7. For comparison or identification questions (e.g., "What is the largest segment?", "Which year had the highest growth?"), note what dimensions need comparison.
 8. Add answer constraints that prevent over-broad or wrong-granularity answers. Examples: "return one minimal entity", "answer yes/no first", "do not return a role if the question asks for a work title".
-9. If the question requires multi-hop reasoning (finding information about entity A to then answer about entity B), decompose into explicit sub-questions that are each independently searchable. For example: "Who directed Sleepless in Seattle?" → "What films did [answer] direct?" Each sub-question should target one hop.
 
 Return ONLY valid JSON on a single line:
-{{"data_points": ["data point 1", "data point 2"], "likely_sources": ["section type 1", "section type 2"], "formula": "explicit formula with variable names, or null", "time_period": "period or null", "expected_answer_type": "year|date|person|location|organization|work_title|yes_no|number|single_entity|list|phrase", "target_slot": "the exact target relation/slot to fill", "answer_constraints": ["constraint 1", "constraint 2"], "sub_questions": ["sub-question for hop 1", "sub-question for hop 2"]}}
+{{"data_points": ["data point 1", "data point 2"], "likely_sources": ["section type 1", "section type 2"], "formula": "explicit formula with variable names, or null", "time_period": "period or null", "expected_answer_type": "year|date|person|location|organization|work_title|yes_no|number|single_entity|list|phrase", "target_slot": "the exact target relation/slot to fill", "answer_constraints": ["constraint 1", "constraint 2"]}}
 """
 
 DEEP_PAGE_SELECT = """You are locating specific data in a document. Select pages to fetch.

@@ -193,11 +193,6 @@ _EVIDENCE_TRIAGE: bool = os.getenv("LENS_EVIDENCE_TRIAGE", "true").lower() == "t
 # (e.g. wiki_00, wiki_01) while preserving existing .txt-based behaviour.
 _FORMAT_AGNOSTIC_RETRIEVAL: bool = os.getenv("LENS_FORMAT_AGNOSTIC_RETRIEVAL", "true").lower() == "true"
 
-# P2-1: Predicate binding verification — after answer generation for bridge
-# questions, verify the answer entity appears in evidence in direct association
-# with the query's predicate. If not, trigger one targeted retry.
-_PREDICATE_VERIFICATION: bool = os.getenv("LENS_PREDICATE_VERIFICATION", "true").lower() == "true"
-
 # Phase 2: Search Depth Enhancement + Hop-Aware Strategy. When enabled,
 # multi-hop queries dynamically receive expanded search budgets (more files,
 # more ReAct loops, more bridge probe rounds/terms), an evidence sufficiency
@@ -281,8 +276,6 @@ class DataRequirements:
     answer_constraints: List[str] = field(default_factory=list)
     hop_type: str = "single"
     """Query hop structure: 'single', 'bridge', or 'comparison'."""
-    sub_questions: List[str] = field(default_factory=list)
-    """Explicit sub-questions for multi-hop decomposition (P1-1)."""
 
 
 @dataclass
@@ -2520,30 +2513,6 @@ class AgenticSearch(BaseSearch):
                     answer = await self._resolve_loop_answer(
                         query, answer, _query_intent, data_reqs, context,
                     )
-            # P2-1: Predicate binding verification for bridge questions.
-            # After answer resolution, check that the answer entity is bound
-            # to the correct predicate in the evidence. One retry on failure.
-            if (
-                _PREDICATE_VERIFICATION
-                and _SEARCH_DEPTH_ENHANCEMENT
-                and data_reqs.hop_type == "bridge"
-                and answer
-                and answer != _NO_RESULTS_MESSAGE
-            ):
-                evidence_text = self._loop_evidence_text(context)
-                verified, reason = self._verify_predicate_binding(
-                    query, answer, evidence_text, data_reqs,
-                )
-                self._record_context_telemetry(
-                    context,
-                    predicate_verified=verified,
-                    predicate_reason=reason,
-                )
-                if not verified and paths:
-                    with self._phase("phase4_9_predicate_retry"):
-                        answer = await self._predicate_retry(
-                            query, answer, data_reqs, context, paths,
-                        )
         else:
             with self._phase("phase4_retrieve"):
                 retrieval = await self._agentic_retrieve(
@@ -8087,190 +8056,6 @@ class AgenticSearch(BaseSearch):
             )
         return answer
 
-    # ------------------------------------------------------------------
-    # P2-1: Predicate Binding Verification
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _verify_predicate_binding(
-        query: str,
-        answer: str,
-        evidence: str,
-        data_reqs: Optional["DataRequirements"],
-    ) -> Tuple[bool, Optional[str]]:
-        """Heuristic predicate-binding check (no LLM call).
-
-        For bridge questions, verifies that the answer entity appears in at
-        least one evidence sentence that also contains a key predicate term
-        from the query. Returns ``(verified, reason)``.
-        """
-        if not answer or not evidence:
-            return True, None
-        import re as _re  # noqa: E402
-        # Extract predicate verbs/keywords from the query. These are the
-        # relation words that bind the answer entity to the question.
-        _PREDICATE_VERBS = {
-            "directed", "starred", "wrote", "founded", "born", "died",
-            "produced", "composed", "created", "designed", "invented",
-            "located", "published", "released", "played", "sang",
-            "married", "won", "received", "attended", "graduated",
-            "employed", "headquartered", "owned", "managed", "led",
-        }
-        query_lower = query.lower()
-        # Find predicate terms present in the query
-        query_predicates = [
-            verb for verb in _PREDICATE_VERBS if verb in query_lower
-        ]
-        if not query_predicates:
-            # Also try gerund/noun forms from the query
-            query_words = set(_re.findall(r"[a-z]+", query_lower))
-            # If no known predicate found, extract candidate predicates from
-            # common question patterns like "What X verb-ed by Y"
-            action_words = query_words - _STOP_WORDS - {
-                "what", "who", "where", "when", "which", "whom",
-            }
-            query_predicates = list(action_words)[:5]
-        if not query_predicates:
-            return True, None  # Cannot verify without predicates
-
-        # Normalize answer for matching
-        answer_clean = answer.strip().strip('"').strip("'").lower()
-        if len(answer_clean) < 2:
-            return True, None
-
-        # Split evidence into sentences and find those containing the answer
-        sentences = _re.split(r"[.!?\n]+", evidence)
-        answer_sentences = [
-            s.lower() for s in sentences if answer_clean in s.lower()
-        ]
-        if not answer_sentences:
-            # Answer not found in evidence at all — likely a problem but
-            # that's caught by other verification layers.
-            return True, None
-
-        # Check if any answer-containing sentence also has a predicate term
-        for sent in answer_sentences:
-            for pred in query_predicates:
-                if pred in sent:
-                    return True, None
-
-        # No sentence binds the answer to a query predicate
-        return False, "predicate_mismatch"
-
-    async def _predicate_retry(
-        self,
-        query: str,
-        answer: str,
-        data_reqs: DataRequirements,
-        context: "SearchContext",
-        paths: List[str],
-    ) -> str:
-        """P2-1: One targeted search + re-synthesis when predicate check fails.
-
-        Searches for the answer entity combined with predicate terms from the
-        query. If new evidence is found, re-synthesizes the answer.
-        Returns the new answer or the original if no improvement.
-        """
-        import re as _re  # noqa: E402
-        # Extract predicate terms from the query for targeted search
-        query_lower = query.lower()
-        query_words = _re.findall(r"[a-zA-Z]+", query)
-        # Find verbs / action words from the query (heuristic: past tense or
-        # known predicates)
-        predicates = [
-            w for w in query_words
-            if (w.lower().endswith("ed") or w.lower().endswith("ing"))
-            and w.lower() not in _STOP_WORDS
-            and len(w) > 3
-        ][:3]
-        if not predicates:
-            # Fallback: use significant words from target_slot
-            slot = (data_reqs.target_slot or "").strip()
-            if slot:
-                predicates = [
-                    w for w in slot.split()
-                    if w.lower() not in _STOP_WORDS and len(w) > 3
-                ][:2]
-        if not predicates:
-            return answer
-
-        # Build search terms: answer entity + predicate
-        answer_clean = answer.strip().strip('"').strip("'")
-        search_terms = [answer_clean] + predicates[:2]
-
-        try:
-            found_files, _ = await self._probe_keyword_matches(
-                search_terms, paths,
-            )
-        except Exception:
-            return answer
-
-        if not found_files:
-            return answer
-
-        # Extract evidence from top hit(s)
-        new_evidence_parts: List[str] = []
-        for fp in found_files[:2]:
-            try:
-                content = await self._extract_non_paginated_content(
-                    fp, query, max_chars=8000,
-                )
-            except Exception:
-                content = None
-            if content:
-                new_evidence_parts.append(content)
-                self._record_evidence_snippet(context, content)
-
-        if not new_evidence_parts:
-            return answer
-
-        # Combine new evidence with existing and re-synthesize
-        existing_evidence = self._loop_evidence_text(context)
-        combined_evidence = existing_evidence + "\n\n" + "\n\n".join(new_evidence_parts)
-
-        # One-shot re-synthesis with predicate emphasis
-        expected = (data_reqs.expected_answer_type or "entity")
-        target_slot = (data_reqs.target_slot or "")
-        prompt = (
-            "The previous answer may not correctly satisfy the question's "
-            "predicate relationship. Re-read the evidence carefully and "
-            "provide the correct answer that satisfies ALL constraints in "
-            "the question.\n\n"
-            f"Question: {query}\n"
-            f"Previous answer (may be wrong): {answer}\n"
-            f"Expected answer type: {expected}\n"
-            + (f"Target relation: {target_slot}\n" if target_slot else "")
-            + f"\nEvidence:\n{combined_evidence[: self._AGENTIC_EVIDENCE_MAX_CHARS]}\n\n"
-            "Reply with exactly one line: **Answer: <span>**"
-        )
-        try:
-            resp = await self.llm.achat(
-                messages=[{"role": "user", "content": prompt}], stream=False,
-            )
-            self.llm_usages.append(resp.usage)
-        except Exception:
-            return answer
-
-        candidate = self._clean_answer_candidate(
-            self._extract_answer_span(resp.content or "")
-        )
-        if (
-            not candidate
-            or self._is_no_answer_value(candidate)
-            or self._is_reserved_answer_span(candidate)
-        ):
-            return answer
-
-        await self._logger.info(
-            f"[Phase 4.9:P2-1] predicate retry produced: {candidate[:80]!r}"
-        )
-        self._record_context_telemetry(
-            context,
-            predicate_retry_used=True,
-            predicate_retry_new_answer=candidate[:200],
-        )
-        return candidate
-
     async def _hygiene_rescue_answer(
         self,
         query: str,
@@ -8969,15 +8754,6 @@ class AgenticSearch(BaseSearch):
             raw = (resp.content or "").strip()
             data = self._extract_json_object(raw)
             if data:
-                hop = self._detect_hop_type(query) if _SEARCH_DEPTH_ENHANCEMENT else "single"
-                # P1-1: Extract explicit sub-questions for hop decomposition
-                raw_sub_qs = data.get("sub_questions", [])
-                sub_questions: List[str] = []
-                if _SEARCH_DEPTH_ENHANCEMENT and isinstance(raw_sub_qs, list):
-                    sub_questions = [
-                        str(sq).strip() for sq in raw_sub_qs
-                        if str(sq).strip() and len(str(sq).strip()) > 5
-                    ][:4]
                 reqs = DataRequirements(
                     data_points=data.get("data_points", [query]),
                     likely_sources=data.get("likely_sources", []),
@@ -8987,8 +8763,7 @@ class AgenticSearch(BaseSearch):
                     expected_answer_type=str(data.get("expected_answer_type") or ""),
                     target_slot=str(data.get("target_slot") or ""),
                     answer_constraints=[str(x) for x in data.get("answer_constraints", [])] if isinstance(data.get("answer_constraints"), list) else [],
-                    hop_type=hop,
-                    sub_questions=sub_questions,
+                    hop_type=self._detect_hop_type(query) if _SEARCH_DEPTH_ENHANCEMENT else "single",
                 )
                 return reqs
         except Exception as exc:
@@ -10340,55 +10115,9 @@ class AgenticSearch(BaseSearch):
         preloaded = await self._build_prior_observations(
             query, target_files[:effective_max_files], match_snippets, context, data_reqs=data_reqs,
         )
-        # P1-1: Sub-question keyword probe — discover additional files by
-        # searching each sub-question's key terms in the corpus. Appends any
-        # new evidence to the warm-start block before triage.
-        if _SEARCH_DEPTH_ENHANCEMENT and data_reqs.sub_questions and paths:
-            import re as _re  # noqa: E402
-            warm_file_set = {str(fp) for fp in target_files[:effective_max_files]}
-            sq_extra_evidence: List[str] = []
-            for sq in data_reqs.sub_questions[:3]:
-                # Extract 2-3 word entities from the sub-question as probe terms
-                sq_terms = [
-                    w for w in _re.findall(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*|[\w]{4,}", sq)
-                    if w.lower() not in _STOP_WORDS
-                ][:3]
-                if not sq_terms:
-                    continue
-                try:
-                    sq_files, _ = await self._probe_keyword_matches(
-                        sq_terms, paths,
-                    )
-                except Exception:
-                    continue
-                for fp in sq_files[:2]:
-                    if str(fp) in warm_file_set:
-                        continue
-                    warm_file_set.add(str(fp))
-                    try:
-                        content = await self._extract_non_paginated_content(
-                            fp, query, max_chars=8000,
-                        )
-                    except Exception:
-                        content = None
-                    if content:
-                        sq_extra_evidence.append(content)
-                        self._record_evidence_snippet(context, content)
-            if sq_extra_evidence:
-                preloaded = preloaded + "\n\n" + "\n\n".join(sq_extra_evidence)
         # P0-1: Evidence triage — reduce noise for better synthesis
         preloaded = self._triage_evidence_for_loop(query, data_reqs, preloaded)
         subgoals = [str(dp) for dp in (data_reqs.data_points or []) if str(dp).strip()][:8]
-
-        # P1-1: Prepend explicit sub-questions to subgoals for bridge questions.
-        # This gives the agent explicit multi-hop search targets ahead of the
-        # flat data-point list, reducing implicit discovery cost.
-        if _SEARCH_DEPTH_ENHANCEMENT and data_reqs.sub_questions:
-            sq_goals = [
-                f"[Hop sub-question] {sq}" for sq in data_reqs.sub_questions
-                if sq not in subgoals
-            ]
-            subgoals = sq_goals + subgoals
 
         agent = ReActSearchAgent(
             llm=self.llm,
