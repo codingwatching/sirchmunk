@@ -169,6 +169,21 @@ _REACT_EXPLORE_FALLBACK: bool = os.getenv("LENS_REACT_EXPLORE_FALLBACK", "true")
 # answer span with the minimal span copied verbatim from the gathered evidence.
 _SPAN_CALIBRATION: bool = os.getenv("LENS_SPAN_CALIBRATION", "true").lower() == "true"
 
+# Loop-mode answer resolution stack (Phase 4.9). The prior-warmed agentic loop
+# bypasses the legacy split-path exit checks (Phases 4.6-4.8), so each layer
+# below restores one exit discipline, re-anchored on the loop's own evidence.
+# D0: reject chain-of-thought narration leaking into the final answer span.
+_LOOP_ANSWER_HYGIENE: bool = os.getenv("LENS_LOOP_ANSWER_HYGIENE", "true").lower() == "true"
+# D1: evidence-anchored answer resolution — re-select the final span verbatim
+# from the evidence, at the granularity the question's target slot asks for.
+_ANSWER_RESOLUTION: bool = os.getenv("LENS_ANSWER_RESOLUTION", "true").lower() == "true"
+# D2: typed comparison verification — deterministic date/number comparison for
+# comparison questions; the draft is overridden only on a clean parse.
+_TYPED_COMPARISON: bool = os.getenv("LENS_TYPED_COMPARISON", "true").lower() == "true"
+# D3: target-slot verification retry — one constrained re-ask when the slot
+# verifier rejects the answer's type.
+_SLOT_VERIFY_RETRY: bool = os.getenv("LENS_SLOT_VERIFY_RETRY", "true").lower() == "true"
+
 # Common English stop-words filtered out during keyword coverage computation.
 _STOP_WORDS: frozenset = frozenset({
     "the", "is", "a", "an", "of", "in", "for", "to", "and", "or",
@@ -2456,6 +2471,14 @@ class AgenticSearch(BaseSearch):
             cluster = None
             self._record_context_telemetry(context, agentic_loop_used=True)
             await self._logger.info("[Phase 4] Prior-warmed agentic loop complete")
+            # Phase 4.9 (loop path): answer resolution stack. Restores the
+            # exit-side answer-evidence alignment the legacy split path ran
+            # as Phases 4.6-4.8, against the evidence the loop actually read.
+            if _query_intent != "computation":
+                with self._phase("phase4_9_answer_resolution"):
+                    answer = await self._resolve_loop_answer(
+                        query, answer, _query_intent, data_reqs, context,
+                    )
         else:
             with self._phase("phase4_retrieve"):
                 retrieval = await self._agentic_retrieve(
@@ -7776,6 +7799,589 @@ class AgenticSearch(BaseSearch):
             flags=re.DOTALL,
         ) if answer.startswith("**Answer:") else f"**Answer: {candidate}**\n\n{answer}"
 
+    # ------------------------------------------------------------------
+    # Phase 4.9: Loop-mode answer resolution stack
+    # ------------------------------------------------------------------
+
+    _REASONING_LEAK_RE: "re.Pattern[str]" = re.compile(
+        r"^(?:let me|let's|looking at|i(?: will|'ll| need| found| am| see|"
+        r" notice| apologize| cannot determine yet)|first,? i|now (?:i|let)|"
+        r"based on (?:the|my) (?:search|evidence so far)|the (?:search|evidence)"
+        r" (?:results?|so far)|searching for|re-?reading|wait[, ]|hmm|"
+        r"okay,? (?:so|let)|to answer this)\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _is_reasoning_leak_answer(cls, text: str) -> bool:
+        """Detect chain-of-thought narration leaking into the answer span.
+
+        The agent loop occasionally emits its thought ("let me reconsider the
+        evidence …") inside the <ANSWER> tags. Such text is never a valid
+        answer span for any corpus, so it is rejected mechanically: either it
+        opens with a narration marker, or it is an overlong multi-clause
+        sentence talking about the search itself.
+        """
+        cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not cleaned:
+            return False
+        if cls._REASONING_LEAK_RE.match(cleaned):
+            return True
+        return len(cleaned.split()) > 24 and bool(
+            re.search(r"\b(?:evidence|search(?:ing|es)?|file|document)\b", cleaned, re.I)
+        )
+
+    @staticmethod
+    def _loop_evidence_text(context: "SearchContext") -> str:
+        """Assemble the evidence text the loop actually read from telemetry.
+
+        ``evidence_snippets`` accumulates every bounded extract recorded by
+        :meth:`_record_deep_evidence_read` (warm-start files) and
+        :meth:`_record_evidence_snippet` (files the loop read itself), so it
+        is the loop-mode equivalent of the split path's ``retrieval.evidence``.
+        """
+        telemetry = getattr(context, "telemetry", None)
+        if not isinstance(telemetry, dict):
+            return ""
+        return "\n\n".join(
+            s for s in (telemetry.get("evidence_snippets") or []) if s
+        )
+
+    @staticmethod
+    def _replace_answer_span(answer: str, new_span: str) -> str:
+        """Swap the leading ``**Answer: …**`` span, preserving the body."""
+        if answer.startswith("**Answer:"):
+            return re.sub(
+                r"^\*\*Answer:\s*.*?\*\*",
+                lambda _m: f"**Answer: {new_span}**",
+                answer,
+                count=1,
+                flags=re.DOTALL,
+            )
+        return f"**Answer: {new_span}**\n\n{answer}"
+
+    async def _resolve_loop_answer(
+        self,
+        query: str,
+        answer: str,
+        intent: str,
+        data_reqs: Optional["DataRequirements"],
+        context: "SearchContext",
+    ) -> str:
+        """Answer resolution stack for the prior-warmed loop path (Phase 4.9).
+
+        The loop owns retrieval and drafting, but its single-shot <ANSWER>
+        span bypasses the exit checks the legacy split path ran as Phases
+        4.6-4.8 (self-correct, forced guess, span calibration). This stack
+        restores that exit discipline against the evidence the loop actually
+        read, in four independently switchable layers:
+
+        - D0 hygiene: reject chain-of-thought narration as the answer and
+          rescue with one best-effort span call;
+        - D3 slot retry: one constrained re-ask when the target-slot verifier
+          rejects the answer's type;
+        - D2 typed comparison: deterministic date/number comparison for
+          comparison questions;
+        - D1 resolution: re-anchor the final span verbatim on the evidence at
+          the granularity the question's target slot asks for.
+
+        Every layer is conservative: a replacement must pass the verbatim
+        gate and type checks, otherwise the previous answer is kept.
+        """
+        self._record_context_telemetry(
+            context,
+            loop_hygiene_leak_detected=False,
+            slot_retry_used=False,
+            typed_comparison_checked=False,
+            answer_resolution_used=False,
+        )
+        if not answer or answer == _NO_RESULTS_MESSAGE:
+            return answer
+        evidence = self._loop_evidence_text(context)
+        if not evidence.strip():
+            return answer
+        if _LOOP_ANSWER_HYGIENE:
+            answer = await self._hygiene_rescue_answer(
+                query, answer, evidence, data_reqs, context,
+            )
+        if _SLOT_VERIFY_RETRY:
+            answer = await self._slot_verify_retry(
+                query, answer, evidence, data_reqs, context,
+            )
+        if _TYPED_COMPARISON and (
+            (intent or "").lower() == "comparison"
+            or self._looks_comparative_question(query)
+        ):
+            answer = await self._verify_comparison_answer(
+                query, answer, evidence, data_reqs, context,
+            )
+        if _ANSWER_RESOLUTION:
+            answer = await self._resolve_answer_span(
+                query, answer, evidence, intent, data_reqs, context,
+            )
+        return answer
+
+    async def _hygiene_rescue_answer(
+        self,
+        query: str,
+        answer: str,
+        evidence: str,
+        data_reqs: Optional["DataRequirements"],
+        context: "SearchContext",
+    ) -> str:
+        """D0: replace a leaked-narration answer with one best-effort span."""
+        short = self._extract_answer_span(answer)
+        if not short or not self._is_reasoning_leak_answer(short):
+            return answer
+        self._record_context_telemetry(
+            context, loop_hygiene_leak_detected=True, loop_hygiene_leak_span=short[:200],
+        )
+        await self._logger.info(f"[Phase 4.9:D0] reasoning leak in answer: {short[:80]!r}")
+        expected = (data_reqs.expected_answer_type if data_reqs else "") or "unconstrained"
+        target_slot = (data_reqs.target_slot if data_reqs else "") or ""
+        prompt = (
+            "Answer the question with the single most plausible minimal span "
+            "supported by the evidence. Do not narrate, do not explain, do not "
+            "refuse.\n\n"
+            f"Question: {query}\n"
+            f"Expected answer type: {expected}\n"
+            + (f"Target relation: {target_slot}\n" if target_slot else "")
+            + f"\nEvidence:\n{evidence[: self._AGENTIC_EVIDENCE_MAX_CHARS]}\n\n"
+            "Reply with exactly one line: **Answer: <span>**"
+        )
+        try:
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+        except Exception as exc:
+            await self._logger.warning(f"[Phase 4.9:D0] rescue failed: {exc}")
+            return answer
+        candidate = self._clean_answer_candidate(
+            self._extract_answer_span(resp.content or "")
+        )
+        if (
+            not candidate
+            or self._is_no_answer_value(candidate)
+            or self._is_reserved_answer_span(candidate)
+            or self._is_reasoning_leak_answer(candidate)
+        ):
+            return answer
+        self._record_context_telemetry(context, loop_hygiene_rescue_used=True)
+        await self._logger.info(f"[Phase 4.9:D0] rescued answer: {candidate[:80]!r}")
+        return self._replace_answer_span(answer, candidate)
+
+    _SLOT_RETRY_REASONS: frozenset = frozenset({
+        "expected_yes_no", "expected_year", "expected_date", "expected_number",
+        "expected_list", "overlong_entity_answer", "reserved_label_answer",
+    })
+
+    async def _slot_verify_retry(
+        self,
+        query: str,
+        answer: str,
+        evidence: str,
+        data_reqs: Optional["DataRequirements"],
+        context: "SearchContext",
+    ) -> str:
+        """D3: one constrained re-ask when the slot verifier rejects the type.
+
+        Turns the previously telemetry-only target-slot verification into an
+        active check: on a type-level rejection (wrong answer shape, not a
+        judgement about content) a single re-ask restates the expected type
+        and the failure, and the replacement is accepted only when it passes
+        the same type check.
+        """
+        record = self._verify_target_slot_answer(query, answer, evidence, data_reqs)
+        self._record_context_telemetry(context, **record)
+        reason = record.get("target_slot_failure_reason") or ""
+        if record.get("target_slot_verified") or reason not in self._SLOT_RETRY_REASONS:
+            return answer
+        short = self._extract_answer_span(answer)
+        expected = ((data_reqs.expected_answer_type if data_reqs else "") or "").lower()
+        target_slot = (data_reqs.target_slot if data_reqs else "") or ""
+        await self._logger.info(
+            f"[Phase 4.9:D3] slot check failed ({reason}); one constrained re-ask"
+        )
+        prompt = (
+            "A draft answer failed a type check. Produce the corrected minimal "
+            "answer span from the evidence.\n\n"
+            f"Question: {query}\n"
+            f"Draft answer: {short}\n"
+            f"Problem: the answer must be of type '{expected or 'minimal span'}' "
+            f"(check failed: {reason}).\n"
+            + (f"Target relation: {target_slot}\n" if target_slot else "")
+            + f"\nEvidence:\n{evidence[: self._AGENTIC_EVIDENCE_MAX_CHARS]}\n\n"
+            "Reply with exactly one line: **Answer: <span>**"
+        )
+        try:
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+        except Exception as exc:
+            await self._logger.warning(f"[Phase 4.9:D3] slot retry failed: {exc}")
+            return answer
+        candidate = self._clean_answer_candidate(
+            self._extract_answer_span(resp.content or "")
+        )
+        if (
+            not candidate
+            or self._is_no_answer_value(candidate)
+            or self._is_reserved_answer_span(candidate)
+            or self._is_reasoning_leak_answer(candidate)
+        ):
+            return answer
+        type_ok, _ = self._answer_matches_expected_type(candidate, expected, query)
+        if not type_ok:
+            return answer
+        if expected not in {"yes_no", ""} and not self._is_verbatim_span(candidate, evidence):
+            return answer
+        self._record_context_telemetry(
+            context, slot_retry_used=True,
+            slot_retry_before=short[:200], slot_retry_after=candidate[:200],
+        )
+        await self._logger.info(
+            f"[Phase 4.9:D3] slot retry: {short[:60]!r} -> {candidate[:60]!r}"
+        )
+        return self._replace_answer_span(answer, candidate)
+
+    @staticmethod
+    def _looks_comparative_question(query: str) -> bool:
+        """Heuristic for comparison questions the intent classifier may miss.
+
+        Requires both a comparative/superlative marker and an explicit
+        alternative (" or "/"both"), so plain lookups with incidental
+        adjectives do not trigger the comparison verifier.
+        """
+        text = f" {query.lower()} "
+        has_marker = bool(re.search(
+            r"\b(?:more|fewer|less|older|younger|earlier|later|first|longer|"
+            r"shorter|taller|higher|larger|smaller|bigger|newer|same|"
+            r"(?:old|young|earli|lat|long|short|tall|high|larg|small|big|new)est)\b",
+            text,
+        ))
+        return has_marker and (" or " in text or " both " in text)
+
+    @staticmethod
+    def _parse_comparable_value(raw: str) -> Optional[Tuple[str, float]]:
+        """Parse a value string into a comparable ``(kind, key)`` pair.
+
+        Dates (full or bare year) map onto a single "date" timeline so that
+        "12 May 1966" and "1970" stay mutually comparable; anything else with
+        a leading numeric quantity becomes a "number". Returns ``None`` when
+        no deterministic ordering key can be extracted.
+        """
+        text = re.sub(r"\s+", " ", str(raw or "")).strip().strip(".,")
+        if not text:
+            return None
+        cleaned = text.replace(",", "")
+        for fmt in ("%d %B %Y", "%B %d %Y", "%d %b %Y", "%b %d %Y", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(cleaned, fmt)
+                return ("date", dt.timestamp())
+            except ValueError:
+                continue
+        year_match = re.fullmatch(r"(1[0-9]{3}|20[0-9]{2})", cleaned)
+        if year_match:
+            return ("date", datetime(int(year_match.group(1)), 7, 1).timestamp())
+        num_match = re.match(r"^[^\d\-]{0,3}(-?\d+(?:\.\d+)?)", cleaned)
+        if num_match:
+            return ("number", float(num_match.group(1)))
+        return None
+
+    async def _verify_comparison_answer(
+        self,
+        query: str,
+        answer: str,
+        evidence: str,
+        data_reqs: Optional["DataRequirements"],
+        context: "SearchContext",
+    ) -> str:
+        """D2: deterministic typed verification for comparison questions.
+
+        Free-form synthesis miscounts and misorders ("neither, both have 1").
+        One structured call extracts the per-entity values; the winner is then
+        computed deterministically from parsed dates/numbers, and the draft is
+        overridden only when every value parses cleanly and the winner is
+        strictly unique — ambiguity always keeps the draft.
+        """
+        short = self._extract_answer_span(answer)
+        if not short or self._is_no_answer_value(short):
+            return answer
+        self._record_context_telemetry(context, typed_comparison_checked=True)
+        prompt = (
+            "Extract the comparison asked by the question and each compared "
+            "entity's value from the evidence.\n\n"
+            f"Question: {query}\n\n"
+            f"Evidence:\n{evidence[: self._AGENTIC_EVIDENCE_MAX_CHARS]}\n\n"
+            "Reply ONLY with JSON:\n"
+            '{"mode": "select" or "boolean",\n'
+            ' "prefer": "largest" or "smallest",\n'
+            ' "relation": "same" or "different",\n'
+            ' "entities": [{"name": "...", "value": "<value from evidence>", '
+            '"comparable": "<value converted to the unit the question compares, '
+            'e.g. a year, a date, a count>"}]}\n'
+            "Notes: mode=select when the question picks one entity (prefer says "
+            "which side of the ordering wins, e.g. 'younger' prefers the "
+            "largest birth date); mode=boolean when the question asks whether "
+            "the values are the same. Copy values from the evidence; leave "
+            "comparable empty if the evidence does not state the value."
+        )
+        try:
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+            data = self._extract_json_object((resp.content or "").strip()) or {}
+        except Exception as exc:
+            await self._logger.warning(f"[Phase 4.9:D2] comparison extract failed: {exc}")
+            return answer
+        entities = [
+            e for e in (data.get("entities") or [])
+            if isinstance(e, dict) and (e.get("name") or "").strip()
+        ]
+        if len(entities) < 2:
+            return answer
+        parsed: List[Tuple[str, Tuple[str, float]]] = []
+        for e in entities:
+            value = self._parse_comparable_value(
+                e.get("comparable") or e.get("value") or ""
+            )
+            if value is None:
+                return answer  # any unparseable value -> keep the draft
+            parsed.append(((e.get("name") or "").strip(), value))
+        kinds = {kind for _, (kind, _) in parsed}
+        if len(kinds) != 1:
+            return answer
+        mode = str(data.get("mode") or "select").lower()
+        candidate = ""
+        if mode == "boolean":
+            keys = {key for _, (_, key) in parsed}
+            equal = len(keys) == 1
+            relation = str(data.get("relation") or "same").lower()
+            candidate = ("Yes" if equal else "No") if relation == "same" else ("No" if equal else "Yes")
+            if self._extract_yes_no(short).lower() == candidate.lower():
+                return answer
+        else:
+            prefer = str(data.get("prefer") or "").lower()
+            if prefer not in {"largest", "smallest"}:
+                return answer
+            ordered = sorted(parsed, key=lambda item: item[1][1], reverse=(prefer == "largest"))
+            if ordered[0][1][1] == ordered[1][1][1]:
+                return answer  # tie -> no strict winner
+            winner = ordered[0][0]
+            winner_norm = re.sub(r"\W+", " ", winner.lower()).strip()
+            short_norm = re.sub(r"\W+", " ", short.lower()).strip()
+            if not winner_norm or winner_norm in short_norm or short_norm in winner_norm:
+                return answer  # draft already names the computed winner
+            if not self._is_verbatim_span(winner, evidence):
+                return answer
+            candidate = winner
+        self._record_context_telemetry(
+            context, typed_comparison_overridden=True,
+            typed_comparison_before=short[:200], typed_comparison_after=candidate[:200],
+        )
+        await self._logger.info(
+            f"[Phase 4.9:D2] comparison override: {short[:60]!r} -> {candidate[:60]!r}"
+        )
+        return self._replace_answer_span(answer, candidate)
+
+    _CANONICAL_FORM_TYPES: frozenset = frozenset({
+        "person", "organization", "work_title", "single_entity",
+    })
+
+    @staticmethod
+    def _shares_content_token(a: str, b: str) -> bool:
+        """Coreference gate: do two spans share at least one content token?
+
+        Guards answer re-anchoring against entity drift ("Hordaland" ->
+        "Bergen"): a legitimate re-naming of the same referent keeps at least
+        one content word ("Bob Iger" / "Robert A. Iger" share "iger"), while
+        a switch to a different entity shares none.
+        """
+        def tokens(s: str) -> Set[str]:
+            return {
+                w for w in re.sub(r"[^a-z0-9 ]", " ", s.lower()).split()
+                if len(w) > 1 and w not in _STOP_WORDS
+            }
+        ta, tb = tokens(a), tokens(b)
+        return bool(ta and tb and ta & tb)
+
+    _ROLE_PREFIX_TOKENS: frozenset = frozenset({
+        "president", "congressman", "congresswoman", "senator", "governor",
+        "general", "major", "colonel", "captain", "admiral", "commander",
+        "sir", "lord", "lady", "dame", "dr", "doctor", "professor", "chief",
+        "ceo", "chairman", "mayor", "judge", "justice", "reverend", "king",
+        "queen", "prince", "princess", "us", "u.s.",
+    })
+
+    @classmethod
+    def _is_role_prefixed_variant(cls, candidate: str, draft: str) -> bool:
+        """Reject candidates that merely prepend a role/honorific to the draft.
+
+        "Charlie Wilson" -> "U.S. Congressman Charlie Wilson" adds a closed-
+        class role prefix, which answer-span conventions treat as part of the
+        description, not the name. Additive prefixes outside this closed
+        class ("1996 NBA Slam Dunk Contest") are legitimate refinements and
+        are not rejected.
+        """
+        cand = re.sub(r"\s+", " ", candidate).strip().lower()
+        drft = re.sub(r"\s+", " ", draft).strip().lower()
+        if not cand.endswith(drft) or cand == drft:
+            return False
+        prefix = cand[: len(cand) - len(drft)]
+        prefix_tokens = [t for t in re.sub(r"[^a-z0-9. ]", " ", prefix).split() if t]
+        return bool(prefix_tokens) and all(
+            t.strip(".") in cls._ROLE_PREFIX_TOKENS or t in cls._ROLE_PREFIX_TOKENS
+            for t in prefix_tokens
+        )
+
+    @staticmethod
+    def _is_suffix_extension(candidate: str, draft: str) -> bool:
+        """Reject candidates that merely append trailing tokens to the draft.
+
+        Observed net-negative pattern: an already-minimal draft gets extended
+        with qualifiers the question does not ask for ("CBS" -> "CBS
+        television", "Royal Air Force" -> "Royal Air Force (RAF)"). Prepends
+        and internal insertions ("1996 NBA Slam Dunk Contest", "dice, cards,
+        and boards") remain allowed — those refine rather than qualify.
+        """
+        norm = lambda s: re.sub(r"[^a-z0-9 ]", " ", s.lower())
+        cand = re.sub(r"\s+", " ", norm(candidate)).strip()
+        drft = re.sub(r"\s+", " ", norm(draft)).strip()
+        return bool(drft) and cand != drft and cand.startswith(drft + " ")
+
+    @staticmethod
+    def _is_micro_edit(candidate: str, draft: str, max_edits: int = 2) -> bool:
+        """Reject near-identical respellings of the draft (edit distance <= 2).
+
+        The verbatim gate forces candidates to occur in the evidence, so when
+        the model proposes a variant differing from the draft by a character
+        or two it is usually anchoring on an evidence-side typo ("Martin
+        Scorsese" -> "Martin Scorcese"). Such micro-edits carry no semantic
+        information and can only lose exact-match credit.
+        """
+        a = re.sub(r"\s+", " ", candidate).strip().lower()
+        b = re.sub(r"\s+", " ", draft).strip().lower()
+        if a == b or abs(len(a) - len(b)) > max_edits:
+            return False
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            cur = [i]
+            for j, cb in enumerate(b, 1):
+                cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+            prev = cur
+        return prev[-1] <= max_edits
+
+    async def _resolve_answer_span(
+        self,
+        query: str,
+        answer: str,
+        evidence: str,
+        intent: str,
+        data_reqs: Optional["DataRequirements"],
+        context: "SearchContext",
+    ) -> str:
+        """D1: evidence-anchored answer resolution (final form selection).
+
+        Synthesis tends to echo the question's surface form of an entity
+        ("bob iger") while the evidence names it differently in the sentence
+        that states the asked relation ("Robert A. Iger"), or to attach
+        granularity the question did not ask for ("panama city panama" for a
+        city slot). One structured call proposes two verbatim candidates —
+        the relational mention (how the evidence sentence stating the asked
+        relation writes the answer) and the minimal slot-granularity span —
+        and a deterministic gate picks the first candidate that is verbatim
+        in the evidence, type-consistent, and coreferent with the draft
+        (shared content token, guarding against entity drift). Candidate
+        order comes from the expected answer type: entity-like types prefer
+        the relational mention, everything else prefers the minimal span.
+        When no candidate passes, the draft is kept unchanged.
+        """
+        if intent and intent.lower() not in self._SPAN_CALIBRATION_INTENTS:
+            return answer
+        expected = ((data_reqs.expected_answer_type if data_reqs else "") or "").lower()
+        if expected == "yes_no" or self._looks_yes_no_question(query):
+            return answer
+        short = self._extract_answer_span(answer)
+        if not short or self._is_no_answer_value(short):
+            return answer
+        target_slot = (data_reqs.target_slot if data_reqs else "") or ""
+        prompt = (
+            "You are selecting the final answer span for a question, anchored "
+            "verbatim on the evidence.\n\n"
+            f"Question: {query}\n"
+            f"Draft answer: {short}\n"
+            + (f"Target slot/relation: {target_slot}\n" if target_slot else "")
+            + f"Expected answer type: {expected or 'unconstrained'}\n\n"
+            f"Evidence:\n{evidence[: self._AGENTIC_EVIDENCE_MAX_CHARS]}\n\n"
+            "Return JSON with two candidate spans, each copied VERBATIM "
+            "(character-for-character) from the evidence:\n"
+            '{"relational": "the span naming the answer exactly as it is '
+            "written in the evidence sentence that states the relation the "
+            'question asks about",\n'
+            ' "minimal": "the shortest span answering exactly what the question '
+            'asks, at exactly the granularity the target slot requests"}\n'
+            "Rules:\n"
+            "- Both spans must refer to the same answer as the draft; never "
+            "switch to a related but different entity.\n"
+            "- Drop qualifiers the question already implies: if it asks for a "
+            "city, do not append the country or state; if it asks for a "
+            "county, do not answer with a town inside it.\n"
+            "- Never prepend roles, ranks or honorifics (President, "
+            "Congressman, General) unless the question asks for the title.\n"
+            "- If the draft answer is already the best verbatim span, return "
+            "it in both fields."
+        )
+        try:
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+            data = self._extract_json_object((resp.content or "").strip()) or {}
+        except Exception as exc:
+            await self._logger.warning(f"[Phase 4.9:D1] resolution failed: {exc}")
+            return answer
+        relational = self._clean_answer_candidate(str(data.get("relational") or ""))
+        minimal = self._clean_answer_candidate(str(data.get("minimal") or ""))
+        if expected in self._CANONICAL_FORM_TYPES:
+            ranked = [("relational", relational), ("minimal", minimal)]
+        else:
+            ranked = [("minimal", minimal), ("relational", relational)]
+        short_norm = re.sub(r"\s+", " ", short).strip().lower()
+        for choice, candidate in ranked:
+            if (
+                not candidate
+                or self._is_no_answer_value(candidate)
+                or self._is_reserved_answer_span(candidate)
+                or self._is_reasoning_leak_answer(candidate)
+                or self._is_overlong_entity_answer(candidate)
+                or not self._is_verbatim_span(candidate, evidence)
+                or not self._shares_content_token(candidate, short)
+                or self._is_role_prefixed_variant(candidate, short)
+                or self._is_suffix_extension(candidate, short)
+                or self._is_micro_edit(candidate, short)
+            ):
+                continue
+            type_ok, _ = self._answer_matches_expected_type(candidate, expected, query)
+            if not type_ok:
+                continue
+            if re.sub(r"\s+", " ", candidate).strip().lower() == short_norm:
+                return answer  # draft already is the selected span
+            self._record_context_telemetry(
+                context, answer_resolution_used=True,
+                answer_resolution_choice=choice,
+                answer_resolution_before=short[:200],
+                answer_resolution_after=candidate[:200],
+            )
+            await self._logger.info(
+                f"[Phase 4.9:D1] span resolved ({choice}): "
+                f"{short[:60]!r} -> {candidate[:60]!r}"
+            )
+            return self._replace_answer_span(answer, candidate)
+        return answer
+
     async def _forced_guess_answer(
         self,
         query: str,
@@ -7908,9 +8514,11 @@ class AgenticSearch(BaseSearch):
         if expected == "yes_no" or cls._looks_yes_no_question(query):
             return (bool(cls._extract_yes_no(text)), "expected_yes_no")
         if expected == "year":
-            return (bool(re.fullmatch(r"(?:18|19|20)\d{2}", lower)), "expected_year")
+            # Accept any plausible historical year (1000-2099): gold years
+            # before 1800 are common ("founded in 1755").
+            return (bool(re.fullmatch(r"(?:1[0-9]|20)\d{2}", lower)), "expected_year")
         if expected == "date":
-            has_date = bool(re.search(r"\b(?:18|19|20)\d{2}\b", lower) or re.search(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", lower))
+            has_date = bool(re.search(r"\b(?:1[0-9]|20)\d{2}\b", lower) or re.search(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", lower))
             return (has_date, "expected_date")
         if expected == "number":
             return (bool(re.search(r"\d", lower)), "expected_number")
@@ -8821,12 +9429,15 @@ class AgenticSearch(BaseSearch):
         words = text.split()
         if len(words) < 2:
             return answer
+        # Repetition must occur at least 3 times before collapsing: doubled
+        # forms are legitimate names ("Duran Duran", "Sirhan Sirhan", "New
+        # York New York"), while decode stutter repeats further.
         # All identical words -> one copy (case-insensitive comparison).
-        if len({w.lower() for w in words}) == 1:
+        if len(words) >= 3 and len({w.lower() for w in words}) == 1:
             return words[0]
-        # Whole span is an exact k-fold repetition of a base phrase.
+        # Whole span is an exact k-fold (k >= 3) repetition of a base phrase.
         n = len(words)
-        for unit in range(1, n // 2 + 1):
+        for unit in range(1, n // 3 + 1):
             if n % unit:
                 continue
             base = [w.lower() for w in words[:unit]]
@@ -8835,6 +9446,13 @@ class AgenticSearch(BaseSearch):
                 for i in range(0, n, unit)
             ):
                 return " ".join(words[:unit])
+        # Leading stutter: the same word emitted 3+ times consecutively before
+        # the rest of the span ("egremont egremont egremont north ...").
+        stutter = 1
+        while stutter < n and words[stutter].lower() == words[0].lower():
+            stutter += 1
+        if stutter >= 3:
+            return " ".join(words[:1] + words[stutter:])
         return answer
 
     @staticmethod
