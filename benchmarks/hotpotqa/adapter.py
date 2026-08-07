@@ -34,6 +34,7 @@ for _p in (str(_SRC),):
 
 sys.path.insert(0, str(_BENCHMARKS_ROOT))
 from framework.adapter import BenchmarkAdapter  # noqa: E402
+from framework.answer_policy import policy_from_env  # noqa: E402
 from framework.protocol import default_protocol  # noqa: E402
 from framework.schema import BenchmarkSample    # noqa: E402
 from evaluation.sampling_protocol import extract_sample_ids  # noqa: E402
@@ -319,6 +320,10 @@ class HotpotQAAdapter(BenchmarkAdapter):
                 work_path=self.get_work_path(),  # 使用隔离后的绝对路径
                 reuse_knowledge=self._get_bool("HOTPOT_REUSE_KNOWLEDGE", False),
                 verbose=False,
+                # Evaluation scores a refusal like a wrong answer, so the
+                # reporting decision is supplied here instead of being read
+                # from the environment inside the retrieval pipeline.
+                answer_policy=policy_from_env(),
             )
         return self._searcher
 

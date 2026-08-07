@@ -17,6 +17,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from baselines.base_adapter import BaselineAdapter, BaselinePrediction, BaselineSetupResult
+from framework.answer_policy import policy_from_env
 from .lens_profile import LensSearchProfile
 
 
@@ -183,6 +184,9 @@ class LensAblationAdapter(BaselineAdapter):
             work_path=str(work_path),
             reuse_knowledge=self._profile.enable_knowledge_reuse,
             verbose=False,
+            # Ablation arms are scored like the main experiment, so they share
+            # the evaluation's no-abstention reporting decision.
+            answer_policy=policy_from_env(),
         )
         _apply_profile_patches(searcher, self._profile)
         return searcher

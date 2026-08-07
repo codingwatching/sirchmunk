@@ -248,7 +248,19 @@ def f1_score(prediction: str, gold_answer: str) -> float:
 
 
 def extract_short_answer(text: str) -> str:
-    """Extract a concise answer span from verbose model output when possible."""
+    """Extract a concise answer span from verbose model output when possible.
+
+    This is the *scoring* caliber: it decides which characters of a prediction
+    EM and F1 are computed over, so changing it moves published metrics for
+    every system, including already-recorded runs.
+
+    It is intentionally not shared with the pipeline-side extractor in
+    ``sirchmunk.search.AgenticSearch._extract_answer_span``, which shapes the
+    product's returned answer instead. The two agree on the overwhelming
+    majority of responses but diverge on a few shapes, so unifying them is a
+    metric-affecting change that requires a re-scored comparison rather than a
+    refactor.
+    """
     if not text:
         return ""
     s = str(text).strip()

@@ -30,6 +30,7 @@ from evaluation.sampling_protocol import (  # noqa: E402
     compute_sample_id_checksum,
     create_sampling_protocol,
 )
+from framework.answer_policy import policy_from_env  # noqa: E402
 from framework.registry import load_benchmark_adapter, supported_benchmarks  # noqa: E402
 from framework.dynamic_stage_runner import (  # noqa: E402
     StageExecutionRecord,
@@ -463,6 +464,9 @@ class _StageAdapter:
             work_path=self.get_work_path(),
             reuse_knowledge=str(self.get_run_config().get("reuse_knowledge", False)).lower() in {"1", "true", "yes"},
             verbose=False,
+            # Dynamic arms are scored like the main experiment, so they share
+            # the evaluation's no-abstention reporting decision.
+            answer_policy=policy_from_env(),
         )
 
 

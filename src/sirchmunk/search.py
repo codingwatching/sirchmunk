@@ -15,6 +15,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
+from sirchmunk.answer_policy import (
+    DEFAULT_ANSWER_POLICY,
+    AnswerPolicy,
+)
 from sirchmunk.base import BaseSearch
 from sirchmunk.learnings.knowledge_base import KnowledgeBase
 from sirchmunk.utils.document_extractor import DocumentExtractor
@@ -378,9 +382,15 @@ class AgenticSearch(BaseSearch):
         log_callback: LogCallback = None,
         reuse_knowledge: bool = True,
         enable_knowledge_evolution: bool = False,
+        answer_policy: Optional[AnswerPolicy] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
+
+        # How weak answers are reported is the caller's decision, not the
+        # retrieval chain's: the default keeps the honest-refusal contract,
+        # while an evaluation harness supplies a policy of its own.
+        self.answer_policy: AnswerPolicy = answer_policy or DEFAULT_ANSWER_POLICY
 
         # Normalise and store default search paths
         if paths is not None:
@@ -3356,8 +3366,8 @@ class AgenticSearch(BaseSearch):
                     {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
                     for p in _tree_probed_files[:top_k_files]
                 ]
-                print(f"SEARCH_WIKI_DEBUG [D7] _tree_probed_files={_tree_probed_files}", flush=True)
-                print(f"SEARCH_WIKI_DEBUG [D8] best_files={[bf['path'] for bf in best_files]}", flush=True)
+                _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D7] _tree_probed_files={_tree_probed_files}")
+                _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D8] best_files={[bf['path'] for bf in best_files]}")
                 await self._logger.info(
                     f"[FAST:PureTree] Using {len(best_files)} tree-probed files: "
                     f"{[Path(p).name for p in _tree_probed_files[:top_k_files]]}"
@@ -3499,10 +3509,10 @@ class AgenticSearch(BaseSearch):
             tree_nav_done: Set[str] = set()
             tree_nav_target = best_files[0]["path"]
 
-            print(f"SEARCH_WIKI_DEBUG [D9] tree_nav_target={tree_nav_target}", flush=True)
-            print(f"SEARCH_WIKI_DEBUG [D10] tree_nav_match={tree_nav_target in (artifacts.tree_available_paths if artifacts else set())}", flush=True)
+            _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D9] tree_nav_target={tree_nav_target}")
+            _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D10] tree_nav_match={tree_nav_target in (artifacts.tree_available_paths if artifacts else set())}")
             if artifacts and tree_nav_target not in artifacts.tree_available_paths:
-                print(f"SEARCH_WIKI_DEBUG [D11] MISMATCH! tree_available_paths={artifacts.tree_available_paths}", flush=True)
+                _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D11] MISMATCH! tree_available_paths={artifacts.tree_available_paths}")
 
             if artifacts and tree_nav_target in artifacts.tree_available_paths:
                 tree_task = self._navigate_tree_for_evidence(
@@ -3526,7 +3536,7 @@ class AgenticSearch(BaseSearch):
                     ext = Path(fp).suffix.lower()
                     ev = None
 
-                    print(f"SEARCH_WIKI_DEBUG [D12] _rga_evidence: fp={fp}", flush=True)
+                    _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D12] _rga_evidence: fp={fp}")
 
                     # 0. Excel digest priority (pre-compiled evidence)
                     if artifacts and artifacts.manifest_map:
@@ -3567,7 +3577,7 @@ class AgenticSearch(BaseSearch):
                             except Exception:
                                 pass
 
-                        print(f"SEARCH_WIKI_DEBUG [D13] table_digest: manifest_lookup={'found' if artifacts.manifest_map and artifacts.manifest_map.get(fp) else 'miss'}, has_table_digest={getattr(artifacts.manifest_map.get(fp), 'has_table_digest', False) if artifacts.manifest_map else 'N/A'}, hash_fallback={'tried' if not _all_tables else 'skipped'}, tables_count={len(_all_tables) if _all_tables else 0}", flush=True)
+                        _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D13] table_digest: manifest_lookup={'found' if artifacts.manifest_map and artifacts.manifest_map.get(fp) else 'miss'}, has_table_digest={getattr(artifacts.manifest_map.get(fp), 'has_table_digest', False) if artifacts.manifest_map else 'N/A'}, hash_fallback={'tried' if not _all_tables else 'skipped'}, tables_count={len(_all_tables) if _all_tables else 0}")
 
                         if _all_tables:
                             _td_budget = (
@@ -3586,7 +3596,7 @@ class AgenticSearch(BaseSearch):
                     # 1. Tree-guided sampling for tree-indexed files
                     # (skipped when a parallel tree_task already covers this file)
                     _tree_cond = artifacts and fp in artifacts.tree_available_paths and fp not in tree_nav_done
-                    print(f"SEARCH_WIKI_DEBUG [D14] tree_sample: cond={_tree_cond}, in_tree_paths={fp in (artifacts.tree_available_paths if artifacts else set())}, in_nav_done={fp in tree_nav_done}", flush=True)
+                    _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D14] tree_sample: cond={_tree_cond}, in_tree_paths={fp in (artifacts.tree_available_paths if artifacts else set())}, in_nav_done={fp in tree_nav_done}")
                     if (
                         artifacts
                         and fp in artifacts.tree_available_paths
@@ -3638,7 +3648,7 @@ class AgenticSearch(BaseSearch):
                         elif "Pre-compiled" in ev: _ev_source = "excel_digest"
                         elif "TreeSample" in str(ev)[:50] or "TreeNav" in str(ev)[:50]: _ev_source = "tree"
                         else: _ev_source = "rga_or_other"
-                    print(f"SEARCH_WIKI_DEBUG [D15] ev_source={_ev_source}, ev_len={len(ev) if ev else 0}", flush=True)
+                    _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D15] ev_source={_ev_source}, ev_len={len(ev) if ev else 0}")
                 return "\n\n---\n\n".join(parts)
 
             # Launch tree navigation alongside rga evidence collection.
@@ -3654,9 +3664,9 @@ class AgenticSearch(BaseSearch):
                 evidence_parts_final.append(rga_ev)
             evidence = "\n\n---\n\n".join(evidence_parts_final)
 
-            print(f"SEARCH_WIKI_DEBUG [D16] tree_ev: {'yes' if tree_ev else 'no'}, len={len(tree_ev) if tree_ev else 0}", flush=True)
-            print(f"SEARCH_WIKI_DEBUG [D17] rga_ev: {'yes' if rga_ev else 'no'}, len={len(rga_ev) if rga_ev else 0}", flush=True)
-            print(f"SEARCH_WIKI_DEBUG [D18] final_evidence_len={len(evidence)}", flush=True)
+            _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D16] tree_ev: {'yes' if tree_ev else 'no'}, len={len(tree_ev) if tree_ev else 0}")
+            _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D17] rga_ev: {'yes' if rga_ev else 'no'}, len={len(rga_ev) if rga_ev else 0}")
+            _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D18] final_evidence_len={len(evidence)}")
 
             if not evidence or len(evidence.strip()) < 20:
                 if llm_fallback:
@@ -4466,9 +4476,9 @@ class AgenticSearch(BaseSearch):
             tree_paths = {p for p in tree_paths if scope.contains(p)}
             manifest_map = {p: e for p, e in manifest_map.items() if scope.contains(p)}
 
-        print(f"SEARCH_WIKI_DEBUG [D1] manifest_map: {len(manifest_map)} entries, keys={list(manifest_map.keys())[:3]}", flush=True)
-        print(f"SEARCH_WIKI_DEBUG [D2] tree_available_paths: {tree_paths}", flush=True)
-        print(f"SEARCH_WIKI_DEBUG [D3] manifest_fallback_executed: {manifest_map and not tree_paths}", flush=True)
+        _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D1] manifest_map: {len(manifest_map)} entries, keys={list(manifest_map.keys())[:3]}")
+        _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D2] tree_available_paths: {tree_paths}")
+        _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D3] manifest_fallback_executed: {manifest_map and not tree_paths}")
         return CompileArtifacts(
             catalog=catalog,
             catalog_map=catalog_map,
@@ -4724,7 +4734,7 @@ class AgenticSearch(BaseSearch):
         if max_chars <= 0:
             max_chars = self._FAST_MAX_EVIDENCE_CHARS
 
-        print(f"SEARCH_WIKI_DEBUG [S1] _tree_guided_sample: file_path={file_path}", flush=True)
+        _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [S1] _tree_guided_sample: file_path={file_path}")
 
         # --- Guard: tree availability ---
         if artifacts is not None:
@@ -4761,7 +4771,7 @@ class AgenticSearch(BaseSearch):
         # --- Classify leaves by extraction method ---
         trimmed = leaves[: self._TREE_SAMPLE_MAX_SECTIONS]
         page_leaves, char_leaves, table_and_summary = self._classify_leaves(trimmed)
-        print(f"SEARCH_WIKI_DEBUG [S2] classify_leaves: page={len(page_leaves)}, char={len(char_leaves)}, table_summary={len(table_and_summary)}", flush=True)
+        _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [S2] classify_leaves: page={len(page_leaves)}, char={len(char_leaves)}, table_summary={len(table_and_summary)}")
 
         # Collect (leaf, segment) pairs preserving original leaf order
         leaf_segments: List[tuple] = []  # (leaf, segment_text)
@@ -4893,7 +4903,7 @@ class AgenticSearch(BaseSearch):
             return None
 
         evidence = "\n\n".join(parts)
-        print(f"SEARCH_WIKI_DEBUG [S3] _tree_guided_sample result: len={len(evidence) if evidence else 0}", flush=True)
+        _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [S3] _tree_guided_sample result: len={len(evidence) if evidence else 0}")
         await self._logger.info(
             f"[TreeSample] {fname}: "
             f"{len(parts)} sections, {total_chars} chars "
@@ -5559,7 +5569,7 @@ class AgenticSearch(BaseSearch):
           3. leaf.summary – last resort
         """
         indexer = self._get_tree_indexer()
-        print(f"SEARCH_WIKI_DEBUG [N1] _navigate_tree_for_evidence: file_path={file_path}", flush=True)
+        _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [N1] _navigate_tree_for_evidence: file_path={file_path}")
         if indexer is None:
             return None
         tree = indexer.load_tree(file_path)
@@ -5571,7 +5581,7 @@ class AgenticSearch(BaseSearch):
         except Exception:
             return None
 
-        print(f"SEARCH_WIKI_DEBUG [N2] navigate_result: {len(leaves) if leaves else 0} leaves", flush=True)
+        _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [N2] navigate_result: {len(leaves) if leaves else 0} leaves")
 
         if not leaves:
             return None
@@ -5581,7 +5591,7 @@ class AgenticSearch(BaseSearch):
 
         # ── Phase 1: classify leaves by available extraction method ──
         page_leaves, char_leaves, summary_only = self._classify_leaves(leaves)
-        print(f"SEARCH_WIKI_DEBUG [N3] classify_leaves: page={len(page_leaves)}, char={len(char_leaves)}, summary={len(summary_only)}", flush=True)
+        _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [N3] classify_leaves: page={len(page_leaves)}, char={len(char_leaves)}, summary={len(summary_only)}")
 
         for leaf in summary_only:
             self._append_evidence_part(
@@ -5631,9 +5641,9 @@ class AgenticSearch(BaseSearch):
                         self._append_evidence_part(
                             parts, fname, leaf, leaf.summary,
                         )
-                print(f"SEARCH_WIKI_DEBUG [N4] page_extraction: page_leaves_ok=False", flush=True)
+                _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [N4] page_extraction: page_leaves_ok=False")
             else:
-                print(f"SEARCH_WIKI_DEBUG [N4] page_extraction: page_leaves_ok=True", flush=True)
+                _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [N4] page_extraction: page_leaves_ok=True")
 
         # ── Phase 3: char_range extraction (compile-consistent content) ──
         if char_leaves:
@@ -5763,10 +5773,9 @@ class AgenticSearch(BaseSearch):
                                     if seg.strip():
                                         self._append_evidence_part(parts, fname, cl, seg)
                         leaves = list(leaves) + comp_new
-                        print(
+                        _loguru_logger.debug(
                             f"SEARCH_WIKI_DEBUG [N3.2] complement_nav: "
                             f"missing={_missing}, new_leaves={len(comp_new)}",
-                            flush=True,
                         )
                 except Exception:
                     pass
@@ -5819,7 +5828,7 @@ class AgenticSearch(BaseSearch):
                                     self._append_evidence_part(parts, fname, rl, seg)
 
                     leaves = retry_leaves
-                    print(f"SEARCH_WIKI_DEBUG [N3.1] retry_nav: {len(retry_leaves)} leaves", flush=True)
+                    _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [N3.1] retry_nav: {len(retry_leaves)} leaves")
             except Exception:
                 pass
 
@@ -5877,7 +5886,7 @@ class AgenticSearch(BaseSearch):
             _current_ev_len < self._DEEP_CROSS_SECTION_MIN_EVIDENCE
             or _quant_intent >= self._QUANTITATIVE_INTENT_THRESHOLD
         )
-        print(
+        _loguru_logger.debug(
             f"SEARCH_WIKI_DEBUG [N5.5] phase5_5_decision: "
             f"intent={_quant_intent:.3f}, "
             f"source={'piggyback' if self._multi_source_intent is not None else 'heuristic'}, "
@@ -5885,7 +5894,6 @@ class AgenticSearch(BaseSearch):
             f"current_ev_len={_current_ev_len}, "
             f"min_evidence={self._DEEP_CROSS_SECTION_MIN_EVIDENCE}, "
             f"triggered={_should_cross_section}",
-            flush=True,
         )
         if _all_tables and leaves and _should_cross_section:
             _leaf_page_set: Set[int] = set()
@@ -5940,13 +5948,12 @@ class AgenticSearch(BaseSearch):
                     parts.append(
                         f"[{fname} - Cross-section Tables]\n{_cross_ev}"
                     )
-                    print(
+                    _loguru_logger.debug(
                         f"SEARCH_WIKI_DEBUG [N5.3] cross_section_tables: "
                         f"uncovered_tables={len(_cross_tables)}, "
                         f"ev_len={len(_cross_ev)}, "
                         f"quantitative_intent={_quant_intent:.2f}, "
                         f"budget={_cross_budget}",
-                        flush=True,
                     )
 
         # Plan 3: If evidence is still too thin, add full table digest as standalone
@@ -5967,9 +5974,9 @@ class AgenticSearch(BaseSearch):
                     f"[{fname} - Standalone Table Evidence]\n{standalone_table_ev}"
                 )
                 evidence = "\n\n".join(parts)
-                print(f"SEARCH_WIKI_DEBUG [N5.1] standalone_table_fallback: len={len(standalone_table_ev)}", flush=True)
+                _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [N5.1] standalone_table_fallback: len={len(standalone_table_ev)}")
 
-        print(f"SEARCH_WIKI_DEBUG [N5] table_supplement: tables_loaded={len(_all_tables) if _all_tables else 0}", flush=True)
+        _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [N5] table_supplement: tables_loaded={len(_all_tables) if _all_tables else 0}")
 
         # ── Phase 6: Referenced-page gap-fill ──
         # Scan evidence for page cross-references (e.g. TOC entries
@@ -6000,10 +6007,9 @@ class AgenticSearch(BaseSearch):
                                 f"\n{pc.content}"
                             )
                     evidence = "\n\n".join(parts)
-                    print(
+                    _loguru_logger.debug(
                         f"SEARCH_WIKI_DEBUG [N5.2] ref_page_gap_fill: "
                         f"pages={_gap_pages}",
-                        flush=True,
                     )
                 except Exception:
                     pass
@@ -6040,7 +6046,7 @@ class AgenticSearch(BaseSearch):
                     parts.append(f"[{fname} \u2192 keyword hits]\n{rga_ctx}")
                     evidence = "\n\n".join(parts)
 
-        print(f"SEARCH_WIKI_DEBUG [N6] _navigate_tree_for_evidence result: len={len(evidence) if evidence else 0}", flush=True)
+        _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [N6] _navigate_tree_for_evidence result: len={len(evidence) if evidence else 0}")
         await self._logger.info(
             f"[FAST:TreeNav] Extracted {len(parts)} sections, "
             f"{len(evidence)} chars from {fname}"
@@ -7166,7 +7172,7 @@ class AgenticSearch(BaseSearch):
         Returns file paths of selected documents, or empty list when trees
         are unavailable or cover too few files to justify an LLM call.
         """
-        print(f"SEARCH_WIKI_DEBUG [D4] _probe_tree_for_fast: tree_available_paths={len(artifacts.tree_available_paths) if artifacts else 0}", flush=True)
+        _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D4] _probe_tree_for_fast: tree_available_paths={len(artifacts.tree_available_paths) if artifacts else 0}")
         if not artifacts or not artifacts.tree_available_paths:
             return []
 
@@ -7176,13 +7182,13 @@ class AgenticSearch(BaseSearch):
             if artifacts and artifacts.tree_available_paths:
                 scoped = artifacts.tree_available_paths
                 trees = [t for t in trees if t.file_path in scoped]
-            print(f"SEARCH_WIKI_DEBUG [D5] loaded_trees: {len(trees)} trees, paths={[t.file_path for t in trees][:3]}", flush=True)
+            _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D5] loaded_trees: {len(trees)} trees, paths={[t.file_path for t in trees][:3]}")
             if not trees:
                 return []
             result = await self._llm_select_from_trees(
                 query, trees, max_select=self._FAST_TREE_PROBE_MAX_FILES,
             )
-            print(f"SEARCH_WIKI_DEBUG [D6] llm_select_result: {result}", flush=True)
+            _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D6] llm_select_result: {result}")
             if result:
                 await self._logger.info(
                     f"[FAST:TreeProbe] Selected {len(result)} files "
@@ -7579,6 +7585,20 @@ class AgenticSearch(BaseSearch):
 
     @classmethod
     def _extract_answer_span(cls, answer: str) -> str:
+        """Pull the concise answer span out of a synthesized response.
+
+        This shapes what the *pipeline returns to its caller*, and understands
+        the pipeline's own markers (``<PRECISE_ANSWER>``, ``Extracted value``).
+
+        It deliberately stays separate from the evaluation-side extractor in
+        ``benchmarks/hotpotqa/judge.py::extract_short_answer``, which defines a
+        scoring caliber rather than an output contract: the two disagree on a
+        small number of response shapes (for example a bold-prefixed name that
+        is followed by its longer titled form, where this method keeps the short
+        name and the scorer keeps the full line). Merging them would silently
+        move published metrics, so any unification must be justified by a
+        re-scored comparison rather than by their surface similarity.
+        """
         no_answer_candidate = ""
         precise = cls._extract_marked_answer_value(answer, "PRECISE_ANSWER", xml_tag=True)
         if precise:
@@ -7722,7 +7742,31 @@ class AgenticSearch(BaseSearch):
 
     @staticmethod
     def _refusal_fallback_enabled() -> bool:
+        """Deprecated shim: the decision now lives on the answer policy.
+
+        Retained so that the legacy environment flag keeps working for callers
+        that have not yet supplied an ``answer_policy``.
+        """
         return os.environ.get("SIRCHMUNK_REFUSAL_FALLBACK", "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _prefers_span_over_refusal(self) -> bool:
+        """Whether a weak-but-supported span should replace a refusal.
+
+        Delegates to the caller-supplied answer policy. The legacy environment
+        flag is honoured as a fallback so existing evaluation configs keep
+        their behaviour until they pass a policy explicitly.
+        """
+        policy = getattr(self, "answer_policy", None)
+        if policy is not None and policy.prefers_span_over_refusal():
+            return True
+        return self._refusal_fallback_enabled()
+
+    def _allows_forced_guess(self) -> bool:
+        """Whether one extra best-effort synthesis may run on a refusal."""
+        policy = getattr(self, "answer_policy", None)
+        if policy is not None and policy.allows_forced_guess():
+            return True
+        return self._refusal_fallback_enabled()
 
     _SPAN_CALIBRATION_INTENTS: frozenset = frozenset({"lookup", "factoid", "comparison", "extraction"})
 
@@ -8533,7 +8577,7 @@ class AgenticSearch(BaseSearch):
         telemetry and never persisted as knowledge, so a guessed answer cannot
         contaminate the knowledge store or later warm-start priors.
         """
-        if not self._refusal_fallback_enabled():
+        if not self._allows_forced_guess():
             return ""
         evidence = (retrieval.evidence or "").strip() if retrieval is not None else ""
         if not evidence:
@@ -8570,30 +8614,29 @@ class AgenticSearch(BaseSearch):
         await self._logger.info(f"[Phase 4.6] forced-guess answer: {candidate[:60]}")
         return f"**Answer: {candidate}**"
 
-    @classmethod
     def _refusal_fallback_answer(
-        cls,
+        self,
         answer: str,
         evidence: str,
         context: Optional["SearchContext"] = None,
     ) -> Optional[str]:
-        """Benchmark-gated best-candidate fallback for refusal outcomes.
+        """Report a supported span instead of refusing, when policy allows it.
 
-        Enabled only when ``SIRCHMUNK_REFUSAL_FALLBACK`` is truthy (default
-        off, so product behavior is unchanged). Benchmarks with no abstention
-        reward treat every refusal as a wrong answer; when synthesis already
-        produced a valid short answer span backed by non-empty evidence, the
-        span is returned instead of refusing. The fallback is recorded in
-        telemetry and the caller must not persist such answers as knowledge.
+        Off by default, so product behavior keeps the honest "no results"
+        contract. A consumer whose scoring gives no credit for abstention (see
+        ``AnswerPolicy``) opts in; when synthesis already produced a valid short
+        answer span backed by non-empty evidence, that span is returned instead
+        of the refusal. The substitution is recorded in telemetry and the caller
+        must not persist such answers as knowledge.
         """
-        if not cls._refusal_fallback_enabled():
+        if not self._prefers_span_over_refusal():
             return None
         if not (evidence or "").strip() or not answer or answer == _NO_RESULTS_MESSAGE:
             return None
-        short = cls._extract_answer_span(answer)
-        if not short or cls._is_no_answer_value(short) or cls._is_reserved_answer_span(short):
+        short = self._extract_answer_span(answer)
+        if not short or self._is_no_answer_value(short) or self._is_reserved_answer_span(short):
             return None
-        cls._record_context_telemetry(context, fallback_best_candidate=True)
+        self._record_context_telemetry(context, fallback_best_candidate=True)
         return answer
 
     @classmethod
@@ -9083,8 +9126,8 @@ class AgenticSearch(BaseSearch):
                 except Exception:
                     pass  # Fall through to generic strategies
 
-        # Strategy 1: direct/window read for text-family files.  HotpotQA raw
-        # wiki shards are extensionless plain-text files (e.g. ``wiki_55``),
+        # Strategy 1: direct/window read for text-family files. Raw corpora are
+        # often shipped as extensionless plain-text shards (e.g. ``wiki_55``),
         # so relying on extension-based MIME detection sends them to kreuzberg
         # and causes "Could not determine MIME type" failures.
         if self._is_plain_text_candidate(path, ext):
@@ -9113,7 +9156,7 @@ class AgenticSearch(BaseSearch):
 
         Besides known text extensions, this accepts extensionless files when a
         small byte probe has no NUL bytes and decodes cleanly enough as UTF-8.
-        This covers HotpotQA Wikipedia shards while avoiding binary formats that
+        This covers extensionless text shards while avoiding binary formats that
         should remain handled by kreuzberg.
         """
         if ext in cls._FAST_TEXT_EXTENSIONS:
@@ -9207,6 +9250,18 @@ class AgenticSearch(BaseSearch):
 
     # Pattern matching generic/meaningless shard filenames where filename
     # tokens carry no semantic signal about the article content inside.
+    _GENERIC_SHARD_TOKENS: Tuple[str, ...] = (
+        "wiki", "shard", "chunk", "part", "split",
+        "segment", "data", "doc", "file", "corpus",
+    )
+    """Stems that carry no topical meaning, only a collection position.
+
+    Raw corpora are frequently delivered as positionally-named shards
+    (``shard_07``, ``part-3``, ``corpus_12``). Such names give filename-based
+    scoring nothing to work with, so they are detected and routed to
+    content-based scoring instead. Override on a subclass to extend the list
+    for a collection with its own naming convention.
+    """
     _GENERIC_SHARD_RE = re.compile(
         r"^(wiki|shard|chunk|part|split|segment|data|doc|file|corpus)"
         r"[_\-]?\d*$",
@@ -9219,7 +9274,7 @@ class AgenticSearch(BaseSearch):
         Uses two heuristics (either sufficient):
         1. Filename matches a generic shard pattern (no meaningful words).
         2. First bytes of the file start with a JSON object containing an
-           ``"id"`` key — the standard format for HotpotQA wiki shards.
+           ``"id"`` key — the common shape for article-per-line corpora.
 
         Results are cached per-file for the duration of the search.
         """
@@ -9404,8 +9459,9 @@ class AgenticSearch(BaseSearch):
                     # Extract text content
                     text_field = obj.get("text", "")
                     if isinstance(text_field, list):
-                        # HotpotQA format: list of paragraphs (each may be a
-                        # list of sentences or a plain string)
+                        # Article-per-line corpora often store ``text`` as a
+                        # list of paragraphs, each a list of sentences or a
+                        # plain string.
                         paragraphs: List[str] = []
                         for para in text_field:
                             if isinstance(para, list):
@@ -9442,9 +9498,10 @@ class AgenticSearch(BaseSearch):
     ) -> None:
         """Add sibling text docs whose title is mentioned in already-read evidence.
 
-        This targets multi-hop collections such as HotpotQA sample contexts: the
-        first-hop document may say "professor at Moscow State University", while
-        the second-hop document is a sibling file named ``Moscow State University``.
+        This targets multi-hop collections where documents cross-reference each
+        other by title: the first-hop document may say "professor at Moscow State
+        University", while the second-hop document is a sibling file named
+        ``Moscow State University``.
         """
         evidence_lower = "\n".join(evidence_parts).lower()
         seen = set(pages_extracted)
