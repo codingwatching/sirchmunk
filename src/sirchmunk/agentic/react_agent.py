@@ -28,11 +28,55 @@ logger = logging.getLogger(__name__)
 
 _ANSWER_PATTERN = re.compile(r"<ANSWER>(.*?)</ANSWER>", re.DOTALL)
 
+# Patterns indicating JSON/code garbage in extracted answers
+_GARBAGE_PATTERNS = [
+    re.compile(r'^\s*[{\[].*[}\]]\s*$', re.DOTALL),  # JSON object/array
+    re.compile(r'^\s*```', re.MULTILINE),              # code fence
+    re.compile(r'^\s*\{\s*"', re.DOTALL),             # JSON-like start
+]
+
 
 def _extract_answer(text: str) -> Optional[str]:
-    """Extract content within <ANSWER>...</ANSWER> tags."""
+    """Extract content within <ANSWER>...</ANSWER> tags.
+
+    Includes post-extraction garbage check: if extracted content looks like
+    JSON/code, attempt to find natural language within it.
+    """
     m = _ANSWER_PATTERN.search(text)
-    return m.group(1).strip() if m else None
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    # Post-extraction check: if content matches JSON/code patterns, clean it
+    if raw and _is_garbage_content(raw):
+        cleaned = _strip_garbage_from_answer(raw)
+        if cleaned:
+            return cleaned
+    return raw
+
+
+def _is_garbage_content(text: str) -> bool:
+    """Check if extracted answer content looks like JSON/code garbage."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    for pat in _GARBAGE_PATTERNS:
+        if pat.search(stripped):
+            return True
+    return False
+
+
+def _strip_garbage_from_answer(text: str) -> Optional[str]:
+    """Try to extract natural language from a garbage answer."""
+    # Remove code fences
+    cleaned = re.sub(r'```[^`]*```', '', text, flags=re.DOTALL).strip()
+    # Remove JSON blocks
+    cleaned = re.sub(r'\{[^}]*\}', '', cleaned).strip()
+    cleaned = re.sub(r'\[[^\]]*\]', '', cleaned).strip()
+    # Remove markdown formatting residuals
+    cleaned = re.sub(r'[\*`#]', '', cleaned).strip()
+    if cleaned and len(cleaned) > 1:
+        return cleaned
+    return None
 
 
 def _parse_tool_call(text: str, available_tools: List[str]) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -338,7 +382,11 @@ class ReActSearchAgent:
                 "content": (
                     "You have reached the retrieval limit. "
                     "Please synthesize your best answer from ALL evidence collected so far. "
-                    "Wrap it in <ANSWER>...</ANSWER> tags."
+                    "Wrap it in <ANSWER>...</ANSWER> tags.\n\n"
+                    "CRITICAL: Your answer must be a concise natural language span "
+                    "(a name, date, number, or yes/no phrase). "
+                    "Do NOT output JSON, code blocks, tool calls, or markdown formatting. "
+                    "If you cannot determine the answer, output your best guess as a simple phrase."
                 ),
             })
             llm_response = await self._call_llm(messages)
@@ -349,6 +397,12 @@ class ReActSearchAgent:
                 total_tok = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
             context.add_llm_tokens(total_tok, usage=usage if usage else None)
             final_answer = _extract_answer(content) or content
+
+            # If the forced synthesis still produced garbage, strip and retry
+            if final_answer and _is_garbage_content(final_answer):
+                cleaned = _strip_garbage_from_answer(final_answer)
+                if cleaned:
+                    final_answer = cleaned
 
         await self._logger.success(f"[ReAct] Completed: {context.summary()}")
 

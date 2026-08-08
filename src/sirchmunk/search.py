@@ -7955,10 +7955,12 @@ class AgenticSearch(BaseSearch):
         re.MULTILINE,
     )
     _SANITIZE_FORMAT_PATTERNS: list = [
+        # **Answer: xyz** — bold wrapper around label+content (must come first)
+        re.compile(r"\*\*(?:Answer|Final Answer|ANSWER)\s*(?::|：)\s*(.*?)\*\*", re.DOTALL),
         # **Answer:** or **Answer ** or **Final Answer:** with bold markers
-        re.compile(r"\*\*(?:Answer|Final Answer|ANSWER)\s*(?::|\s)\s*\*\*\s*"),
-        # **Answer: xyz** — bold prefix without closing before content
-        re.compile(r"\*\*(?:Answer|Final Answer|ANSWER)\s*(?::|\s)\s*"),
+        re.compile(r"\*\*(?:Answer|Final Answer|ANSWER)\s*(?::|：|\s)\s*\*\*\s*"),
+        # **Answer: — bold prefix without closing before content
+        re.compile(r"\*\*(?:Answer|Final Answer|ANSWER)\s*(?::|：|\s)\s*"),
         # Markdown heading answer lines
         re.compile(r"^#+\s*(?:Answer|Final Answer|ANSWER)\s*[:：]?\s*\n?", re.MULTILINE),
     ]
@@ -7968,12 +7970,43 @@ class AgenticSearch(BaseSearch):
     )
     _SANITIZE_BOLD_WRAPPER_RE = re.compile(r"^\*\*(.+?)\*\*$", re.DOTALL)
     _SANITIZE_TRAILING_REASONING_RE = re.compile(
-        r"\n+(?:(?:This|Based|I |The |According|From|Let me|Note|Source|Evidence).*)$",
+        r"\n+(?:(?:This is|This was|Based on|I found|I need|The evidence|The search|According to|From the|Let me|Note:|Source:|Evidence:).*)$",
         re.DOTALL,
     )
     _SANITIZE_MULTILINE_JSON_RE = re.compile(
         r"(?:\{[^{}]*\n[^{}]*\}|\[[^\[\]]*\n[^\[\]]*\])", re.DOTALL,
     )
+    _SANITIZE_FENCED_CODE_RE = re.compile(
+        r"```(?:json|python|text)?\s*\n?.*?\n?```", re.DOTALL,
+    )
+    _SANITIZE_BARE_JSON_LITERAL_RE = re.compile(
+        r"^\s*(?:\{\s*\}|\[\s*\]|null|undefined)\s*$", re.MULTILINE,
+    )
+
+    def _is_garbage_answer(self, answer: str) -> bool:
+        """Detect if answer is JSON garbage / code block residue."""
+        if not answer or not answer.strip():
+            return True
+        stripped = answer.strip()
+        # Pure JSON-like literals
+        if stripped in ('{}', '[]', 'null', 'undefined', 'None', '""', "''"):
+            return True
+        # Code fenced blocks
+        if stripped.startswith('```') and stripped.endswith('```'):
+            return True
+        # JSON object/array patterns with no natural language
+        if (stripped.startswith('{') and stripped.endswith('}')) or \
+           (stripped.startswith('[') and stripped.endswith(']')):
+            try:
+                import json
+                json.loads(stripped)
+                return True  # Valid JSON = not a natural language answer
+            except (json.JSONDecodeError, ValueError):
+                pass
+        # Very short meaningless strings (single char, punctuation, etc.)
+        if len(stripped) <= 2 and stripped.lower() not in ('no', 'yes'):
+            return True
+        return False
 
     def _sanitize_answer_output(self, answer: str) -> str:
         """Phase 1B: Remove tool-call artifacts and reasoning traces from *answer*.
@@ -7990,8 +8023,14 @@ class AgenticSearch(BaseSearch):
         for pat in self._SANITIZE_TOOL_CALL_PATTERNS:
             cleaned = pat.sub("", cleaned)
 
+        # 1b. Remove fenced code blocks (```json...```, ```...```).
+        cleaned = self._SANITIZE_FENCED_CODE_RE.sub("", cleaned)
+
         # 2. Remove multi-line JSON blocks (objects/arrays spanning newlines).
         cleaned = self._SANITIZE_MULTILINE_JSON_RE.sub("", cleaned)
+
+        # 2b. Remove bare JSON literals ({}, [], null, undefined).
+        cleaned = self._SANITIZE_BARE_JSON_LITERAL_RE.sub("", cleaned)
 
         # 3. Remove formatting headers ("**Answer:**", "## Answer", etc.).
         for pat in self._SANITIZE_FORMAT_PATTERNS:
@@ -8077,8 +8116,32 @@ class AgenticSearch(BaseSearch):
         # Phase 1B: sanitize tool-call / reasoning artifacts before D-layers.
         answer = self._sanitize_answer_output(answer)
         evidence = self._loop_evidence_text(context)
+        # Fallback: also try context.telemetry evidence_snippets directly
+        if not evidence.strip():
+            telemetry = getattr(context, "telemetry", None)
+            if isinstance(telemetry, dict):
+                snippets = telemetry.get("evidence_snippets") or []
+                evidence = "\n\n".join(s for s in snippets if s)
         if not evidence.strip():
             return answer
+        # Phase 1C: detect JSON garbage after sanitization — attempt forced synthesis.
+        # NOTE: garbage recovery is UNCONDITIONAL (no _allows_forced_guess gate).
+        # JSON/code garbage is never an acceptable output regardless of policy.
+        if self._is_garbage_answer(answer):
+            forced = await self._forced_guess_from_evidence(
+                query, evidence, data_reqs, context,
+            )
+            if forced and not self._is_garbage_answer(forced):
+                answer = forced
+            else:
+                # Retry with stricter prompt if first attempt failed
+                forced_retry = await self._forced_guess_from_evidence_strict(
+                    query, evidence, data_reqs, context,
+                )
+                if forced_retry and not self._is_garbage_answer(forced_retry):
+                    answer = forced_retry
+            if self._is_garbage_answer(answer):
+                return answer
         if _LOOP_ANSWER_HYGIENE:
             answer = await self._hygiene_rescue_answer(
                 query, answer, evidence, data_reqs, context,
@@ -8613,6 +8676,95 @@ class AgenticSearch(BaseSearch):
         )
         await self._logger.info(f"[Phase 4.6] forced-guess answer: {candidate[:60]}")
         return f"**Answer: {candidate}**"
+
+    async def _forced_guess_from_evidence(
+        self,
+        query: str,
+        evidence: str,
+        data_reqs: Optional["DataRequirements"] = None,
+        context: Optional["SearchContext"] = None,
+    ) -> Optional[str]:
+        """Last-resort: extract a concise answer from available evidence when loop output is garbage.
+
+        Similar to ``_forced_guess_answer`` but operates on the loop evidence
+        text directly (no RetrievalResult wrapper). Returns a sanitized answer
+        string or None.
+        """
+        if not evidence or len(evidence.strip()) < 50:
+            return None
+        expected = (data_reqs.expected_answer_type if data_reqs else "") or "unconstrained"
+        target_slot = (data_reqs.target_slot if data_reqs else "") or ""
+        prompt = (
+            "Answer the question with ONLY the minimal answer span "
+            "(a name, date, number, or yes/no). The evidence may be incomplete; "
+            "do not refuse and do not explain. No JSON, no code blocks.\n\n"
+            f"Question: {query}\n"
+            f"Expected answer type: {expected}\n"
+            + (f"Target relation: {target_slot}\n" if target_slot else "")
+            + f"\nEvidence:\n{evidence[: self._AGENTIC_EVIDENCE_MAX_CHARS]}\n\n"
+            "Reply with exactly one line: **Answer: <span>**"
+        )
+        try:
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+        except Exception as exc:
+            await self._logger.warning(f"[Phase 1C] forced-guess-from-evidence failed: {exc}")
+            return None
+        candidate = self._clean_answer_candidate(
+            self._extract_answer_span(resp.content or "")
+        )
+        if not candidate or self._is_no_answer_value(candidate) or self._is_reserved_answer_span(candidate):
+            return None
+        self._record_context_telemetry(
+            context, forced_guess_used=True, forced_guess_answer=candidate,
+        )
+        await self._logger.info(f"[Phase 1C] forced-guess-from-evidence: {candidate[:60]}")
+        return candidate
+
+    async def _forced_guess_from_evidence_strict(
+        self,
+        query: str,
+        evidence: str,
+        data_reqs: Optional["DataRequirements"] = None,
+        context: Optional["SearchContext"] = None,
+    ) -> Optional[str]:
+        """Stricter retry for forced guess when first attempt returns garbage.
+
+        Uses an even more explicit prompt that forbids any non-natural-language
+        output. This is the last resort before accepting a garbage answer.
+        """
+        if not evidence or len(evidence.strip()) < 50:
+            return None
+        expected = (data_reqs.expected_answer_type if data_reqs else "") or "unconstrained"
+        prompt = (
+            "Output ONLY a name, date, number, or short phrase. "
+            "Absolutely NO JSON, NO code, NO curly braces, NO square brackets, "
+            "NO markdown, NO explanation. Just the raw answer words.\n\n"
+            f"Question: {query}\n"
+            f"Expected answer type: {expected}\n"
+            f"\nEvidence:\n{evidence[: self._AGENTIC_EVIDENCE_MAX_CHARS]}\n\n"
+            "Reply with exactly one line: **Answer: <span>**"
+        )
+        try:
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+        except Exception as exc:
+            await self._logger.warning(f"[Phase 1C] forced-guess-strict failed: {exc}")
+            return None
+        candidate = self._clean_answer_candidate(
+            self._extract_answer_span(resp.content or "")
+        )
+        if not candidate or self._is_no_answer_value(candidate) or self._is_reserved_answer_span(candidate):
+            return None
+        self._record_context_telemetry(
+            context, forced_guess_used=True, forced_guess_answer=candidate,
+        )
+        await self._logger.info(f"[Phase 1C] forced-guess-strict: {candidate[:60]}")
+        return candidate
 
     def _refusal_fallback_answer(
         self,
@@ -9952,7 +10104,18 @@ class AgenticSearch(BaseSearch):
             "",
             "CRITICAL: Your answer MUST be copied verbatim from the evidence/tool results \u2014 "
             "use the exact spelling, capitalization, and full form as it appears in the source text. "
-            "Do NOT paraphrase, abbreviate, or reformat entity names.",
+            "Do NOT paraphrase, abbreviate, or reformat entity names. "
+            "Prefer the SHORTEST correct form that appears in evidence.",
+            "",
+            "PRECISION RULES:",
+            "- If asked about a person, answer with their name only (not title + name + credentials)",
+            "- If asked about a place, answer with the most specific relevant level only "
+            "(city name, not street + city + country)",
+            "- If asked about a work (book/film/song), give just the title",
+            "- If multiple items could answer, give ONLY the single most relevant one",
+            "- Never include parenthetical clarifications like '(also known as...)'",
+            "- Match the granularity of the question: if it asks 'which city', answer "
+            "with a city name only",
         ]
         if data_reqs and data_reqs.expected_answer_type:
             at = data_reqs.expected_answer_type
