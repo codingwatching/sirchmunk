@@ -268,7 +268,7 @@ async def _noop_async(self, *args, **kwargs):
 
 
 def _one_shot_retrieve_factory(profile: LensSearchProfile):
-    async def _one_shot_retrieve(self, query, data_reqs, target_files, context):
+    async def _one_shot_retrieve(self, query, data_reqs, target_files, context, **kwargs):
         from sirchmunk.search import RetrievalResult
         evidence_blocks: List[str] = []
         max_files = min(profile.one_shot_max_files, len(target_files or []))
