@@ -1224,6 +1224,49 @@ class AgenticSearch(BaseSearch):
         return bool(cls._REFUSAL_PATTERN.search(head))
 
     @classmethod
+    def _is_rescuable_refusal(cls, text: str) -> bool:
+        """Whether *text* abstains in a way the refusal rescue should retry.
+
+        Deliberately narrower than :meth:`_is_refusal_answer`, which counts any
+        text under 20 characters as a refusal. That heuristic suits full
+        synthesis output, whose refusals are prose, but is wrong on the loop's
+        exit path, where a correct answer is often a bare short span such as
+        ``Citgo``. Re-synthesizing those would burn budget and risk replacing a
+        right answer, so only explicit no-answer markers qualify here.
+
+        All phrase matching runs on the extracted span rather than the whole
+        text: this path's answers carry their supporting passages and
+        comparison tables inline, and those routinely say a *secondary*
+        dimension was not found, which must not condemn a sound answer.
+        """
+        if not text or text == _NO_RESULTS_MESSAGE:
+            return True
+        short = (cls._extract_answer_span(text) or "").strip()
+        if not short:
+            return True
+        if cls._is_no_answer_value(short) or cls._is_reserved_answer_span(short):
+            return True
+        if re.sub(r"[^a-z]", "", short.lower()) in {"none", "null", "nil"}:
+            return True
+        # A control tag that survived into the span is never a real answer, and
+        # the bare-tag form escapes ``_is_no_answer_value`` because the angle
+        # brackets defeat its normalization.
+        if re.search(r"<[A-Za-z_/]+>", short):
+            return True
+        # ``_REFUSAL_PATTERN`` only matches "no relevant/sufficient <noun>", so
+        # the plain "no evidence found" phrasing the loop also emits needs its
+        # own clause. Scoped to this rescue check to leave the shared pattern's
+        # semantics untouched.
+        if re.search(
+            r"\bno\s+(?:relevant\s+|sufficient\s+)?"
+            r"(?:data|information|evidence|results?|matches?)\b",
+            short,
+            re.IGNORECASE,
+        ):
+            return True
+        return bool(cls._REFUSAL_PATTERN.search(short))
+
+    @classmethod
     def _parse_summary_response(cls, llm_response: str) -> Tuple[str, bool, bool]:
         """Parse LLM response to extract summary, precise answer, and quality decisions.
 
@@ -8110,11 +8153,8 @@ class AgenticSearch(BaseSearch):
             slot_retry_used=False,
             typed_comparison_checked=False,
             answer_resolution_used=False,
+            forced_guess_used=False,
         )
-        if not answer or answer == _NO_RESULTS_MESSAGE:
-            return answer
-        # Phase 1B: sanitize tool-call / reasoning artifacts before D-layers.
-        answer = self._sanitize_answer_output(answer)
         evidence = self._loop_evidence_text(context)
         # Fallback: also try context.telemetry evidence_snippets directly
         if not evidence.strip():
@@ -8122,6 +8162,31 @@ class AgenticSearch(BaseSearch):
             if isinstance(telemetry, dict):
                 snippets = telemetry.get("evidence_snippets") or []
                 evidence = "\n\n".join(s for s in snippets if s)
+        # Phase 1A: refusal rescue. The loop's answer contract is supposed to
+        # forbid abstaining on partial evidence, but it still refuses on a
+        # minority of samples while the evidence it read holds the answer, and
+        # the legacy split path's forced-guess last resort is unreachable from
+        # here. So make one best-effort attempt from that evidence. Gated on
+        # the answer policy, keeping the honest "no results" contract as the
+        # default product behaviour, and never persisted as knowledge.
+        if self._is_rescuable_refusal(answer):
+            if not evidence.strip() or not self._allows_forced_guess():
+                return answer
+            rescued = await self._forced_guess_from_evidence(
+                query, evidence, data_reqs, context,
+            )
+            if not rescued or self._is_garbage_answer(rescued):
+                rescued = await self._forced_guess_from_evidence_strict(
+                    query, evidence, data_reqs, context,
+                )
+            if not rescued or self._is_garbage_answer(rescued):
+                return answer
+            await self._logger.info(
+                f"[Phase 1A] refusal rescue: {rescued[:60]}"
+            )
+            answer = rescued
+        # Phase 1B: sanitize tool-call / reasoning artifacts before D-layers.
+        answer = self._sanitize_answer_output(answer)
         if not evidence.strip():
             return answer
         # Phase 1C: detect JSON garbage after sanitization — attempt forced synthesis.
