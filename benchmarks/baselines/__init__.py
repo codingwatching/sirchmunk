@@ -11,6 +11,7 @@
 """
 from .base_adapter import BaselineAdapter, BaselinePrediction, BaselineResult, BaselineSetupResult
 from .bm25_rag import BM25RAGBaseline
+from .closed_book import ClosedBookBaseline
 from .external import ExternalPredictionBaseline, GraphRAGBaseline, LightRAGV1Baseline
 from .lexical import LocalBM25Baseline, NaiveRAGBaseline
 from .hybrid_rag import HybridRAGBaseline
@@ -28,6 +29,7 @@ __all__ = [
     # 本地/外部基线
     "LocalBM25Baseline",
     "BM25RAGBaseline",
+    "ClosedBookBaseline",
     "HybridRAGBaseline",
     "NaiveRAGBaseline",
     "ReActSearchBaseline",

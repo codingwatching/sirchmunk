@@ -902,6 +902,24 @@ def _aggregate_runner_metrics(results: List[PredictionResult]) -> Dict[str, Any]
     em = sum(float(t.get("em", 0.0) or 0.0) for t in telemetry) / n
     f1 = sum(float(t.get("f1", 0.0) or 0.0) for t in telemetry) / n
     evidence = sum(float(t.get("evidence_recall", 0.0) or 0.0) for t in telemetry) / n
+    # Evidence recall reported at both levels, because the headline
+    # ``evidence_recall`` switches basis depending on whether a system exposes
+    # evidence snippets, which makes it unsafe to compare across systems alone.
+    ev_fact = sum(float(t.get("evidence_recall_fact_level", 0.0) or 0.0) for t in telemetry) / n
+    sent_values = [
+        float(t["evidence_recall_sentence_level"]) for t in telemetry
+        if isinstance(t.get("evidence_recall_sentence_level"), (int, float))
+    ]
+    ev_sentence = (sum(sent_values) / len(sent_values)) if sent_values else None
+    # Answers actually traceable to retrieved evidence, and exact match counted
+    # only over those. An open-book system can score on parametric recall alone,
+    # which credits memorisation rather than retrieval; restricting EM to
+    # grounded answers measures what the retrieval chain contributed.
+    grounded = [t for t in telemetry if t.get("answer_source_grounded")]
+    grounded_em = (
+        sum(float(t.get("em", 0.0) or 0.0) for t in grounded) / len(grounded)
+        if grounded else None
+    )
     total_tokens = sum(_safe_int(t.get("total_tokens", 0)) for t in telemetry)
     judge_tokens = sum(_safe_int(t.get("judge_tokens", 0)) for t in telemetry)
     retry_attempts = [max(_safe_int(t.get("retry_attempts", 1), default=1), 0) for t in telemetry]
@@ -927,6 +945,13 @@ def _aggregate_runner_metrics(results: List[PredictionResult]) -> Dict[str, Any]
         "em": round(em * 100, 2),
         "f1": round(f1 * 100, 2),
         "evidence_recall": round(evidence * 100, 2),
+        "evidence_recall_fact_level": round(ev_fact * 100, 2),
+        "evidence_recall_sentence_level": (
+            round(ev_sentence * 100, 2) if ev_sentence is not None else None
+        ),
+        "answer_source_grounded_rate": round(len(grounded) / n * 100, 2),
+        "grounded_em": round(grounded_em * 100, 2) if grounded_em is not None else None,
+        "grounded_n": len(grounded),
         "latency": {
             "avg": round(sum(latencies) / n, 2),
             "p50": round(_percentile(latencies, 50), 2),

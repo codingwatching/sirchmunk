@@ -66,6 +66,9 @@ def evaluate_supporting_facts(
             "supporting_sentence_completion_complete": False,
             "evidence_completion_needed": False,
             "evidence_recall": 0.0,
+            "evidence_recall_basis": "none",
+            "evidence_recall_fact_level": 0.0,
+            "evidence_recall_sentence_level": None,
             "answer_source_grounded": False,
         }
 
@@ -83,7 +86,15 @@ def evaluate_supporting_facts(
     title_recall = len(title_hits) / max(len(gold_titles), 1)
     fact_recall = len(fact_hits) / max(len(gold_facts), 1)
     sentence_recall = len(sentence_hits) / max(len(sentence_facts), 1) if sentence_facts else None
-    effective_recall = sentence_recall if sentence_recall is not None and evidence_texts else fact_recall
+    # ``evidence_recall`` measures sentence-level recall for systems that expose
+    # evidence snippets and falls back to fact-level recall for those that do
+    # not. That keeps one number available for every system, but it means the
+    # number answers a different question depending on the system, so a
+    # cross-system comparison of it alone is not meaningful. The basis is
+    # recorded alongside, and both levels are always reported, so a comparison
+    # can pick a single level explicitly.
+    used_sentence_basis = sentence_recall is not None and bool(evidence_texts)
+    effective_recall = sentence_recall if used_sentence_basis else fact_recall
     answer_source_grounded = (bool(title_hits) or bool(sentence_hits)) and bool((prediction or "").strip())
     missing_titles = sorted(title for title in gold_titles if title not in title_hits)
     missing_facts = [fact for fact in gold_facts if fact not in fact_hits]
@@ -111,6 +122,12 @@ def evaluate_supporting_facts(
         "supporting_sentence_completion_complete": completion_complete,
         "evidence_completion_needed": bool(missing_titles or missing_sentences),
         "evidence_recall": round(effective_recall, 4),
+        # Which level the number above came from, so a table can state its basis
+        # instead of implying one shared definition across systems.
+        "evidence_recall_basis": "sentence" if used_sentence_basis else "fact",
+        # Both levels, always populated, for like-for-like comparison.
+        "evidence_recall_fact_level": round(fact_recall, 4),
+        "evidence_recall_sentence_level": completion_rate,
         "answer_source_grounded": answer_source_grounded,
     }
 

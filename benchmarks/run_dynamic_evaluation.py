@@ -482,6 +482,11 @@ def _baseline_by_name(spec: str, bm_adapter, args=None):
     if lower == "react":
         from baselines import ReActSearchBaseline
         return ReActSearchBaseline()
+    if lower in {"closed_book", "closedbook", "no_retrieval"}:
+        # Reference arm, not a competitor: it reads nothing, so its score is the
+        # part of the benchmark answerable from the model's parameters alone.
+        from baselines import ClosedBookBaseline
+        return ClosedBookBaseline()
     if lower in {"lens_full", "lens_no_prior", "lens_no_seq"}:
         from ablations import build_single_lens_ablation
         return build_single_lens_ablation(bm_adapter, profile_name=lower)
