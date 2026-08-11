@@ -106,14 +106,21 @@ def _rule_verdict(gold: str, pred: str) -> Dict[str, Any]:
     return {"label": None, "rule": "", "deterministic": False}
 
 
-def build(review_path: Path, per_stratum: int, seed: int) -> Dict[str, Any]:
+def build(review_path: Path, per_stratum: int, seed: int,
+         exclude_sample_ids: set[str] | None = None) -> Dict[str, Any]:
     payload = json.loads(review_path.read_text(encoding="utf-8"))
     review: List[Dict[str, Any]] = payload.get("review", [])
+    exclude = exclude_sample_ids or set()
 
     strata: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
     for row in review:
         gold, pred = str(row.get("gold") or ""), str(row.get("prediction") or "")
         if not gold or not pred:
+            continue
+        # A held-out split must not reuse any pair already labelled for tuning,
+        # or the agreement it reports is measured on the data the prompt was
+        # shaped against.
+        if str(row.get("sample_id")) in exclude:
             continue
         strata[(row.get("system", "?"), bool(row.get("judge_equivalent")))].append(row)
 
@@ -184,14 +191,22 @@ def main() -> None:
     parser.add_argument("--per-stratum", type=int, default=20)
     parser.add_argument("--seed", type=int, default=20260811)
     parser.add_argument("--out-dir", default="")
+    parser.add_argument("--tag", default="", help="filename suffix, e.g. 'heldout'")
+    parser.add_argument("--exclude-key", default="",
+                        help="a calibration key whose sample_ids are held out")
     args = parser.parse_args()
 
     review_path = Path(args.review).resolve()
-    built = build(review_path, args.per_stratum, args.seed)
+    exclude: set[str] = set()
+    if args.exclude_key:
+        prior = json.loads(Path(args.exclude_key).read_text(encoding="utf-8"))
+        exclude = {str(v.get("sample_id")) for v in prior.values()}
+    built = build(review_path, args.per_stratum, args.seed, exclude)
 
     out_dir = Path(args.out_dir).resolve() if args.out_dir else review_path.parent
-    ws_path = out_dir / "judge_calibration_worksheet.json"
-    key_path = out_dir / "judge_calibration_key.json"
+    suffix = f"_{args.tag}" if args.tag else ""
+    ws_path = out_dir / f"judge_calibration_worksheet{suffix}.json"
+    key_path = out_dir / f"judge_calibration_key{suffix}.json"
     ws_path.write_text(json.dumps(
         {"meta": built["meta"], "worksheet": built["worksheet"]},
         indent=2, ensure_ascii=False), encoding="utf-8")
