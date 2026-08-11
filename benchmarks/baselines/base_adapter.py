@@ -162,6 +162,67 @@ class BaselineAdapter(ABC):
         """
 
     # ------------------------------------------------------------------
+    # 检索契约（评估口径的前提）
+    # ------------------------------------------------------------------
+
+    # How this system obtains its answers. Every baseline is compared on the
+    # same terms, and those terms depend on this being declared honestly:
+    #
+    #   "retrieval_based" — reads the corpus. Must report what it read via
+    #       read_file_ids / evidence_sources, otherwise evidence recall and
+    #       source grounding silently read as zero and the system looks like it
+    #       retrieved nothing.
+    #   "retrieval_free"  — answers from model parameters alone. Zero evidence
+    #       is the correct result, not missing data.
+    #
+    # Defaulting to retrieval_based is deliberate: a new adapter that forgets to
+    # declare gets held to the stricter obligation and fails the check below,
+    # rather than passing quietly with unreported evidence.
+    retrieval_mode: str = "retrieval_based"
+
+    RETRIEVAL_MODES = ("retrieval_based", "retrieval_free")
+
+    def validate_prediction_contract(self, prediction: "BaselinePrediction") -> List[str]:
+        """Check one prediction against the declared retrieval mode.
+
+        Returns a list of problems, empty when the prediction is consistent with
+        what the adapter claims to be. This exists because a missing evidence
+        field is not visible in the score: the run completes, the metric reads
+        zero, and the system is recorded as having retrieved nothing. Comparing
+        such a row against systems that do report evidence is not meaningful, so
+        the mismatch has to surface as an error rather than as a low number.
+        """
+        problems: List[str] = []
+        mode = str(getattr(self, "retrieval_mode", "") or "")
+        if mode not in self.RETRIEVAL_MODES:
+            problems.append(
+                f"{self.name}: retrieval_mode={mode!r} is not one of {self.RETRIEVAL_MODES}"
+            )
+            return problems
+
+        meta = prediction.metadata or {}
+        read_ids = meta.get("read_file_ids")
+        sources = meta.get("evidence_sources")
+
+        if mode == "retrieval_free":
+            if read_ids or sources:
+                problems.append(
+                    f"{self.name}: declared retrieval_free but reported evidence "
+                    f"({len(read_ids or [])} read_file_ids, {len(sources or [])} sources)"
+                )
+            return problems
+
+        # retrieval_based: the fields must be present, so that an empty result
+        # means "retrieved nothing on this question" rather than "never wired up".
+        if read_ids is None and sources is None:
+            problems.append(
+                f"{self.name}: declared retrieval_based but reported neither "
+                "read_file_ids nor evidence_sources, so evidence metrics cannot "
+                "distinguish a retrieval miss from missing instrumentation"
+            )
+        return problems
+
+    # ------------------------------------------------------------------
     # 可选覆盖
     # ------------------------------------------------------------------
 

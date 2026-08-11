@@ -41,6 +41,9 @@ Instructions:
 class ClosedBookBaseline(BaselineAdapter):
     """Answer without retrieval, to measure the memorisation floor."""
 
+    # Reads nothing by design, so zero evidence is the correct reading here.
+    retrieval_mode = "retrieval_free"
+
     def __init__(
         self,
         *,
@@ -116,12 +119,10 @@ class ClosedBookBaseline(BaselineAdapter):
             tokens_used=tokens,
             metadata={
                 "baseline_type": "closed_book",
-                # No read_file_ids and no evidence_sources: this system reads
-                # nothing, so evidence recall and source grounding must come out
-                # at zero. Emitting empty lists here keeps that explicit rather
-                # than letting a downstream default imply the fields were lost.
-                "read_file_ids": [],
-                "evidence_sources": [],
+                # Declared retrieval_free, so no evidence keys are emitted at
+                # all: the contract check treats present-but-empty as a
+                # contradiction, and absent as the honest signal that this
+                # system never had evidence to report.
                 "retrieval_free": True,
                 "setup_metrics": self.collect_setup_metrics(),
             },

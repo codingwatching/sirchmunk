@@ -212,6 +212,10 @@ class BaselineEvaluationSuite:
         """评估单个竞品系统的所有样本，并分类预算/超时/导入缺失失败。"""
         results: List[BaselineResult] = []
         results_lock = asyncio.Lock()
+        # One retrieval-contract check per baseline, on whichever sample finishes
+        # first. Held in a list because the per-sample coroutine closes over it;
+        # a race here can only cause the check to run twice, which is harmless.
+        contract_checked_flag: List[bool] = []
         request_delay = baseline.get_request_delay()
         max_conc = _resolve_sample_concurrency(self._bm_adapter, baseline)
         sample_semaphore = asyncio.Semaphore(max_conc)
@@ -318,6 +322,26 @@ class BaselineEvaluationSuite:
                         failure_phase = "prediction"
 
                 if prediction_obj is not None:
+                    # Check the retrieval contract once per baseline, on its first
+                    # real prediction. A baseline that reads the corpus but never
+                    # reports what it read still produces a complete run whose
+                    # evidence metrics read zero, which is indistinguishable from
+                    # genuinely retrieving nothing and silently makes it
+                    # incomparable with the other arms. Failing here costs one
+                    # sample; discovering it after a 500-question run costs the run.
+                    if not contract_checked_flag:
+                        contract_checked_flag.append(True)
+                        try:
+                            issues = baseline.validate_prediction_contract(prediction_obj)
+                        except AttributeError:
+                            issues = []
+                        if issues:
+                            raise RuntimeError(
+                                "Baseline retrieval contract violated:\n  - "
+                                + "\n  - ".join(issues)
+                                + "\nDeclare retrieval_mode on the adapter and report "
+                                  "read_file_ids/evidence_sources accordingly."
+                            )
                     prediction_text = prediction_obj.answer
                     pred_elapsed = prediction_obj.elapsed
                     pred_tokens = prediction_obj.tokens_used
