@@ -180,10 +180,45 @@ def answer_form_report(text: str) -> Dict[str, Any]:
     return {"form_compliant": True, "form_reason": "", "form_tokens": n}
 
 
+# Judge prompt. Version it: a verdict is only comparable against verdicts from
+# the same prompt, so the identifier travels with every result.
+_JUDGE_PROMPT_VERSION = "2026-08-11.criteria-v2"
+
+# v2 states the two boundaries that measured disagreement clustered on, rather
+# than leaving them to the model's discretion. Agreement analysis showed the
+# judge too lenient about containment hierarchies and coarser dates, and too
+# strict about qualifier-only differences. Both are stated as general criteria
+# with illustrative shapes, not as the specific pairs that were measured, so the
+# prompt does not encode the calibration set.
 _JUDGE_PROMPT = """\
 You are judging a HotpotQA answer. Decide whether the prediction answers the
-question equivalently to the gold answer. Be strict about entity identity, but
-allow harmless aliases, abbreviations, and wording differences.
+question equivalently to the gold answer.
+
+EQUIVALENT — the two denote the same thing:
+- alias, abbreviation, transliteration, or spelling variant of one referent
+- one side carries an extra qualifier, title, appositive, or parent scope that
+  does not select a different thing (a bare name vs the same name with a title;
+  a place vs that place with its country appended)
+- the same quantity or date written differently, including a spelled number, a
+  unit, or a counted noun attached to the figure
+- a full sentence whose stated answer is the gold answer
+
+NOT EQUIVALENT — they denote different things, even when closely related:
+- a different level of a containment hierarchy: a county is not the city inside
+  it, a parent organisation is not one of its channels, an institution is not
+  one of its teams
+- a value coarser or finer than the question asks: a bare year does not answer a
+  question whose gold specifies a month; a region does not answer a question
+  whose gold names a sub-region
+- a category where a specific instance is asked, or an instance where the
+  category is asked
+- a different entity of the same type, or an answer to a different aspect of the
+  question than the one asked
+- an incomplete enumeration when the gold lists several items
+- a refusal, an empty answer, or a statement that the evidence is insufficient
+
+Judge identity strictly, and judge form leniently: how verbose the prediction is
+does not matter, only whether the thing it names is the thing the gold names.
 
 Question: {question}
 Gold answer: {gold}
@@ -215,7 +250,8 @@ class HotpotQAJudge:
         self._llm_fallback_f1_threshold = llm_fallback_f1_threshold
         self._equivalence_f1_threshold = equivalence_f1_threshold
         self._confidence_threshold = confidence_threshold
-        self._cache: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+        # Keyed by (prompt version, question, prediction, gold).
+        self._cache: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
 
     async def judge(
         self,
@@ -257,6 +293,7 @@ class HotpotQAJudge:
             # answer by consumers that read ``equivalent`` alone.
             "indeterminate": False,
             "judge_status": "",
+            "judge_prompt_version": _JUDGE_PROMPT_VERSION,
             **answer_form_report(short_prediction),
         }
 
@@ -329,7 +366,11 @@ class HotpotQAJudge:
                 "judge_status": "lexical_only",
             }
 
+        # The prompt version is part of the key: verdicts from different criteria
+        # are not interchangeable, and without it a prompt change would keep
+        # serving decisions made under the previous one.
         cache_key = (
+            _JUDGE_PROMPT_VERSION,
             normalize_answer(question),
             normalize_answer(short_prediction),
             normalize_answer(gold_answer),

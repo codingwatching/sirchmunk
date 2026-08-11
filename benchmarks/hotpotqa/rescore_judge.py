@@ -76,8 +76,16 @@ async def main() -> int:
 
     os.environ.setdefault("HOTPOT_ENABLE_LLM_JUDGE", "true")
     adapter = HotpotQAAdapter(args.env)
-    llm = adapter.build_searcher().llm
-    judge = HotpotQAJudge(llm=llm, enable_llm_judge=True)
+    # Build the judge through the adapter so it uses HOTPOT_JUDGE_MODEL_NAME.
+    # Reaching for build_searcher().llm instead would hand scoring to the very
+    # model being scored (LLM_MODEL_NAME), and a model asked whether its own
+    # phrasing matches the gold is not an independent rater.
+    judge = adapter.build_judge()
+    if judge is None:
+        raise RuntimeError(
+            "Judge unavailable. Set HOTPOT_ENABLE_LLM_JUDGE=true and "
+            "HOTPOT_JUDGE_MODEL_NAME to a model distinct from LLM_MODEL_NAME."
+        )
 
     stages = args.stage or ["G_125_D_125", "G_250_D_250", "G_500_D_500"]
     runs = Path(args.runs)

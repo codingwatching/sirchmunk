@@ -127,9 +127,24 @@ class HotpotQAAdapter(BenchmarkAdapter):
         return self._get(key, str(default)).lower() in ("true", "1", "yes")
 
     def _judge_model_name(self, *, required: bool = True) -> str:
-        """Return the explicitly configured HotpotQA judge model."""
+        """Return the explicitly configured HotpotQA judge model.
+
+        Rejects a judge model equal to the model under evaluation. Asking a model
+        whether its own phrasing matches the gold is not an independent rating,
+        and the resulting score would flatter whichever system shares the
+        judge's answer style.
+        """
         model = self._get("HOTPOT_JUDGE_MODEL_NAME", "")
-        if model or not required:
+        if model:
+            system_model = self._get("LLM_MODEL_NAME", "")
+            if system_model and model.strip() == system_model.strip():
+                raise RuntimeError(
+                    f"HOTPOT_JUDGE_MODEL_NAME ({model}) equals LLM_MODEL_NAME, so the "
+                    "judge would be scoring its own output. Configure a different "
+                    "model for judging."
+                )
+            return model
+        if not required:
             return model
         raise RuntimeError(
             "HOTPOT_JUDGE_MODEL_NAME is required when HOTPOT_ENABLE_LLM_JUDGE=true. "
