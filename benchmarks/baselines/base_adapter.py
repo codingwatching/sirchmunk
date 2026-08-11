@@ -193,6 +193,8 @@ class BaselineAdapter(ABC):
             "normalized_em": float(jr.get("normalized_em", 0.0) or 0.0),
             "judge_indeterminate": bool(jr.get("indeterminate", False)),
             "judge_status": str(jr.get("judge_status", "") or ""),
+            "answer_form_compliant": bool(jr.get("form_compliant", True)),
+            "answer_form_reason": str(jr.get("form_reason", "") or ""),
             "coverage": bool(cr.get("has_coverage", False)),
             "judge_tokens": int(jr.get("tokens_used", 0) or 0) + int(cr.get("tokens_used", 0) or 0),
             "judge_result": jr,

@@ -133,6 +133,53 @@ _REFUSAL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# Answer form: is the prediction a minimal span, or a sentence that explains
+# itself?
+#
+# This is scored separately from semantic equivalence because the two are
+# independent properties, and conflating them makes the metric unreadable. It
+# matters for cross-system fairness: official EM penalises a system that answers
+# in prose, while a purely semantic judge does not, so a verbose system collects
+# semantic credit that a span-constrained system is denied. Reporting form
+# alongside equivalence lets a comparison hold both systems to one standard.
+# ---------------------------------------------------------------------------
+
+_ANSWER_FORM_MAX_TOKENS = 12
+
+_EXPLANATORY_RE = re.compile(
+    r"\b(based on|according to|as stated|the evidence|the retrieved|"
+    r"therefore|because|which means|this means|in summary|note that|"
+    r"the answer is|source|passage)\b",
+    flags=re.IGNORECASE,
+)
+
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?](?:\s|$)")
+
+
+def answer_form_report(text: str) -> Dict[str, Any]:
+    """Describe whether *text* reads as a minimal answer span.
+
+    Reports the reason rather than a bare boolean so a failing comparison can be
+    attributed instead of merely observed.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return {"form_compliant": False, "form_reason": "empty", "form_tokens": 0}
+    tokens = normalize_answer(raw).split()
+    n = len(tokens)
+    # Trailing punctuation on a single clause is fine; two or more sentences
+    # means the answer is narrating rather than answering.
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(raw) if s.strip()]
+    if len(sentences) > 1:
+        return {"form_compliant": False, "form_reason": "multi_sentence", "form_tokens": n}
+    if _EXPLANATORY_RE.search(raw):
+        return {"form_compliant": False, "form_reason": "explanatory", "form_tokens": n}
+    if n > _ANSWER_FORM_MAX_TOKENS:
+        return {"form_compliant": False, "form_reason": "too_long", "form_tokens": n}
+    return {"form_compliant": True, "form_reason": "", "form_tokens": n}
+
+
 _JUDGE_PROMPT = """\
 You are judging a HotpotQA answer. Decide whether the prediction answers the
 question equivalently to the gold answer. Be strict about entity identity, but
@@ -210,19 +257,14 @@ class HotpotQAJudge:
             # answer by consumers that read ``equivalent`` alone.
             "indeterminate": False,
             "judge_status": "",
+            **answer_form_report(short_prediction),
         }
 
-        if _is_refusal(short_prediction):
-            return {
-                **base,
-                "equivalent": False,
-                "confidence": 1.0,
-                "reasoning": "Prediction is a refusal or empty answer.",
-                "llm_judge_used": False,
-                "llm_equivalent": None,
-                "judge_status": "refusal",
-            }
-
+        # Lexical agreement is checked before the refusal test on purpose. The
+        # refusal vocabulary overlaps with legitimate answers ("unknown" is
+        # itself a gold answer for some questions) and with narration inside a
+        # long but correct answer, so an answer that already matches the gold
+        # must not be discarded for containing one of those words.
         if em >= 1.0:
             return {
                 **base,
@@ -247,6 +289,17 @@ class HotpotQAJudge:
                 "llm_judge_used": False,
                 "llm_equivalent": None,
                 "judge_status": "canonical_exact",
+            }
+
+        if _is_refusal(short_prediction):
+            return {
+                **base,
+                "equivalent": False,
+                "confidence": 1.0,
+                "reasoning": "Prediction is a refusal or empty answer.",
+                "llm_judge_used": False,
+                "llm_equivalent": None,
+                "judge_status": "refusal",
             }
 
         if f1 >= self._equivalence_f1_threshold:
