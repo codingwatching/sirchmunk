@@ -6,6 +6,11 @@ credit, so an evaluated system should report its best supported span rather
 than decline. That is an evaluation-protocol decision, which belongs here
 rather than in the retrieval pipeline.
 
+The pipeline holds up its end by always emitting a candidate answer alongside
+its own rating of the supporting evidence, so a policy here decides whether a
+weakly supported candidate is shown or replaced by a refusal. Nothing is
+reconstructed after the fact, because the candidate is never discarded.
+
 The pipeline exposes ``sirchmunk.answer_policy.AnswerPolicy`` for this purpose;
 adapters construct :class:`NoAbstentionAnswerPolicy` and pass it to
 ``AgenticSearch``, so ``search.py`` no longer needs to read benchmark
@@ -44,6 +49,10 @@ class NoAbstentionAnswerPolicy:
     def allows_forced_guess(self) -> bool:
         return self._forced_guess
 
+    def renders_refusal_for(self, sufficiency: str) -> bool:
+        """Never render a refusal: an unanswered question scores as wrong."""
+        return False
+
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return (
             f"NoAbstentionAnswerPolicy(prefer_span={self._prefer_span}, "
@@ -61,6 +70,16 @@ class HonestRefusalAnswerPolicy:
 
     def allows_forced_guess(self) -> bool:
         return False
+
+    def renders_refusal_for(self, sufficiency: str) -> bool:
+        """Refuse only when the agent rated its own evidence as unrelated.
+
+        The pipeline now always produces a candidate answer plus a rating of the
+        evidence behind it, so abstention is a presentation choice made here.
+        ``partial`` still answers: the candidate is inference-backed, which is
+        worth showing, whereas ``absent`` marks a guess this arm suppresses.
+        """
+        return str(sufficiency or "").strip().lower() == "absent"
 
 
 def policy_from_env(env: dict | None = None) -> object:

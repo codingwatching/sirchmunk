@@ -2566,6 +2566,11 @@ class AgenticSearch(BaseSearch):
                     answer = await self._resolve_loop_answer(
                         query, answer, _query_intent, data_reqs, context,
                     )
+            # Phase 4.95: apply the answer policy to the agent's own evidence
+            # rating. The loop always returns a candidate, so withholding it is
+            # a presentation decision the consumer owns, made here from an
+            # explicit rating rather than reconstructed from a refusal.
+            answer = self._apply_answer_presentation(answer, context)
         else:
             with self._phase("phase4_retrieve"):
                 retrieval = await self._agentic_retrieve(
@@ -7811,6 +7816,42 @@ class AgenticSearch(BaseSearch):
             return True
         return self._refusal_fallback_enabled()
 
+    def _apply_answer_presentation(
+        self, answer: str, context: Optional["SearchContext"] = None,
+    ) -> str:
+        """Withhold a candidate answer only when the policy says to.
+
+        The agent always commits to a candidate and rates the evidence behind
+        it, which separates "what did we find" from "is it worth showing". This
+        applies the second decision: consumers that score abstention as a wrong
+        answer show everything, while the default product contract suppresses a
+        candidate the agent itself rated as unsupported.
+
+        An unrated answer is shown as-is: a missing rating means the agent did
+        not claim its evidence was unrelated, and suppressing on that silence
+        would reintroduce the failure this design removes.
+        """
+        if not answer or answer == _NO_RESULTS_MESSAGE:
+            return answer
+        telemetry = getattr(context, "telemetry", None)
+        sufficiency = ""
+        if isinstance(telemetry, dict):
+            sufficiency = str(telemetry.get("evidence_sufficiency") or "").strip().lower()
+        if not sufficiency:
+            return answer
+        policy = getattr(self, "answer_policy", None)
+        renders_refusal = getattr(policy, "renders_refusal_for", None) if policy else None
+        if callable(renders_refusal):
+            withhold = bool(renders_refusal(sufficiency))
+        else:
+            # No policy supplied (product default, or a legacy policy): keep the
+            # honest contract unless the caller opted out of abstention.
+            withhold = sufficiency == "absent" and not self._prefers_span_over_refusal()
+        if not withhold:
+            return answer
+        self._record_context_telemetry(context, answer_withheld_by_policy=True)
+        return _NO_RESULTS_MESSAGE
+
     _SPAN_CALIBRATION_INTENTS: frozenset = frozenset({"lookup", "factoid", "comparison", "extraction"})
 
     @staticmethod
@@ -10160,12 +10201,35 @@ class AgenticSearch(BaseSearch):
     """Cap on the prior-warmed evidence block handed to the agent loop."""
 
     def _build_loop_answer_contract(self, data_reqs: Optional["DataRequirements"] = None) -> str:
-        """Build dynamic answer contract with type constraints (P0-2 + P0-3)."""
+        """Build the loop's answer contract: always answer, and rate the evidence.
+
+        Abstaining is not an output the agent may choose. Whether an answer is
+        worth showing depends on what the consumer does with a refusal, which
+        the agent cannot know, so it reports its best candidate plus an honest
+        assessment of the evidence behind it and lets the answer policy decide
+        how to render that. Letting the agent refuse instead destroyed the
+        candidate at the source, leaving nothing downstream could recover.
+        """
         parts = [
             "Your final answer inside <ANSWER></ANSWER> must be the minimal concise "
             "answer span only (a name, date, phrase, or yes/no) \u2014 no explanations, "
-            "no full sentences, no multiple candidates. If evidence is partial, give "
-            "the best supported concise answer instead of refusing.",
+            "no full sentences, no multiple candidates.",
+            "",
+            "NEVER REFUSE. <ANSWER> must always contain a concrete candidate span. "
+            "Do not write 'no relevant data', 'not found', 'unknown', 'none', or any "
+            "other statement about the evidence in place of an answer. When the "
+            "evidence is incomplete, commit to the single most likely candidate it "
+            "supports, and record the shortfall in <EVIDENCE_SUFFICIENCY> instead.",
+            "",
+            "After <ANSWER>, always emit exactly one of:",
+            "<EVIDENCE_SUFFICIENCY>sufficient</EVIDENCE_SUFFICIENCY> \u2014 the evidence "
+            "states the answer outright.",
+            "<EVIDENCE_SUFFICIENCY>partial</EVIDENCE_SUFFICIENCY> \u2014 the evidence "
+            "supports the answer only by inference, or covers some required facts.",
+            "<EVIDENCE_SUFFICIENCY>absent</EVIDENCE_SUFFICIENCY> \u2014 the evidence is "
+            "unrelated and the answer is a guess.",
+            "This rating never changes what goes in <ANSWER>; it only describes the "
+            "support behind it, so rate honestly.",
             "",
             "CRITICAL: Your answer MUST be copied verbatim from the evidence/tool results \u2014 "
             "use the exact spelling, capitalization, and full form as it appears in the source text. "
@@ -10512,7 +10576,12 @@ class AgenticSearch(BaseSearch):
         The loop runs on its own SearchContext; its read files, retrieval
         logs, token usage, and loop count are copied back so downstream
         evidence / cost / provenance metrics read identically to the previous
-        pipeline.
+        pipeline. Scalar diagnostic fields the loop attached to its own
+        ``telemetry`` bag come across too, since only the DEEP context is
+        exported and a key left behind would read downstream as "mechanism
+        never fired". Collection-valued keys are left alone: both contexts
+        accumulate ``evidence_snippets``, and copying the loop's over the outer
+        one would drop the warm-start evidence the metrics depend on.
         """
         try:
             for fp in getattr(loop_ctx, "read_file_ids", set()) or set():
@@ -10526,6 +10595,12 @@ class AgenticSearch(BaseSearch):
                 context.add_llm_tokens(loop_tokens)
             for usage in getattr(loop_ctx, "llm_usages", []) or []:
                 context.llm_usages.append(usage)
+            loop_telemetry = getattr(loop_ctx, "telemetry", None)
+            if isinstance(loop_telemetry, dict):
+                self._record_context_telemetry(context, **{
+                    key: value for key, value in loop_telemetry.items()
+                    if not isinstance(value, (list, dict, set, tuple))
+                })
             self._record_context_telemetry(
                 context,
                 loop_iterations=getattr(loop_ctx, "loop_count", 0),

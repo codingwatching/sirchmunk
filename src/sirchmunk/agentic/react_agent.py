@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 # ---- Helpers ----
 
 _ANSWER_PATTERN = re.compile(r"<ANSWER>(.*?)</ANSWER>", re.DOTALL)
+_SUFFICIENCY_PATTERN = re.compile(
+    r"<EVIDENCE_SUFFICIENCY>\s*(sufficient|partial|absent)\s*</EVIDENCE_SUFFICIENCY>",
+    re.IGNORECASE,
+)
 
 # Patterns indicating JSON/code garbage in extracted answers
 _GARBAGE_PATTERNS = [
@@ -52,6 +56,34 @@ def _extract_answer(text: str) -> Optional[str]:
         if cleaned:
             return cleaned
     return raw
+
+
+def _extract_sufficiency(text: str) -> Optional[str]:
+    """Extract the agent's own rating of the evidence behind its answer.
+
+    Returned verbatim from the tag so the caller's answer policy can decide how
+    to present a weakly supported answer. Absent when the agent omitted the tag,
+    which the caller must treat as unknown rather than as any particular rating.
+    """
+    m = _SUFFICIENCY_PATTERN.search(text or "")
+    return m.group(1).strip().lower() if m else None
+
+
+def _record_sufficiency(context: SearchContext, content: str) -> None:
+    """Attach the evidence rating to ``context.telemetry`` when present.
+
+    ``telemetry`` is an ad-hoc bag the pipeline attaches on demand rather than a
+    declared field, so it is created here when missing; ``SearchContext.to_dict``
+    exports whatever it holds.
+    """
+    sufficiency = _extract_sufficiency(content)
+    if not sufficiency:
+        return
+    telemetry = getattr(context, "telemetry", None)
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+        setattr(context, "telemetry", telemetry)
+    telemetry["evidence_sufficiency"] = sufficiency
 
 
 def _is_garbage_content(text: str) -> bool:
@@ -326,6 +358,7 @@ class ReActSearchAgent:
             answer = _extract_answer(content)
             if answer:
                 final_answer = answer
+                _record_sufficiency(context, content)
                 await self._logger.success(f"[ReAct] Answer found at loop {context.loop_count}")
                 break
 
@@ -397,6 +430,7 @@ class ReActSearchAgent:
                 total_tok = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
             context.add_llm_tokens(total_tok, usage=usage if usage else None)
             final_answer = _extract_answer(content) or content
+            _record_sufficiency(context, content)
 
             # If the forced synthesis still produced garbage, strip and retry
             if final_answer and _is_garbage_content(final_answer):
