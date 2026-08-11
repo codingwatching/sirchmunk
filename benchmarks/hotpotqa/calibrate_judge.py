@@ -119,6 +119,7 @@ def analyse(runs_dir: Path, stage: str) -> Tuple[Dict[str, Any], List[Dict[str, 
                 continue
             gold = str(row.get("gold_answer") or "")
             pred = _short_prediction(row)
+            question = str(row.get("question") or "")
             if not gold or not pred:
                 continue
             said_equivalent = bool(verdict.get("equivalent"))
@@ -129,7 +130,7 @@ def analyse(runs_dir: Path, stage: str) -> Tuple[Dict[str, Any], List[Dict[str, 
                 if not said_equivalent:
                     review.append({
                         "slice": "false_negative", "system": name, "sample_id": sid,
-                        "gold": gold, "prediction": pred,
+                        "question": question, "gold": gold, "prediction": pred,
                         "judge_equivalent": said_equivalent,
                     })
             elif _lexically_disjoint(gold, pred):
@@ -138,7 +139,8 @@ def analyse(runs_dir: Path, stage: str) -> Tuple[Dict[str, Any], List[Dict[str, 
                 if said_equivalent:
                     review.append({
                         "slice": "disjoint_judge_said_equivalent", "system": name,
-                        "sample_id": sid, "gold": gold, "prediction": pred,
+                        "sample_id": sid, "question": question,
+                        "gold": gold, "prediction": pred,
                         "judge_equivalent": said_equivalent,
                         "form": answer_form_report(pred),
                         "note": "no lexical overlap; may still be a valid alias",
@@ -148,7 +150,7 @@ def analyse(runs_dir: Path, stage: str) -> Tuple[Dict[str, Any], List[Dict[str, 
                 boundary += 1
                 review.append({
                     "slice": "needs_human_label", "system": name, "sample_id": sid,
-                    "gold": gold, "prediction": pred,
+                    "question": question, "gold": gold, "prediction": pred,
                     "judge_equivalent": said_equivalent,
                     "form": answer_form_report(pred),
                     "human_label": None,
