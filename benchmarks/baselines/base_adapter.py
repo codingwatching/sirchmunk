@@ -201,8 +201,26 @@ class BaselineAdapter(ABC):
             return problems
 
         meta = prediction.metadata or {}
-        read_ids = meta.get("read_file_ids")
-        sources = meta.get("evidence_sources")
+        # Look in both places the evaluation harness itself reads from: adapters may
+        # report evidence at the metadata top level or nested under
+        # metadata["telemetry"], and _merge_prediction_telemetry accepts either.
+        # Checking only the top level would reject an adapter that reports
+        # correctly through the nested path.
+        nested = meta.get("telemetry") if isinstance(meta.get("telemetry"), dict) else {}
+
+        def _reported(key: str):
+            for source in (meta, nested):
+                if key in source:
+                    return source[key]
+            return None
+
+        read_ids = _reported("read_file_ids")
+        sources = _reported("evidence_sources")
+        declared_keys = any(
+            key in source
+            for key in ("read_file_ids", "evidence_sources")
+            for source in (meta, nested)
+        )
 
         if mode == "retrieval_free":
             if read_ids or sources:
@@ -214,7 +232,7 @@ class BaselineAdapter(ABC):
 
         # retrieval_based: the fields must be present, so that an empty result
         # means "retrieved nothing on this question" rather than "never wired up".
-        if read_ids is None and sources is None:
+        if not declared_keys:
             problems.append(
                 f"{self.name}: declared retrieval_based but reported neither "
                 "read_file_ids nor evidence_sources, so evidence metrics cannot "
