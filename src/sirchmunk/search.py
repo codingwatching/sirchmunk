@@ -205,6 +205,15 @@ _FORMAT_AGNOSTIC_RETRIEVAL: bool = os.getenv("LENS_FORMAT_AGNOSTIC_RETRIEVAL", "
 # original conservative defaults.
 _SEARCH_DEPTH_ENHANCEMENT: bool = os.getenv("LENS_SEARCH_DEPTH_ENHANCEMENT", "true").lower() == "true"
 
+# Phase 4.7: loop-path bridge re-search. The posterior-driven second-hop
+# mechanism (_bridge_research) was reachable only from the legacy split path
+# and never ran once the agentic loop became the default. When enabled, a
+# bridge question whose loop answer may rest on an unresolved first hop gets
+# one corpus-wide re-search for the bridging entity and a re-synthesis.
+# Off by default: it spends extra oracle calls on every bridge question, so a
+# consumer opts into that cost/quality trade explicitly.
+_LOOP_BRIDGE_RESEARCH: bool = os.getenv("LENS_LOOP_BRIDGE_RESEARCH", "false").lower() == "true"
+
 # Common English stop-words filtered out during keyword coverage computation.
 _STOP_WORDS: frozenset = frozenset({
     "the", "is", "a", "an", "of", "in", "for", "to", "and", "or",
@@ -2543,6 +2552,17 @@ class AgenticSearch(BaseSearch):
         # reasoning linking evidence to the question survives to the answer.
         # Legacy split path (flag off) retained for ablation.
         retrieval: Optional[RetrievalResult] = None
+        # Seed the mechanism markers before any path runs, so downstream
+        # telemetry always carries an explicit False and a mechanism that fires
+        # — in the loop's Phase 4.7 bridge re-search or the legacy split path
+        # — overwrites it. Seeding here rather than after the branch keeps the
+        # loop attribution intact: Phase 4.7 runs before the split-path block.
+        self._record_context_telemetry(
+            context,
+            self_correct_entered=False,
+            bridge_research_used=False,
+            forced_guess_used=False,
+        )
         if _AGENTIC_LOOP_MODE:
             with self._phase("phase4_loop"):
                 answer, should_save = await self._agentic_loop_search(
@@ -2558,6 +2578,16 @@ class AgenticSearch(BaseSearch):
                 hop_type=data_reqs.hop_type,
             )
             await self._logger.info("[Phase 4] Prior-warmed agentic loop complete")
+            # Phase 4.7 (loop path): posterior-driven bridge re-search. The
+            # dedicated second-hop mechanism was reachable only from the legacy
+            # split path; reconnect it here so a bridge question whose first hop
+            # resolved to the wrong entity can recover a second hop. Env-gated
+            # and scoped to bridge hop_type, so single-hop queries are untouched.
+            if _LOOP_BRIDGE_RESEARCH and data_reqs.hop_type == "bridge":
+                with self._phase("phase4_7_loop_bridge"):
+                    answer = await self._loop_bridge_recover(
+                        query, answer, data_reqs, context, paths,
+                    )
             # Phase 4.9 (loop path): answer resolution stack. Restores the
             # exit-side answer-evidence alignment the legacy split path ran
             # as Phases 4.6-4.8, against the evidence the loop actually read.
@@ -2594,16 +2624,6 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         # Phase 4.6: Self-correction (conditional; legacy split path only)
         # ==============================================================
-        # Seed the mechanism markers so downstream telemetry always carries an
-        # explicit False, letting analysis distinguish "mechanism did not fire"
-        # from "attribution key was dropped". The mechanisms below overwrite
-        # these with richer values when they actually run.
-        self._record_context_telemetry(
-            context,
-            self_correct_entered=False,
-            bridge_research_used=False,
-            forced_guess_used=False,
-        )
         sc_retrieval: Optional[RetrievalResult] = None
         if not _AGENTIC_LOOP_MODE and answer == _NO_RESULTS_MESSAGE:
             self._record_context_telemetry(context, self_correct_entered=True)
@@ -6280,6 +6300,68 @@ class AgenticSearch(BaseSearch):
             is_complete=bridge.is_complete or initial_retrieval.is_complete,
             rounds_used=initial_retrieval.rounds_used + bridge.rounds_used,
         )
+
+    async def _loop_bridge_recover(
+        self,
+        query: str,
+        answer: str,
+        data_reqs: "DataRequirements",
+        context: "SearchContext",
+        paths: Optional[List[str]],
+    ) -> str:
+        """Loop-path second hop: mine a bridge entity, re-search, re-synthesize.
+
+        The posterior-driven bridge re-search was built for the split path and
+        gated behind the disabled legacy flag, so the default loop never ran it,
+        which is a leading cause of confident wrong answers on bridge questions
+        whose first hop resolved to the wrong entity. This adapter feeds the
+        loop's own gathered evidence into the same mechanism and re-synthesizes
+        with the existing evidence synthesizer, so no new synthesis logic is
+        introduced. The re-searched answer is kept only when the second hop adds
+        evidence and yields a valid span; otherwise the loop's answer stands, so
+        the step can only add a recovered hop, never blank out a good answer.
+        """
+        if not paths:
+            return answer
+        evidence = self._loop_evidence_text(context)
+        if not evidence.strip():
+            return answer
+        seed = RetrievalResult(
+            evidence=evidence, pages_extracted={}, is_complete=False, rounds_used=0,
+        )
+        exclude = [str(fp) for fp in (getattr(context, "read_file_ids", set()) or set())]
+        try:
+            bridge_rr = await self._bridge_research(
+                query, data_reqs, seed, exclude, context, paths,
+            )
+        except Exception as exc:
+            await self._logger.warning(f"[Phase 4.7] loop bridge re-search failed: {exc}")
+            return answer
+        if bridge_rr is None or not (bridge_rr.evidence or "").strip():
+            return answer
+        candidate = await self._forced_guess_from_evidence(
+            query, bridge_rr.evidence, data_reqs, context,
+        )
+        if (
+            not candidate
+            or self._is_no_answer_value(candidate)
+            or self._is_reserved_answer_span(candidate)
+            or self._is_rescuable_refusal(candidate)
+        ):
+            return answer
+        before = self._extract_answer_span(answer) or ""
+        if candidate.strip() == before.strip():
+            return answer
+        self._record_context_telemetry(
+            context,
+            loop_bridge_recovered=True,
+            loop_bridge_before=before[:200],
+            loop_bridge_after=candidate[:200],
+        )
+        await self._logger.info(
+            f"[Phase 4.7] loop bridge recover: {before[:50]!r} -> {candidate[:50]!r}"
+        )
+        return self._replace_answer_span(answer, candidate)
 
     async def _deep_agentic_self_correct(
         self,
