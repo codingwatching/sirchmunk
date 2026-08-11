@@ -178,11 +178,21 @@ class BaselineAdapter(ABC):
         return await self.predict(question, context_paths)
 
     async def evaluate(self, prediction: str, gold_answer: str, question: str, judge: Any) -> Dict[str, Any]:
-        """Evaluate one prediction with the benchmark judge."""
+        """Evaluate one prediction with the benchmark judge.
+
+        ``judge_correct`` stays the primary boolean, but the surface-form-tolerant
+        match and the indeterminate flag are lifted to the top level too: both
+        need to be aggregated per system, and reaching into the nested judge
+        payload for them is easy to forget, which is how an unusable metric goes
+        unnoticed.
+        """
         jr = await judge.judge(prediction=prediction, gold_answer=gold_answer, question=question)
         cr = await judge.judge_coverage(prediction=prediction, question=question)
         return {
             "judge_correct": bool(jr.get("equivalent", False)),
+            "normalized_em": float(jr.get("normalized_em", 0.0) or 0.0),
+            "judge_indeterminate": bool(jr.get("indeterminate", False)),
+            "judge_status": str(jr.get("judge_status", "") or ""),
             "coverage": bool(cr.get("has_coverage", False)),
             "judge_tokens": int(jr.get("tokens_used", 0) or 0) + int(cr.get("tokens_used", 0) or 0),
             "judge_result": jr,

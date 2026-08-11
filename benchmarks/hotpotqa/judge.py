@@ -16,6 +16,117 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 _ARTICLES_RE = re.compile(r"\b(a|an|the)\b", flags=re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
+# Deterministic canonicalization (no LLM): surface forms that cannot change
+# which entity or quantity an answer refers to.
+#
+# Official HotpotQA normalization only lowercases, strips punctuation and drops
+# articles, so it scores "three" against "3" as a miss. Those misses are not
+# retrieval or reasoning failures, and counting them as such misdirects tuning.
+# What follows is deliberately narrow: every rule here is reference-preserving.
+#
+# Explicitly NOT handled, because these do change the referent and must be left
+# to a semantic judge: administrative or organizational levels ("Albany" vs
+# "Albany County", "BBC" vs "BBC Radio 1"), and brand versus category
+# ("Plymouth Gin" vs "gin").
+# ---------------------------------------------------------------------------
+
+_NUMBER_WORDS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
+    "fourteen": "14", "fifteen": "15", "sixteen": "16", "seventeen": "17",
+    "eighteen": "18", "nineteen": "19", "twenty": "20",
+}
+
+_ORDINAL_WORDS = {
+    "first": "1", "second": "2", "third": "3", "fourth": "4", "fifth": "5",
+    "sixth": "6", "seventh": "7", "eighth": "8", "ninth": "9", "tenth": "10",
+    "eleventh": "11", "twelfth": "12",
+}
+
+# Units and counted nouns. Dropped only when they trail a number, so that
+# "78.5 mi long" reduces to "78.5" while "Long Island" keeps both words.
+_MEASURE_WORDS = frozenset({
+    "mi", "mile", "miles", "km", "kilometre", "kilometres", "kilometer",
+    "kilometers", "m", "metre", "metres", "meter", "meters", "ft", "foot",
+    "feet", "long", "tall", "high", "wide", "deep",
+    "member", "members", "award", "awards", "year", "years", "time", "times",
+    "season", "seasons", "album", "albums", "episode", "episodes",
+    "employee", "employees", "vote", "votes", "people", "person",
+    "goal", "goals", "point", "points", "win", "wins", "day", "days",
+})
+
+# Legal-entity suffixes, dropped only from the tail of the answer.
+_CORPORATE_SUFFIXES = frozenset({
+    "inc", "incorporated", "ltd", "limited", "llc", "plc", "corp",
+    "corporation", "holdings", "holding", "co", "company", "group", "sa", "ag",
+})
+
+_NUMERIC_RE = re.compile(r"^\d+(?:[.,]\d+)?$")
+
+
+def _is_numeric_token(token: str) -> bool:
+    return bool(_NUMERIC_RE.match(token))
+
+
+def canonicalize_answer(text: str) -> str:
+    """Reduce reference-preserving surface variation on top of normalization.
+
+    Applied to gold and prediction alike, so it can only ever turn a pair that
+    means the same thing into a match; it never relaxes what an answer refers
+    to. See the rule commentary above for what is intentionally left alone.
+    """
+    base = normalize_answer(text)
+    if not base:
+        return ""
+    # "5th" -> "5": an ordinal suffix on a digit never changes the referent.
+    base = re.sub(r"\b(\d+)(?:st|nd|rd|th)\b", r"\1", base)
+    tokens = base.split()
+
+    # Ordinal words are unconditionally interchangeable with their digits
+    # ("Fifth Avenue" and "5th Avenue" name one street).
+    tokens = [_ORDINAL_WORDS.get(t, t) for t in tokens]
+
+    # Number words convert only as a lone answer or when a unit follows, so a
+    # name that happens to contain one ("One Direction") is left intact.
+    converted: list[str] = []
+    for idx, token in enumerate(tokens):
+        spelled = _NUMBER_WORDS.get(token)
+        if spelled is not None:
+            lone = len(tokens) == 1
+            unit_follows = idx + 1 < len(tokens) and tokens[idx + 1] in _MEASURE_WORDS
+            converted.append(spelled if (lone or unit_follows) else token)
+        else:
+            converted.append(token)
+
+    # Drop units/counted nouns that trail a number.
+    kept: list[str] = []
+    for token in converted:
+        if token in _MEASURE_WORDS and kept and _is_numeric_token(kept[-1]):
+            continue
+        kept.append(token)
+
+    # Drop legal-entity suffixes from the tail only, never mid-name.
+    while len(kept) > 1 and kept[-1] in _CORPORATE_SUFFIXES:
+        kept.pop()
+
+    return " ".join(kept)
+
+
+def normalized_exact_match_score(prediction: str, gold_answer: str) -> float:
+    """Exact match after deterministic canonicalization.
+
+    Reported alongside ``official_em`` rather than replacing it: the official
+    number stays comparable with published results, while this one measures the
+    same answers without penalising surface form.
+    """
+    pred = canonicalize_answer(prediction)
+    gold = canonicalize_answer(gold_answer)
+    return 1.0 if pred and gold and pred == gold else 0.0
+
+
 _REFUSAL_RE = re.compile(
     r"\b(i cannot|i can't|unable to|not able to|i don't know|unknown|"
     r"no results found|cannot determine|insufficient data|not found)\b",
@@ -74,6 +185,7 @@ class HotpotQAJudge:
         short_prediction = extract_short_answer(prediction)
         em = exact_match_score(short_prediction, gold_answer)
         f1 = f1_score(short_prediction, gold_answer)
+        normalized_em = normalized_exact_match_score(short_prediction, gold_answer)
 
         base = {
             "em": em,
@@ -82,12 +194,22 @@ class HotpotQAJudge:
             "official_f1": f1,
             "official_exact_match": em >= 1.0,
             "official_f1_correct": f1 >= self._equivalence_f1_threshold,
+            "normalized_em": normalized_em,
+            "normalized_exact_match": normalized_em >= 1.0,
+            "canonical_prediction": canonicalize_answer(short_prediction),
+            "canonical_gold": canonicalize_answer(gold_answer),
             "normalized_prediction": normalize_answer(short_prediction),
             "normalized_gold": normalize_answer(gold_answer),
             "short_prediction": short_prediction,
             "tokens_used": 0,
             "cached": False,
             "error": None,
+            # Whether the verdict is a real judgement. False for every decided
+            # outcome; True only when the judge could not reach one, so an
+            # infrastructure failure is never silently counted as a wrong
+            # answer by consumers that read ``equivalent`` alone.
+            "indeterminate": False,
+            "judge_status": "",
         }
 
         if _is_refusal(short_prediction):
@@ -98,6 +220,7 @@ class HotpotQAJudge:
                 "reasoning": "Prediction is a refusal or empty answer.",
                 "llm_judge_used": False,
                 "llm_equivalent": None,
+                "judge_status": "refusal",
             }
 
         if em >= 1.0:
@@ -108,6 +231,22 @@ class HotpotQAJudge:
                 "reasoning": "Normalized exact match.",
                 "llm_judge_used": False,
                 "llm_equivalent": None,
+                "judge_status": "official_exact",
+            }
+
+        if normalized_em >= 1.0:
+            # Same referent, different surface form ("three"/"3",
+            # "Tumi Holdings, Inc."/"Tumi"). Decided deterministically, so this
+            # holds even with the LLM judge disabled, where such pairs were
+            # previously scored as wrong answers.
+            return {
+                **base,
+                "equivalent": True,
+                "confidence": 1.0,
+                "reasoning": "Exact match after deterministic canonicalization.",
+                "llm_judge_used": False,
+                "llm_equivalent": None,
+                "judge_status": "canonical_exact",
             }
 
         if f1 >= self._equivalence_f1_threshold:
@@ -118,6 +257,7 @@ class HotpotQAJudge:
                 "reasoning": "Token F1 exceeds equivalence threshold.",
                 "llm_judge_used": False,
                 "llm_equivalent": None,
+                "judge_status": "lexical_f1",
             }
 
         should_call_llm = (
@@ -133,6 +273,7 @@ class HotpotQAJudge:
                 "reasoning": "Lexical metrics below equivalence threshold; LLM fallback not available or disabled.",
                 "llm_judge_used": False,
                 "llm_equivalent": None,
+                "judge_status": "lexical_only",
             }
 
         cache_key = (
@@ -159,6 +300,23 @@ class HotpotQAJudge:
             )
             tokens_used = _extract_tokens(resp)
             parsed = _parse_json_response(resp.content or "")
+            if not parsed.get("_parsed", False):
+                # The judge answered but not in the agreed shape, so there is no
+                # verdict to record. Guessing from loose keyword presence would
+                # manufacture a decision, and the old fallback confidence of 0.5
+                # silently became "wrong answer" under the confidence gate.
+                return {
+                    **base,
+                    "equivalent": False,
+                    "confidence": 0.0,
+                    "reasoning": "LLM judge response was not parseable as a verdict.",
+                    "tokens_used": tokens_used,
+                    "llm_judge_used": True,
+                    "llm_equivalent": None,
+                    "indeterminate": True,
+                    "judge_status": "indeterminate_unparseable",
+                    "error": "judge_response_unparseable",
+                }
             equivalent = bool(parsed.get("equivalent", False))
             confidence = _clamp_float(parsed.get("confidence", 0.0))
             reasoning = str(parsed.get("reasoning", ""))[:500]
@@ -176,12 +334,17 @@ class HotpotQAJudge:
                 "tokens_used": tokens_used,
                 "llm_judge_used": True,
                 "llm_equivalent": equivalent,
+                "judge_status": "llm_semantic",
             }
             self._cache[cache_key] = {
                 k: v for k, v in result.items() if k not in ("cached", "tokens_used")
             }
             return result
         except Exception as exc:
+            # A transport or provider failure says nothing about the answer.
+            # Recording it as a wrong answer would depress the metric exactly
+            # when the infrastructure is unhealthy, so it is surfaced as
+            # indeterminate for the caller to account for or fail on.
             logger.warning("HotpotQA LLM judge failed: %s", exc)
             return {
                 **base,
@@ -190,7 +353,9 @@ class HotpotQAJudge:
                 "reasoning": f"LLM judge failed: {exc}",
                 "tokens_used": tokens_used,
                 "llm_judge_used": True,
-                "llm_equivalent": False,
+                "llm_equivalent": None,
+                "indeterminate": True,
+                "judge_status": "indeterminate_error",
                 "error": str(exc),
             }
 
@@ -297,6 +462,12 @@ def _extract_tokens(resp: Any) -> int:
 
 
 def _parse_json_response(raw: str) -> Dict[str, Any]:
+    """Parse a judge verdict, reporting whether a real verdict was found.
+
+    ``_parsed`` lets the caller distinguish a parsed verdict from an
+    unparseable response. Inferring the answer from stray "true"/"false" text
+    used to turn malformed output into a confident-looking decision.
+    """
     cleaned = re.sub(r"```(?:json)?\s*", "", raw or "").strip().rstrip("`").strip()
     candidates = [cleaned]
     match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
@@ -305,15 +476,15 @@ def _parse_json_response(raw: str) -> Dict[str, Any]:
     for candidate in candidates:
         try:
             parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
+            if isinstance(parsed, dict) and "equivalent" in parsed:
+                return {**parsed, "_parsed": True}
         except (json.JSONDecodeError, TypeError, ValueError):
             continue
-    lower = cleaned.lower()
     return {
-        "equivalent": "true" in lower and "false" not in lower,
-        "confidence": 0.5,
+        "equivalent": False,
+        "confidence": 0.0,
         "reasoning": cleaned[:300],
+        "_parsed": False,
     }
 
 
