@@ -28,6 +28,7 @@ SYSTEMS = {
     "hybrid_rag": "baseline_hybrid_rag.jsonl",
     "react": "baseline_react.jsonl",
     "lens_full": "baseline_ablation_lens_full.jsonl",
+    "closed_book": "baseline_closed_book.jsonl",
 }
 
 

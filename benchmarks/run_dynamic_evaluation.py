@@ -772,7 +772,15 @@ async def _run_staleness_arm(
         frozen_order_checksum=compute_frozen_order_checksum(delta_ids),
     )
 
-    baselines = list(previous_baselines.values())
+    base_adapter = getattr(stage_adapter, "_base", stage_adapter)
+    from_stage_adapter = _StageAdapter(base_adapter, from_binding)
+    to_stage_adapter = _StageAdapter(base_adapter, to_binding)
+    candidate_baselines = [
+        _baseline_by_name(spec, from_stage_adapter, args)
+        for spec in str(args.baselines).split(",")
+        if spec.strip()
+    ]
+    baselines = [baseline for baseline in candidate_baselines if baseline.name in previous_baselines]
     stale_dir = Path(to_binding.output_dir) / "staleness"
     stale_dir.mkdir(parents=True, exist_ok=True)
 
@@ -796,14 +804,20 @@ async def _run_staleness_arm(
         for baseline in baselines:
             if not baseline.is_index_required():
                 continue
-            setup = await baseline.prepare(golden_set=prev_golden, bm_adapter=stage_adapter)
-            logger.info(
-                "[Staleness] rebuilt stale index for '%s' on %s: docs=%d",
-                baseline.name, from_binding.d_stage, setup.indexed_documents,
+            setup = await baseline.prepare(golden_set=prev_golden, bm_adapter=from_stage_adapter)
+            print(
+                f"[Staleness] rebuilt stale index for '{baseline.name}' on "
+                f"{from_binding.d_stage}: docs={setup.indexed_documents}",
+                file=sys.stderr,
             )
+    with _stage_environment(to_binding):
+        for baseline in baselines:
+            if baseline.is_index_required():
+                continue
+            await baseline.prepare(golden_set=delta_golden, bm_adapter=to_stage_adapter)
 
     suite = BaselineEvaluationSuite(
-        bm_adapter=stage_adapter,
+        bm_adapter=to_stage_adapter,
         baselines=baselines,
         output_dir=str(stale_dir),
         corpus_metadata={

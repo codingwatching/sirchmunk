@@ -605,6 +605,7 @@ def _parse_named_paths(specs: list[str]) -> dict[str, str]:
 def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None):
     from baselines import (
         BM25RAGBaseline,
+        ClosedBookBaseline,
         GraphRAGBaseline,
         HybridRAGBaseline,
         LightRAGV136Baseline,
@@ -631,6 +632,10 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None
         )
     if lower == "react":
         return ReActSearchBaseline()
+    if lower in ("closed_book", "closedbook", "no_retrieval"):
+        # Reference arm, not a competitor: it reads nothing, so its score is the
+        # part of the benchmark answerable from the model's parameters alone.
+        return ClosedBookBaseline()
     if lower == "naive_rag":
         return NaiveRAGBaseline(max_files=args.naive_rag_max_files)
     if lower == "lightrag_v1":
@@ -681,7 +686,7 @@ def _load_baseline_spec(raw_name: str, args: argparse.Namespace, bm_adapter=None
         return baseline
     raise ValueError(
         "Unknown baseline. Use bm25 and naive_rag for quickstart/local smoke; "
-        "bm25_rag, hybrid_rag, and react for paper main; "
+        "bm25_rag, hybrid_rag, and react for paper main; closed_book as the no-retrieval reference arm; "
         "related-work/lifecycle: lightrag_v136 or lightrag_v136_<mode>; "
         "imported: lightrag_v1, graphrag; "
         "ablation: lens_full, lens_no_prior, lens_no_seq, lens_no_reuse; custom: module:factory. "
