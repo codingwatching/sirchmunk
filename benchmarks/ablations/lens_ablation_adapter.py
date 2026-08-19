@@ -1,12 +1,15 @@
-"""ablations/lens_ablation_adapter.py — LENS 消融 BaselineAdapter
+"""ablations/lens_ablation_adapter.py — LENS ablation BaselineAdapter
 
-将 LENS full / ablation profile 包装为 BaselineAdapter，使其进入与 BM25-RAG、
-ReAct Search 相同的 BaselineEvaluationSuite / PaperTableGenerator 流程。
+Wraps LENS full / ablation profiles as BaselineAdapter instances so they run through
+the same BaselineEvaluationSuite / PaperTableGenerator pipeline as BM25-RAG and
+ReAct Search.
 
-关键原则：
-- 不修改 run_research_loop.py 的自改进循环。
-- 默认不修改 search.py；通过独立 AgenticSearch 实例 + 实例级 method patch 实现消融。
-- 每个 profile 使用独立 work_path: {bm_work_path}/ablations/{profile.name}/，避免缓存污染。
+Key principles:
+- The self-improvement loop in run_research_loop.py is left untouched.
+- search.py is not modified by default; ablations use a dedicated AgenticSearch
+  instance plus instance-level method patching.
+- Every profile uses an isolated work_path
+  {bm_work_path}/ablations/{profile.name}/ to avoid cache contamination.
 """
 from __future__ import annotations
 

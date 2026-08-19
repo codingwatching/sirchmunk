@@ -1,19 +1,23 @@
-"""baselines/sdk_baseline.py — SDK 通用包装 + 已发表结果导入
+"""baselines/sdk_baseline.py — generic SDK wrapper + published-result import
 
 SdkBaseline:
-    包装任意 Python SDK / 框架（不要求有 REST API）。
-    通过 predict_fn 回调注入竞品系统的调用逻辑，框架只负责调度和计时。
+    Wraps any Python SDK or framework; a REST API is not required.
+    The competitor call logic is injected through the predict_fn callback, while the
+    framework only handles scheduling and timing.
 
 ManualImportAdapter:
-    从预计算的 JSONL 文件导入竞品的预测结果。
-    两种使用场景：
-    a) 竞品提供了原始 predictions（需要用我们的 Judge 重新评分，保证 Judge 一致性）
-    b) 竞品只有发表的汇总数字（直接传入 metrics_dict 跳过 Judge）
+    Imports competitor predictions from a precomputed JSONL file.
+    Two scenarios:
+    a) the competitor provides raw predictions (re-scored with our judge to keep judging
+       consistent)
+    b) the competitor only has published aggregate numbers (pass metrics_dict to skip
+       judging)
 
-接入新竞品的最快路径：
-    1. 如果竞品有 Python 包，用 SdkBaseline 包装
-    2. 如果只有已发表数字，用 PaperTableGenerator.add_published_metrics() 直接写入表格
-    3. 如果有原始 predictions JSONL，用 ManualImportAdapter 加载后重新过 Judge
+Fastest path to onboard a new competitor:
+    1. If the competitor ships a Python package, wrap it with SdkBaseline
+    2. If only published numbers exist, write them straight into the table via
+       PaperTableGenerator.add_published_metrics()
+    3. If a raw predictions JSONL exists, load it with ManualImportAdapter and re-judge
 """
 from __future__ import annotations
 
@@ -27,33 +31,33 @@ from .base_adapter import BaselineAdapter, BaselinePrediction
 
 
 class SdkBaseline(BaselineAdapter):
-    """通用 Python SDK/框架竞品包装器。
+    """Generic wrapper for a Python SDK / framework competitor.
 
-    使用方法（以假想的 NaiveRAG 为例）::
+    Usage, with a hypothetical NaiveRAG::
 
-        # 1. 初始化竞品系统（只需实例化一次）
+        # 1. Initialize the competitor system (instantiate once)
         from some_rag_package import NaiveRAGSystem
         system = NaiveRAGSystem(
             model="gpt-4o-mini",
             top_k=5,
         )
 
-        # 2. 定义 predict_fn：接受 (system, question, context_paths) → str
+        # 2. Define predict_fn: accepts (system, question, context_paths) -> str
         def naive_rag_predict(sys, question, paths):
             return sys.retrieve_and_answer(question, document_paths=paths)
 
-        # 3. 包装为 SdkBaseline
+        # 3. Wrap it as an SdkBaseline
         baseline = SdkBaseline(
             name="naive_rag_v1",
             citation_name="Naive RAG (Gao et al., 2023)",
             system=system,
             predict_fn=naive_rag_predict,
-            is_async=False,      # 若 predict_fn 为 async 则设为 True
+            is_async=False,      # set True when predict_fn is async
             max_concurrent=2,
             metadata={"model": "gpt-4o-mini", "top_k": 5},
         )
 
-    若竞品的 predict 是异步的::
+    When the competitor predict is asynchronous::
 
         async def async_predict(sys, question, paths):
             return await sys.apredict(question, paths)
@@ -75,17 +79,17 @@ class SdkBaseline(BaselineAdapter):
     ) -> None:
         """
         Args:
-            name:           系统内部 ID，不含空格，用于文件命名。
-            citation_name:  论文表格展示名称。
-            system:         竞品系统实例（任意类型）。
-            predict_fn:     调用签名 (system, question: str, paths: List[str]) -> str
-                            若 is_async=True，则为 async callable。
-            is_async:       predict_fn 是否为协程函数。
-            max_concurrent: 最大并发请求数。
-            request_delay:  每次请求间延迟（秒）。
-            tokens_fn:      可选，提取 token 数量的函数
-                            签名: (system, question, result) -> int
-            metadata:       写入 BaselineResult.metadata 的系统元数据。
+            name:           internal system ID without spaces, used for file naming.
+            citation_name:  display name in paper tables.
+            system:         competitor system instance of any type.
+            predict_fn:     call signature (system, question: str, paths: List[str]) -> str;
+                            an async callable when is_async=True.
+            is_async:       whether predict_fn is a coroutine function.
+            max_concurrent: maximum concurrent requests.
+            request_delay:  delay between requests in seconds.
+            tokens_fn:      optional function extracting the token count, with signature
+                            (system, question, result) -> int
+            metadata:       system metadata written into BaselineResult.metadata.
         """
         self._name = name
         self._citation = citation_name
@@ -146,18 +150,20 @@ class SdkBaseline(BaselineAdapter):
 
 
 class ManualImportAdapter(BaselineAdapter):
-    """从预计算结果 JSONL 导入竞品预测，用我们的 Judge 重新评分。
+    """Import competitor predictions from a precomputed JSONL and re-score with our judge.
 
-    使用场景：竞品系统无 API / SDK，但已产出一份 JSONL 文件，每行含
-    {"sample_id": "...", "prediction": "...", "elapsed": 3.2}
+    Use case: the competitor system has no API or SDK but has produced a JSONL file where
+    each line holds {"sample_id": "...", "prediction": "...", "elapsed": 3.2}
 
-    这样可保证所有系统使用同一个 Judge 评分（论文公平性要求）。
+    This keeps every system scored by the same judge, which the paper fairness
+    requirement demands.
 
-    JSONL 格式（每行一条）::
+    JSONL format, one record per line::
 
         {"sample_id": "hotpotqa_id_001", "prediction": "Paris", "elapsed": 5.2}
 
-    注意：sample_id 必须与 GoldenSet 中的 sample_id 匹配，否则该样本被跳过。
+    Note: sample_id must match the sample_id in the GoldenSet, otherwise the sample is
+    skipped.
     """
 
     def __init__(
@@ -170,11 +176,12 @@ class ManualImportAdapter(BaselineAdapter):
     ) -> None:
         """
         Args:
-            name:              系统内部 ID。
-            citation_name:     论文表格展示名称。
-            predictions_path:  JSONL 文件路径，每行含 sample_id + prediction。
-            default_elapsed:   若 JSONL 中无 elapsed 字段，使用此默认值。
-            setup_metrics_path: 可选 setup metrics JSON，用于公平报告预处理/索引成本。
+            name:              internal system ID.
+            citation_name:     display name in paper tables.
+            predictions_path:  JSONL path where each line holds sample_id + prediction.
+            default_elapsed:   fallback used when the JSONL has no elapsed field.
+            setup_metrics_path: optional setup metrics JSON, used to report preprocessing
+                                and indexing cost fairly.
         """
         self._name = name
         self._citation = citation_name
@@ -218,8 +225,8 @@ class ManualImportAdapter(BaselineAdapter):
         return self._citation
 
     async def predict(self, question: str, context_paths: List[str]) -> BaselinePrediction:
-        # 通过 question 无法反查，此方法不使用
-        # 实际评估由 BaselineEvaluationSuite 调用 predict_by_id()
+        # Cannot be resolved from the question text, so this path is unused
+        # BaselineEvaluationSuite drives evaluation through predict_by_id()
         return BaselinePrediction(
             answer="",
             elapsed=self._default_elapsed,
@@ -232,10 +239,10 @@ class ManualImportAdapter(BaselineAdapter):
         )
 
     def predict_by_id(self, sample_id: str) -> Optional[BaselinePrediction]:
-        """通过 sample_id 查取预导入的预测结果。
+        """Look up a preloaded prediction by sample_id.
 
         Returns:
-            BaselinePrediction，若 sample_id 不存在则返回 None。
+            A BaselinePrediction, or None when the sample_id is unknown.
         """
         row = self._predictions.get(str(sample_id))
         if row is None:
@@ -254,7 +261,7 @@ class ManualImportAdapter(BaselineAdapter):
 
     @property
     def loaded_count(self) -> int:
-        """已成功加载的预测条数。"""
+        """Number of predictions successfully loaded."""
         return len(self._predictions)
 
     def requires_import_coverage(self) -> bool:
@@ -273,7 +280,7 @@ class ManualImportAdapter(BaselineAdapter):
         return dict(self._setup_metrics)
 
     def get_request_delay(self) -> float:
-        return 0.0   # 纯内存查询，无需延迟
+        return 0.0   # Pure in-memory lookup, no latency to report
 
 
 def _load_setup_metrics(path: str) -> Dict[str, Any]:

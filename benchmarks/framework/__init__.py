@@ -1,8 +1,10 @@
 """benchmarks/framework — Research Loop Framework
 
-统一 benchmark 接入 → 实验执行 → badcase 分析 → 改进建议 → 人工确认 → 循环迭代。
-支持单 benchmark （ResearchOrchestrator）和多 benchmark 联合优化（MultiAdapterOrchestrator）。
-快速导入示例::
+Unified flow: benchmark onboarding -> experiment execution -> badcase analysis ->
+improvement hypotheses -> manual confirmation -> iterate.
+Supports both a single benchmark (ResearchOrchestrator) and multi-benchmark joint
+optimization (MultiAdapterOrchestrator).
+Quick import example::
 
     from benchmarks.framework import (
         BenchmarkAdapter,
@@ -18,7 +20,7 @@
         StatisticalAnalyzer,
         load_benchmark_adapter,
         supported_benchmarks,
-        # 联合优化
+        # Joint optimization
         MultiAdapterOrchestrator,
         ParetoTracker,
         ShadowEvaluator,
@@ -200,7 +202,7 @@ __all__ = [
     "ProtocolValidator",
     "load_benchmark_adapter",
     "supported_benchmarks",
-    # Pareto 联合优化
+    # Pareto joint optimization
     "MultiDelta",
     "MultiMetricsPoint",
     "ParetoTracker",

@@ -1,21 +1,22 @@
 """evaluation/table_generator.py — PaperTableGenerator
 
-生成可直接放入论文的比较表格：
-  - LaTeX (tabular 环境，可直接粘贴)
-  - Markdown (可在 README/报告中预览)
-  - JSON (机器可读，供进一步处理)
+Produces comparison tables that can be dropped straight into a paper:
+  - LaTeX (tabular environment, ready to paste)
+  - Markdown (previewable in a README or report)
+  - JSON (machine readable for further processing)
 
-支持三种数据输入方式：
-  1. add_system_results(system_name, results)    ← BaselineResult 列表 / PredictionResult 列表
-  2. add_published_metrics(system_name, ...)     ← 只有发表数字（无需 Judge 重跑）
-  3. set_ours(system_name)                       ← 标记本文系统（加粗 + 星号）
+Three ways to feed data:
+  1. add_system_results(system_name, results)    <- list of BaselineResult / PredictionResult
+  2. add_published_metrics(system_name, ...)     <- published numbers only, no judging
+  3. set_ours(system_name)                       <- mark our system (bold + star)
 
-统计特性：
-  - 自动对每个系统计算 Bootstrap 95% CI
-  - 自动对每个 baseline 与 ours 运行 McNemar 检验（配对，需 correct 列表）
-  - Bonferroni 校正（k = baseline 数量）
-  - 显著性标记: *, **, *** 追加在 accuracy 后面
-  - 最优值自动加粗（LaTeX: \\textbf{...}）
+Statistical features:
+  - Bootstrap 95% CI computed automatically per system
+  - McNemar test run automatically for each baseline against ours (paired, needs the
+    correct list)
+  - Bonferroni correction (k = number of baselines)
+  - Significance markers *, **, *** appended after accuracy
+  - Best value bolded automatically (LaTeX: \\textbf{...})
 """
 from __future__ import annotations
 
@@ -41,8 +42,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SystemEntry:
-    """论文表格中一行系统的聚合指标。"""
-    system_name: str          # 表格展示名（citation_name）
+    """Aggregated metrics of one system row in the paper table."""
+    system_name: str          # Display name used in tables (citation_name)
     n: int = 0
     accuracy: float = 0.0
     official_em: float = 0.0
@@ -51,7 +52,7 @@ class SystemEntry:
     ci_lower: float = 0.0     # Bootstrap 95% CI lower
     ci_upper: float = 0.0     # Bootstrap 95% CI upper
     coverage: float = 0.0
-    avg_latency: float = 0.0  # 秒
+    avg_latency: float = 0.0  # Seconds
     avg_tokens: float = 0.0
     avg_oracle_calls: float = 0.0
     avg_llm_calls: float = 0.0
@@ -68,8 +69,8 @@ class SystemEntry:
     baseline_index_scope: str = ""
     by_question_type: Dict[str, Dict] = field(default_factory=dict)
     is_ours: bool = False
-    is_published_only: bool = False   # True = 只有发表数字，无 CI
-    correct_list: List[bool] = field(default_factory=list)  # 用于 McNemar
+    is_published_only: bool = False   # True = published number only, no confidence interval
+    correct_list: List[bool] = field(default_factory=list)  # Used by the McNemar test
     sample_ids: List[str] = field(default_factory=list)
     sample_id_checksum: str = ""
     setup_metrics: Dict[str, Any] = field(default_factory=dict)
@@ -89,39 +90,39 @@ class SystemEntry:
     sampling_manifest: Dict[str, Any] = field(default_factory=dict)
     strata_distribution: Dict[str, Any] = field(default_factory=dict)
     weighted_metric_available: bool = False
-    # 显著性（由 finalize() 填入）
+    # Significance, populated by finalize()
     p_value: Optional[float] = None
     is_significant: bool = False
     sig_marker: str = ""
 
 
 class PaperTableGenerator:
-    """论文比较表格生成器。
+    """Paper comparison table generator.
 
     Usage::
 
         gen = PaperTableGenerator(benchmark_name="FinanceBench", our_system_name="LENS")
 
-        # 添加本文系统（从 Sirchmunk 的 results.jsonl 加载）
+        # Add our system, loaded from the Sirchmunk results.jsonl
         gen.add_system_results(
             system_name="LENS (ours)",
-            results=sirchmunk_results,   # List[PredictionResult 兼容]
+            results=sirchmunk_results,   # List[PredictionResult-compatible]
             is_ours=True,
         )
 
-        # 添加已运行的竞品（BaselineResult 列表）
+        # Add an already-run competitor (list of BaselineResult)
         gen.add_system_results(
             system_name="GPT-4o (zero-shot)",
             results=gpt4o_results,        # List[BaselineResult]
         )
 
-        # 添加只有发表数字的竞品（无需重跑）
+        # Add a competitor that only has published numbers (no re-run needed)
         gen.add_published_metrics(
             system_name="Mafin 2.5",
             accuracy=98.7, coverage=100.0, avg_latency=0, citation="Gao et al., 2024"
         )
 
-        # 生成表格
+        # Generate the tables
         paths = gen.generate(output_dir="output/paper_table/")
         # paths: {"latex": ..., "markdown": ..., "json": ...}
     """
@@ -141,23 +142,24 @@ class PaperTableGenerator:
         self._sampling_metadata = dict(sampling_metadata or {})
 
     # ------------------------------------------------------------------
-    # 数据输入接口
+    # Data input interface
     # ------------------------------------------------------------------
 
     def add_system_results(
         self,
         system_name: str,
-        results: List[Any],             # BaselineResult 或 PredictionResult（鸭子类型）
+        results: List[Any],             # BaselineResult or PredictionResult (duck typed)
         is_ours: bool = False,
         question_type_key: str = "question_type",
     ) -> None:
-        """从结果列表添加一个系统。
+        """Add one system from a list of results.
 
         Args:
-            system_name:       论文表格中的展示名称。
-            results:           BaselineResult 或 PredictionResult 列表（duck typing）。
-            is_ours:           是否为本文系统（用于加粗和显著性检验基准）。
-            question_type_key: 从 metadata 中取 question_type 的 key（for breakdown）。
+            system_name:       display name in the paper table.
+            results:           list of BaselineResult or PredictionResult (duck typing).
+            is_ours:           whether this is our system, used for bolding and as the
+                               significance-test reference.
+            question_type_key: metadata key holding question_type (for the breakdown).
         """
         if not results:
             logger.warning("[TableGen] '%s': empty results, skipping.", system_name)
@@ -298,16 +300,16 @@ class PaperTableGenerator:
         n: int = 150,
         citation: str = "",
     ) -> None:
-        """直接添加已发表数字（无法计算 CI 和 McNemar）。
+        """Add published numbers directly; CI and McNemar cannot be computed.
 
         Args:
-            system_name:  论文表格中的展示名。
-            accuracy:     精度（百分比，如 98.7 表示 98.7%）。
-            coverage:     覆盖率。
-            avg_latency:  平均延迟（秒）。
-            avg_tokens:   平均 token 数。
-            n:            评估样本数。
-            citation:     引用（可选）。
+            system_name:  display name in the paper table.
+            accuracy:     accuracy as a percentage, e.g. 98.7 means 98.7%.
+            coverage:     coverage rate.
+            avg_latency:  average latency in seconds.
+            avg_tokens:   average token count.
+            n:            number of evaluated samples.
+            citation:     optional citation.
         """
         display = system_name
         if citation:
@@ -327,7 +329,7 @@ class PaperTableGenerator:
         self._entries.append(entry)
 
     # ------------------------------------------------------------------
-    # 生成表格
+    # Table generation
     # ------------------------------------------------------------------
 
     def generate(
@@ -339,15 +341,15 @@ class PaperTableGenerator:
         include_tokens: bool = True,
         include_breakdown: bool = True,
     ) -> Dict[str, str]:
-        """生成 LaTeX + Markdown + JSON 表格。
+        """Generate the LaTeX + Markdown + JSON tables.
 
         Args:
-            output_dir:        输出目录。
-            caption:           LaTeX 表格标题（为空时自动生成）。
-            label:             LaTeX \\label{...} 标识符。
-            include_latency:   是否包含延迟列。
-            include_tokens:    是否包含 token 列。
-            include_breakdown: 是否包含分题型列。
+            output_dir:        output directory.
+            caption:           LaTeX table caption; generated automatically when empty.
+            label:             LaTeX \\label{...} identifier.
+            include_latency:   whether to include the latency column.
+            include_tokens:    whether to include the token column.
+            include_breakdown: whether to include per-question-type columns.
 
         Returns:
             {"latex": path, "markdown": path, "json": path}
@@ -397,11 +399,11 @@ class PaperTableGenerator:
         return {"latex": latex_path, "markdown": md_path, "json": json_path}
 
     # ------------------------------------------------------------------
-    # 统计计算
+    # Statistical computation
     # ------------------------------------------------------------------
 
     def _finalize_statistics(self) -> None:
-        """计算 McNemar 检验 + Bonferroni 校正，写入各 entry。"""
+        """Run the McNemar test plus Bonferroni correction and write results into entries."""
         ours = next((e for e in self._entries if e.is_ours), None)
         baselines = [e for e in self._entries if not e.is_ours]
 
@@ -419,7 +421,7 @@ class PaperTableGenerator:
                 p_values.append(1.0)
                 baseline_with_data.append(b)
 
-        # Bonferroni 校正
+        # Bonferroni correction
         corrected = bonferroni_correction(p_values)
         for b, p, sig in zip(baseline_with_data, p_values, corrected):
             b.p_value = p
@@ -427,7 +429,7 @@ class PaperTableGenerator:
             b.sig_marker = significance_marker(p) if sig else ""
 
     # ------------------------------------------------------------------
-    # LaTeX 输出
+    # LaTeX output
     # ------------------------------------------------------------------
 
     def _to_latex(
@@ -437,11 +439,11 @@ class PaperTableGenerator:
         if not entries:
             return "% No entries\n"
 
-        # 找出各列最优值（用于加粗）
+        # Locate the best value per column (used for bolding)
         best_acc = max(e.accuracy for e in entries)
         best_cov = max(e.coverage for e in entries)
 
-        # 列定义
+        # Column definitions
         include_setup = any(e.setup_metrics for e in entries)
         include_import = any(e.imported_baseline for e in entries)
         include_failures = any(e.failure_counts for e in entries)
@@ -494,7 +496,7 @@ class PaperTableGenerator:
             "\\hline",
         ]
 
-        # 先写非 ours，再写 ours（中间加分隔线）
+        # Emit non-ours rows first, then ours rows, separated by a rule
         non_ours = [e for e in entries if not e.is_ours]
         ours_entries = [e for e in entries if e.is_ours]
 
@@ -554,14 +556,14 @@ class PaperTableGenerator:
             "\\end{table}",
         ]
 
-        # 分题型子表（可选）
+        # Optional per-question-type sub-table
         if include_breakdown:
             lines += self._breakdown_latex(entries)
 
         return "\n".join(lines) + "\n"
 
     def _breakdown_latex(self, entries: List[SystemEntry]) -> List[str]:
-        """生成按 question_type 分类的子表格。"""
+        """Generate the sub-table grouped by question_type."""
         all_qts = sorted(
             {qt for e in entries for qt in e.by_question_type}
         )
@@ -590,7 +592,7 @@ class PaperTableGenerator:
         return lines
 
     # ------------------------------------------------------------------
-    # Markdown 输出
+    # Markdown output
     # ------------------------------------------------------------------
 
     def _to_markdown(
@@ -655,7 +657,7 @@ class PaperTableGenerator:
 
         footer = "\n_* p<0.05, ** p<0.01, *** p<0.001 (McNemar + Bonferroni correction)_\n"
 
-        # 分题型子表
+        # Per-question-type sub-table
         breakdown_md = ""
         if include_breakdown:
             all_qts = sorted({qt for e in entries for qt in e.by_question_type})
@@ -677,7 +679,7 @@ class PaperTableGenerator:
         return "\n".join(rows) + "\n" + footer + corpus_warning + breakdown_md
 
     # ------------------------------------------------------------------
-    # JSON 输出
+    # JSON output
     # ------------------------------------------------------------------
 
     def _to_json(self) -> str:

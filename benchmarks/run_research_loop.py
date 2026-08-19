@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
-"""benchmarks/run_research_loop.py — Research Loop CLI 入口
+"""benchmarks/run_research_loop.py — Research Loop CLI entry point
 
-用法示例::
+Usage examples::
 
-    # 单 benchmark 循环（采样 50 题，最多 5 次迭代）
+    # Single-benchmark loop (50 sampled questions, at most 5 iterations)
     python benchmarks/run_research_loop.py \\
       --benchmark hotpotqa \\
       --env benchmarks/hotpotqa/.env.hotpotqa.exploration \\
       --limit 50 --max-iter 5
 
-    # 多 benchmark 联合优化（Pareto Gate / exploration only）
+    # Multi-benchmark joint optimization (Pareto gate / exploration only)
     python benchmarks/run_research_loop.py \\
       --multi \\
       --add-bm hotpotqa=benchmarks/hotpotqa/.env.hotpotqa.exploration \\
       --add-bm setup_cost=benchmarks/setup_cost/.env.setup_cost \\
       --limit 30 --shadow-fraction 0.10
 
-    # P0机制性实验
+    # P0 mechanism experiment
     python benchmarks/run_research_loop.py \\
       --benchmark setup_cost \\
       --env benchmarks/setup_cost/.env.setup_cost \\
       --limit 1 --max-iter 1
 
-    # 演练模式（不实际写 .env 文件）
+    # Dry-run mode (no .env file is written)
     python benchmarks/run_research_loop.py \\
       --benchmark hotpotqa \\
       --env benchmarks/hotpotqa/.env.hotpotqa.exploration \\
@@ -36,7 +36,7 @@ import logging
 import sys
 from pathlib import Path
 
-# ── sys.path 注入：确保从任何目录执行均能找到 framework 和各 benchmark ──
+# ── sys.path injection so framework and benchmarks resolve from any CWD ──
 _SCRIPT_DIR = Path(__file__).parent.resolve()   # benchmarks/
 _PROJECT_ROOT = _SCRIPT_DIR.parent              # sirchmunk/
 _SRC = _PROJECT_ROOT / "src"
@@ -69,7 +69,7 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    # 单/多 benchmark 选择
+    # Single- or multi-benchmark selection
     mode_group = parser.add_mutually_exclusive_group(required=True)
     mode_group.add_argument(
         "--benchmark", "-b",
@@ -81,13 +81,13 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="多 benchmark 联合优化模式（配合 --add-bm 使用）",
     )
-    # 单 benchmark 専属
+    # Single-benchmark only
     parser.add_argument(
         "--env", "-e",
         default=None,
         help=".env 配置文件路径（--benchmark 模式专用）",
     )
-    # 多 benchmark 尓属
+    # Multi-benchmark only
     parser.add_argument(
         "--add-bm",
         action="append",
@@ -98,7 +98,7 @@ def _parse_args() -> argparse.Namespace:
             "格式: hotpotqa=benchmarks/hotpotqa/.env.hotpotqa"
         ),
     )
-    # 公共参数
+    # Shared arguments
     parser.add_argument(
         "--limit", "-l",
         type=int, default=None,
@@ -168,7 +168,7 @@ def _setup_logging(level: str) -> None:
         format="%(asctime)s  %(name)-30s  %(levelname)-7s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    # 抑制过于噪杂的第三方日志
+    # Silence overly noisy third-party loggers
     for noisy in ("httpx", "httpcore", "openai", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -188,7 +188,7 @@ async def _main() -> int:
 
     logger = logging.getLogger("run_research_loop")
 
-    # ── 多 benchmark 模式 ──────────────────────────────────────────
+    # ── Multi-benchmark mode ────────────────────────────────────
     if args.multi:
         if not args.add_bm:
             logger.error("多模式需要指定至少两个 --add-bm，如: --add-bm hotpotqa=...")
@@ -242,7 +242,7 @@ async def _main() -> int:
             return 1
         return 0
 
-    # ── 单 benchmark 模式（就有逻辑）────────────────────────
+    # ── Single-benchmark mode (existing logic) ─────
     if not args.env:
         logger.error("单模式需要指定 --env 参数")
         return 1

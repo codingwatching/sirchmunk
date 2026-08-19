@@ -1,14 +1,15 @@
-"""ablations/matrix.py — LENS 核心消融矩阵
+"""ablations/matrix.py — core LENS ablation matrix
 
-动态raw-corpus主消融只保留两项核心机制消融，避免细碎工程消融：
+The dynamic raw-corpus main ablation keeps only the two core mechanism ablations
+and avoids fine-grained engineering ablations:
   - w/o Multi-signal Prior
   - w/o Sequential Exploration
 
-`w/o Knowledge Reuse` 作为 appendix-only profile 仍可通过
-build_single_lens_ablation(..., "lens_no_reuse") 单独构建。
+`w/o Knowledge Reuse` remains an appendix-only profile and can still be built via
+build_single_lens_ablation(..., "lens_no_reuse").
 
-本模块提供 factory，把这些 profile 转换为 BaselineAdapter 列表，直接交给
-BaselineEvaluationSuite 运行。
+This module exposes factories that turn those profiles into BaselineAdapter lists
+ready to be handed to BaselineEvaluationSuite.
 """
 from __future__ import annotations
 

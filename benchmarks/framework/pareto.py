@@ -1,18 +1,18 @@
 """framework/pareto.py — ParetoTracker
 
-多 benchmark 联合优化的 Pareto 追踪器。
+Pareto tracker for multi-benchmark joint optimization.
 
-核心概念：
+Core concepts:
   metrics_vector = {benchmark_name: {accuracy, coverage, avg_latency}}
-  A 支配 B（A dominates B）:= A 在所有 benchmark 的 accuracy 上均 >= B，
-                              且至少在一个 benchmark 上 > B。
+  A dominates B := A has accuracy >= B on every benchmark and > B on at least one.
 
-持久化：multi_experiments.jsonl（与单 benchmark 的 experiments.jsonl 分开）
+Persistence: multi_experiments.jsonl, kept separate from the single-benchmark
+experiments.jsonl
 
-使用场景：
-  - MultiAdapterOrchestrator 记录每次联合实验的指标向量
-  - 在提交任何 Layer 0/1 变更前，检查是否 Pareto dominant
-  - 追踪 Pareto frontier 是否停止扩张（收敛判断）
+Use cases:
+  - MultiAdapterOrchestrator records the metric vector of every joint experiment
+  - Check Pareto dominance before committing any Layer 0/1 change
+  - Track whether the Pareto frontier stopped expanding (convergence signal)
 """
 from __future__ import annotations
 
@@ -26,25 +26,25 @@ from .time_utils import now_local_iso
 
 logger = logging.getLogger(__name__)
 
-# accuracy 降幅超过此值（百分点）视为回退
+# An accuracy drop beyond this value (percentage points) counts as a regression
 _REGRESSION_THRESHOLD = 2.0
 
 
 @dataclass
 class MultiMetricsPoint:
-    """一次联合实验的多维度指标快照。"""
+    """Multi-dimensional metric snapshot of one joint experiment."""
     run_id: str
     timestamp: str                                    # ISO 8601
     git_commit: str
-    config_hash: str                                  # 全局 config hash
+    config_hash: str                                  # Global config hash
     metrics_vector: Dict[str, Dict[str, float]]       # {bm: {accuracy, coverage, avg_latency}}
-    is_pareto_optimal: bool = True                    # 是否在当前 Pareto frontier 上
+    is_pareto_optimal: bool = True                    # Whether the point lies on the current Pareto frontier
     notes: str = ""
 
 
 @dataclass
 class MultiDelta:
-    """两次联合实验之间的差异。"""
+    """Difference between two joint experiments."""
     run_id_a: str
     run_id_b: str
     # {bm_name: {accuracy_delta, coverage_delta, latency_delta}}
@@ -71,7 +71,7 @@ class MultiDelta:
 
 
 class ParetoTracker:
-    """联合实验的 Pareto 追踪器。
+    """Pareto tracker for joint experiments.
 
     Usage::
 
@@ -98,9 +98,10 @@ class ParetoTracker:
         config_hash: str = "unknown",
         notes: str = "",
     ) -> MultiMetricsPoint:
-        """记录一次联合实验，自动计算 Pareto 最优性并标记回退。
+        """Record one joint experiment, computing Pareto optimality and flagging regressions.
 
-        先追加，再重算全局 Pareto 排名（O(N²) 但 N 通常很小）。
+        Appends first, then recomputes the global Pareto ranking (O(N^2), but N is usually
+        small).
         """
         point = MultiMetricsPoint(
             run_id=run_id,
@@ -114,7 +115,7 @@ class ParetoTracker:
         self._append(point)
         self._recompute_pareto_flags()
 
-        # 回退检测：与前一条记录比较
+        # Regression detection against the previous record
         history = self._load_all()
         if len(history) >= 2:
             prev = history[-2]
@@ -130,7 +131,7 @@ class ParetoTracker:
         return point
 
     def compare_runs(self, run_id_a: str, run_id_b: str) -> Optional[MultiDelta]:
-        """比较两次联合实验，返回 per-benchmark delta 和 Pareto 状态。"""
+        """Compare two joint experiments and return per-benchmark deltas plus Pareto status."""
         all_pts = {p.run_id: p for p in self._load_all()}
         a, b = all_pts.get(run_id_a), all_pts.get(run_id_b)
         if not a or not b:
@@ -149,7 +150,7 @@ class ParetoTracker:
                 "latency_delta":   vb.get("avg_latency", 0) - va.get("avg_latency", 0),
             }
 
-        # Pareto 状态分类
+        # Pareto status classification
         acc_deltas = [v["accuracy_delta"] for v in per_bm.values()]
         if all(d >= 0 for d in acc_deltas) and any(d > 0 for d in acc_deltas):
             status = "dominant"
@@ -168,19 +169,20 @@ class ParetoTracker:
         )
 
     def latest_n(self, n: int = 5) -> List[MultiMetricsPoint]:
-        """返回最近 N 条联合实验记录。"""
+        """Return the last N joint experiment records."""
         return self._load_all()[-n:]
 
     def pareto_frontier(self) -> List[MultiMetricsPoint]:
-        """返回当前 Pareto 最优点集合。"""
+        """Return the current set of Pareto-optimal points."""
         return [p for p in self._load_all() if p.is_pareto_optimal]
 
     def convergence_check(
         self, window: int = 3, threshold: float = 1.0
     ) -> Tuple[bool, str]:
-        """检查最近 window 次联合实验中 Pareto frontier 是否停止扩张。
+        """Check whether the Pareto frontier stopped expanding over the last `window` runs.
 
-        判断依据：连续 window 次，每次 avg accuracy delta（跨所有 benchmark）< threshold。
+        Criterion: for `window` consecutive runs, the average accuracy delta across all
+        benchmarks stays below threshold.
         """
         history = self._load_all()
         if len(history) < window + 1:
@@ -208,13 +210,13 @@ class ParetoTracker:
         return False, f"Not converged: recent avg deltas = {[f'{d:.2f}%' for d in deltas]}"
 
     def print_history(self, n: int = 8) -> None:
-        """打印联合实验历史表格。"""
+        """Print the joint experiment history table."""
         points = self.latest_n(n)
         if not points:
             print("  (no multi-benchmark experiments recorded yet)")
             return
 
-        # 收集所有 benchmark 名称
+        # Collect every benchmark name
         all_bms = sorted({bm for p in points for bm in p.metrics_vector})
         header_bms = "  ".join(f"{bm[:12]:>12}" for bm in all_bms)
         print(f"\n{'Run ID':<35}  {header_bms}  {'Pareto':>6}")
@@ -300,12 +302,12 @@ class ParetoTracker:
         return points
 
     def _recompute_pareto_flags(self) -> None:
-        """重计算所有已记录点的 Pareto 最优性，并更新文件。"""
+        """Recompute Pareto optimality for every recorded point and update the file."""
         points = self._load_all()
         if not points:
             return
 
-        # 使用 accuracy 作为主要优化维度
+        # Use accuracy as the primary optimization dimension
         dominated = set()
         for i, a in enumerate(points):
             for j, b in enumerate(points):
@@ -316,7 +318,7 @@ class ParetoTracker:
         for i, p in enumerate(points):
             p.is_pareto_optimal = (i not in dominated)
 
-        # 覆写文件
+        # Overwrite the file
         with open(self._path, "w", encoding="utf-8") as f:
             for p in points:
                 row = {

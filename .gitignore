@@ -293,3 +293,5 @@ benchmarks/*/data/
 benchmarks/*/.env*
 !benchmarks/**/*.example
 benchmarks/**/.env*.example
+# Keep the Layer 0 template referenced by benchmarks/README.md quick start.
+!benchmarks/.env.global.example

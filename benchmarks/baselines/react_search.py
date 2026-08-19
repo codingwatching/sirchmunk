@@ -1,11 +1,13 @@
 """baselines/react_search.py — ReAct Search baseline
 
-论文主表 baseline：普通 ReAct tool-use search。
+Main-table paper baseline: a plain ReAct tool-use search loop.
 
-边界定义：
-- 使用 LLM + ToolRegistry + keyword_search / file_read / dir_scan。
-- 默认不启用 knowledge_query，不启用 tree_navigate，避免吃到 LENS 的缓存/树索引资产。
-- 不调用 AgenticSearch.search(mode="DEEP")，避免混入 LENS 的多信号先验、数据需求分解、self-correction、persistence。
+Scope:
+- Uses LLM + ToolRegistry + keyword_search / file_read / dir_scan.
+- knowledge_query and tree_navigate stay disabled so the baseline cannot consume
+  LENS cache or tree-index assets.
+- Never calls AgenticSearch.search(mode="DEEP"), so LENS multi-signal priors,
+  requirement decomposition, self-correction and persistence stay out of scope.
 """
 from __future__ import annotations
 

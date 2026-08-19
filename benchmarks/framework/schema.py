@@ -1,7 +1,8 @@
-"""framework/schema.py — 通用数据契约
+"""framework/schema.py — shared data contracts
 
-跨 benchmark 通用数据结构，不依赖任何具体 benchmark 实现。
-所有字段均为显式类型标注，以便静态检查和文档自动生成。
+Cross-benchmark data structures that do not depend on any concrete benchmark
+implementation. Every field carries an explicit type annotation so static checking and
+documentation generation both work.
 """
 from __future__ import annotations
 
@@ -11,17 +12,17 @@ from typing import Any, Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
-# 变更类型枚举
+# Change-type enumeration
 # ---------------------------------------------------------------------------
 
 
 class ChangeType(str, Enum):
-    """改进建议的变更类型。
+    """Change type of an improvement hypothesis.
 
-    CONFIG_CHANGE  — 仅修改 .env 变量，框架可自动执行
-    PROMPT_FIX     — 修改 prompts.py 等 prompt 模板，需人工/Qoder 执行
-    PIPELINE_PATCH — 修改核心检索逻辑（src/），需人工/Qoder 执行
-    SKIP           — 跳过本轮改动，继续下一次迭代
+    CONFIG_CHANGE  — only .env variables change; the framework can apply it automatically
+    PROMPT_FIX     — change a prompt template such as prompts.py; needs a human/Qoder
+    PIPELINE_PATCH — change core retrieval logic under src/; needs a human/Qoder
+    SKIP           — skip this round and continue with the next iteration
     """
     CONFIG_CHANGE = "config_change"
     PROMPT_FIX = "prompt_fix"
@@ -30,19 +31,20 @@ class ChangeType(str, Enum):
 
 
 class ConfigLayer(int, Enum):
-    """Config 三层隔离层级。
+    """Three-layer config isolation.
 
-    GLOBAL   (0) — Layer 0: 全局变更，影响所有 benchmark。
-                    包括: src/sirchmunk/ 代码修改、共享 prompt、
-                    全局 env（LLM_MODEL_NAME 等）。
-                    接受条件: 所有 benchmark 均不出现 Pareto 退化。
+    GLOBAL   (0) — Layer 0: global change affecting every benchmark.
+                    Covers src/sirchmunk/ code changes, shared prompts and global env
+                    values such as LLM_MODEL_NAME.
+                    Acceptance: no benchmark may show a Pareto regression.
 
-    FAMILY   (1) — Layer 1: 家族变更，影响同类 benchmark。
-                    预留用于未来扩展，当前尚未启用。
+    FAMILY   (1) — Layer 1: family change affecting benchmarks of the same kind.
+                    Reserved for future extension, not enabled yet.
 
-    SPECIFIC (2) — Layer 2: benchmark 专属变更，仅影响本 benchmark。
-                    包括: HOTPOT_TOP_K_FILES、HOTPOT_MODE 等专属配置。
-                    接受条件: 本 benchmark 指标提升即可，无需联合评估。
+    SPECIFIC (2) — Layer 2: benchmark-specific change affecting this benchmark only.
+                    Covers dedicated config such as HOTPOT_TOP_K_FILES or HOTPOT_MODE.
+                    Acceptance: an improvement on this benchmark is enough, no joint
+                    evaluation required.
     """
     GLOBAL   = 0
     FAMILY   = 1
@@ -50,12 +52,12 @@ class ConfigLayer(int, Enum):
 
 
 class RootCause(str, Enum):
-    """根因分类。"""
-    RETRIEVAL_FAILURE = "retrieval_failure"   # 没有找到相关文件/段落
-    EVIDENCE_PARTIAL  = "evidence_partial"    # 找到部分证据但不完整
-    SYNTHESIS_ERROR   = "synthesis_error"     # 推理/计算错误
-    JUDGE_SUSPECT     = "judge_suspect"       # Judge 可能误判（false negative）
-    DATA_QUALITY      = "data_quality"        # 问题或金标准本身有疑问
+    """Root-cause classification."""
+    RETRIEVAL_FAILURE = "retrieval_failure"   # No relevant file or passage was found
+    EVIDENCE_PARTIAL  = "evidence_partial"    # Partial evidence was found but it is incomplete
+    SYNTHESIS_ERROR   = "synthesis_error"     # Reasoning or computation error
+    JUDGE_SUSPECT     = "judge_suspect"       # The judge may have mis-scored it (false negative)
+    DATA_QUALITY      = "data_quality"        # The question or the gold answer itself is questionable
     UNKNOWN           = "unknown"
 
 
@@ -66,13 +68,13 @@ class ImpactLevel(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# 核心数据结构
+# Core data structures
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class BenchmarkSample:
-    """通用 QA 样本，跨 benchmark 共享。"""
+    """Generic QA sample shared across benchmarks."""
     sample_id: str
     question: str
     gold_answer: str
@@ -82,57 +84,57 @@ class BenchmarkSample:
 
 @dataclass
 class PredictionResult:
-    """单样本执行结果。"""
+    """Execution result of a single sample."""
     sample_id: str
     prediction: str
     judge_correct: bool
     coverage: bool
-    elapsed: float                          # 秒
+    elapsed: float                          # Seconds
     telemetry: Dict[str, Any] = field(default_factory=dict)
     """telemetry 含 total_tokens / loop_count / num_files_read 等。"""
     error: Optional[str] = None
-    # 保留原始 benchmark 特有字段供 BadCaseAnalyzer 使用
+    # Keep benchmark-specific raw fields for BadCaseAnalyzer
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class BadCase:
-    """单个失败样本的分类结果。"""
+    """Classification result of a single failing sample."""
     sample_id: str
     question: str
     gold_answer: str
     prediction: str
     failure_type: str               # refusal / wrong_value / no_coverage / partial_answer
     root_cause: RootCause
-    evidence: str = ""              # 支持该根因判断的关键信号，简短描述
+    evidence: str = ""              # Short description of the signals supporting this root cause
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class BadCaseReport:
-    """坏案例分析报告。"""
+    """Badcase analysis report."""
     total_samples: int
     total_badcases: int
     accuracy: float
     coverage: float
     badcases: List[BadCase] = field(default_factory=list)
 
-    # 失败类型分布 {failure_type: count}
+    # Failure-type distribution {failure_type: count}
     failure_type_breakdown: Dict[str, int] = field(default_factory=dict)
-    # 根因分布 {root_cause: count}
+    # Root-cause distribution {root_cause: count}
     root_cause_breakdown: Dict[str, int] = field(default_factory=dict)
-    # 按 question_type 分层统计
+    # Statistics stratified by question_type
     by_question_type: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    # LLM 归纳的失败模式（单次 LLM call，可为空字符串）
+    # LLM-induced failure patterns from a single call, may be empty
     pattern_summary: str = ""
-    # 需人工审查的可疑 judge 样本
+    # Suspect judge samples that need manual review
     judge_suspect_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
 class ImprovementHypothesis:
-    """单条改进假设。"""
+    """A single improvement hypothesis."""
     hypothesis_id: str
     title: str
     root_cause: str
@@ -141,23 +143,23 @@ class ImprovementHypothesis:
     estimated_impact: ImpactLevel
     risk_level: str = "low"         # low / medium / high
 
-    # Config 三层隔离层级（Layer 0=全局 / 1=家族 / 2=benchmark专属）
+    # Three-layer config isolation (Layer 0=global / 1=family / 2=benchmark-specific)
     config_layer: ConfigLayer = ConfigLayer.SPECIFIC
 
-    # CONFIG_CHANGE 时填充：{env_key: new_value}
+    # Filled for CONFIG_CHANGE: {env_key: new_value}
     config_changes: Dict[str, str] = field(default_factory=dict)
-    # 受影响的 .env 文件路径（相对于 benchmarks/）
+    # Affected .env file paths, relative to benchmarks/
     env_file: str = ""
 
-    # PROMPT_FIX / PIPELINE_PATCH 时填充：文字描述修改点
+    # Filled for PROMPT_FIX / PIPELINE_PATCH: textual description of the change
     code_guidance: str = ""
-    # 预计影响的 badcase 比例
+    # Estimated share of badcases affected
     estimated_coverage_fraction: float = 0.0
 
 
 @dataclass
 class ExperimentRecord:
-    """一次完整实验快照，持久化到 experiments.jsonl。"""
+    """One complete experiment snapshot, persisted to experiments.jsonl."""
     run_id: str
     benchmark: str
     timestamp: str                  # ISO 8601
@@ -166,4 +168,4 @@ class ExperimentRecord:
     metrics: Dict[str, Any] = field(default_factory=dict)
     results_path: str = ""
     notes: str = ""
-    is_regression: bool = False     # 若 accuracy < 上一次 - 2% 则标记
+    is_regression: bool = False     # Flagged when accuracy drops more than 2% below the previous run

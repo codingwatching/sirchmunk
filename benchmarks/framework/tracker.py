@@ -1,12 +1,12 @@
 """framework/tracker.py — ExperimentTracker
 
-维护 benchmarks/experiments.jsonl（每行一个实验快照）。
+Maintains benchmarks/experiments.jsonl with one experiment snapshot per line.
 
-功能：
-- record()    保存实验记录
-- compare()   计算两次实验的 delta（含回退检测）
-- latest_n()  查看最近 N 次实验趋势
-- convergence_check()  连续 delta < threshold 时建议停止
+Capabilities:
+- record()    persist an experiment record
+- compare()   compute the delta between two runs, including regression detection
+- latest_n()  inspect the trend across the last N experiments
+- convergence_check()  suggest stopping once delta stays below the threshold
 """
 from __future__ import annotations
 
@@ -21,14 +21,14 @@ from .time_utils import now_local_iso
 
 logger = logging.getLogger(__name__)
 
-# 若 accuracy 降幅超过此值，标记为回退
-_REGRESSION_THRESHOLD = 2.0   # 百分点
-# 连续多少次 delta < convergence_threshold 后认为收敛
+# Mark a regression when the accuracy drop exceeds this value
+_REGRESSION_THRESHOLD = 2.0   # Percentage points
+# Consecutive rounds with delta < convergence_threshold before declaring convergence
 _CONVERGENCE_WINDOW = 3
 
 
 class ExperimentDelta:
-    """两次实验之间的差异。"""
+    """Difference between two experiments."""
 
     def __init__(
         self,
@@ -66,7 +66,7 @@ class ExperimentDelta:
 
 
 class ExperimentTracker:
-    """实验追踪器。
+    """Experiment tracker.
 
     Usage::
 
@@ -96,9 +96,10 @@ class ExperimentTracker:
         results_path: str = "",
         notes: str = "",
     ) -> ExperimentRecord:
-        """保存一次实验记录。
+        """Persist one experiment record.
 
-        自动检测是否为回退（与上一条同 benchmark 的记录相比）。
+        Regressions are detected automatically against the previous record of the same
+        benchmark.
         """
         prev = self._latest_for_benchmark(benchmark)
         is_regression = False
@@ -134,14 +135,14 @@ class ExperimentTracker:
         return record
 
     def compare(self, run_id_a: str, run_id_b: str) -> Optional[ExperimentDelta]:
-        """计算两个实验之间的 delta。
+        """Compute the delta between two experiments.
 
         Args:
-            run_id_a: 基线实验 ID（较早）。
-            run_id_b: 待比较实验 ID（较新）。
+            run_id_a: baseline experiment ID (earlier).
+            run_id_b: experiment ID to compare (later).
 
         Returns:
-            ExperimentDelta；若任一 run_id 不存在则返回 None。
+            An ExperimentDelta, or None when either run_id does not exist.
         """
         all_records = self._load_all()
         rec_map = {r.run_id: r for r in all_records}
@@ -187,7 +188,7 @@ class ExperimentTracker:
         )
 
     def latest_n(self, n: int = 5, benchmark: Optional[str] = None) -> List[ExperimentRecord]:
-        """返回最近 N 条实验记录（可按 benchmark 过滤）。"""
+        """Return the last N experiment records, optionally filtered by benchmark."""
         all_records = self._load_all()
         if benchmark:
             all_records = [r for r in all_records if r.benchmark == benchmark]
@@ -199,7 +200,7 @@ class ExperimentTracker:
         threshold: float = 1.0,
         window: int = _CONVERGENCE_WINDOW,
     ) -> Tuple[bool, str]:
-        """检查最近 window 次实验 accuracy delta 是否均 < threshold。
+        """Check whether the accuracy delta of the last `window` runs stays below threshold.
 
         Returns:
             (is_converged, message)
@@ -226,7 +227,7 @@ class ExperimentTracker:
         return False, f"Not converged: recent deltas = {[f'{d:.2f}%' for d in recent_deltas]}"
 
     def print_history(self, benchmark: Optional[str] = None, n: int = 10) -> None:
-        """打印实验历史表格。"""
+        """Print the experiment history table."""
         records = self.latest_n(n, benchmark=benchmark)
         if not records:
             print("  (no experiments recorded yet)")
@@ -349,13 +350,13 @@ class ExperimentTracker:
     # ------------------------------------------------------------------
 
     def _append(self, record: ExperimentRecord) -> None:
-        """追加一行到 JSONL 文件。"""
+        """Append one line to the JSONL file."""
         row = asdict(record)
         with open(self._path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def _load_all(self) -> List[ExperimentRecord]:
-        """加载全部实验记录。"""
+        """Load every experiment record."""
         if not self._path.exists():
             return []
         records: List[ExperimentRecord] = []
@@ -382,6 +383,6 @@ class ExperimentTracker:
         return records
 
     def _latest_for_benchmark(self, benchmark: str) -> Optional[ExperimentRecord]:
-        """返回指定 benchmark 的最新一条记录。"""
+        """Return the latest record for the given benchmark."""
         records = [r for r in self._load_all() if r.benchmark == benchmark]
         return records[-1] if records else None

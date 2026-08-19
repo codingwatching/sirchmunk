@@ -18,7 +18,7 @@
 
 📖 **[Documentation](https://modelscope.github.io/sirchmunk-web/)**
 
-[**Quick Start**](#-quick-start) · [**Key Features**](#-key-features) · [**Research**](#-research--paper-artifacts) · [**MCP Server**](#-mcp-server) · [**Web UI**](#️-web-ui) · [**Docker**](#-docker-deployment) · [**How it Works**](#️-how-it-works) · [**FAQ**](#-faq)
+[**Quick Start**](#-quick-start) · [**Key Features**](#-key-features) · [**MCP Server**](#-mcp-server) · [**Web UI**](#️-web-ui) · [**Docker**](#-docker-deployment) · [**How it Works**](#️-how-it-works) · [**FAQ**](#-faq)
 
 </div>
 
@@ -67,20 +67,7 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 > For more technical details, refer to the [Sirchmunk blog](https://modelscope.github.io/sirchmunk-web/blog)
 
-## 🔬 Research & Paper Artifacts
-
-The current research draft formalizes the core Sirchmunk/LENS search path as **LENS: In-Context Search via Latent Evidence Exploration over Dynamic Raw Documents**. The paper frames in-context search as **Budgeted Evidence Localization** over a latent evidence space induced by dynamic raw documents, emphasizing a complementary trade-off to index-centric retrieval rather than a replacement claim.
-
-Key local artifacts:
-
-| Artifact | Path | Purpose |
-|---|---|---|
-| Core algorithm note | `temp/papers/lens_core_algo/lens_core_algorithm_zh_v1.md` | Mathematical framing of latent evidence space, budgeted sequential inference, and LENS mechanisms |
-| AAAI writing plan | `temp/papers/overleaf_version/lens_paper_writing_plan_v0.md` | Section-level writing plan, story line, terminology, and AAAI 2027 constraints |
-| Overleaf draft | `temp/papers/overleaf_version/lens_submission/` | AAAI-style LaTeX draft and bibliography |
-| Dynamic experiment design | `temp/papers/` | HotpotQA fullwiki dynamic raw-corpus protocol and paper-facing experiment plan |
-
-For reproducible experiments, see [`benchmarks/README.md`](benchmarks/README.md). It documents the frozen sampled evaluation workflow, dynamic `G_n/D_n` corpus snapshots, lifecycle-cost accounting, and LENS ablation variants used to support paper claims.
+For reproducible experiments, see [`benchmarks/README.md`](benchmarks/README.md). It documents the frozen sampled evaluation workflow, dynamic `G_n/D_n` corpus snapshots, lifecycle-cost accounting, and LENS ablation variants.
 
 
 ---

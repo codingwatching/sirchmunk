@@ -1,10 +1,10 @@
-"""evaluation — 竞品横向评估与论文表格生成包
+"""evaluation — competitor comparison and paper table generation package
 
-与 framework/ 自改进循环完全隔离，专用于：
-  1. 管理固定测试集（GoldenSet）
-  2. 对所有竞品运行评估（BaselineEvaluationSuite）
-  3. 统计分析（Bootstrap CI, McNemar, Bonferroni）
-  4. 生成论文级比较表格（LaTeX + Markdown + JSON）
+Fully isolated from the framework/ self-improvement loop and dedicated to:
+  1. managing the frozen test set (GoldenSet)
+  2. running the evaluation for every competitor (BaselineEvaluationSuite)
+  3. statistical analysis (bootstrap CI, McNemar, Bonferroni)
+  4. generating paper-grade comparison tables (LaTeX + Markdown + JSON)
 """
 from .error_appendix import ErrorAppendixGenerator
 from .figure_generator import FigureGenerator

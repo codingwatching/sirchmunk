@@ -1,15 +1,17 @@
-"""ablations/lens_profile.py — LENS 核心消融 Profile
+"""ablations/lens_profile.py — core LENS ablation profiles
 
-用于动态raw-corpus主消融实验的最小三项 profile：
+The minimal set of three profiles used by the dynamic raw-corpus main ablation:
   1. Full LENS
   2. w/o Multi-signal Prior
   3. w/o Sequential Exploration
 
-`w/o Knowledge Reuse` 保留为 appendix-only profile，用于 follow-up / warm-start
-amortization study，不进入 main ablation table。
+`w/o Knowledge Reuse` stays an appendix-only profile for follow-up / warm-start
+amortization studies and does not enter the main ablation table.
 
-注意：profile 是 benchmark/evaluation 层的实验抽象，不改变自改进循环。
-具体执行由 LensAblationAdapter 通过 wrapper/instance patch 实现，默认不修改 search.py。
+Note: a profile is an experiment abstraction of the benchmark/evaluation layer and
+does not change the self-improvement loop. Execution is handled by
+LensAblationAdapter through wrapper / instance patching, and search.py is left
+unmodified by default.
 """
 from __future__ import annotations
 
@@ -19,9 +21,10 @@ from typing import Any, Dict, List
 
 @dataclass(frozen=True)
 class LensSearchProfile:
-    """LENS 消融 Profile。
+    """LENS ablation profile.
 
-    这些开关对应 LENS 核心算法 A0-A7 的三块高层机制。
+    These switches map to the three high-level mechanism blocks of the LENS core
+    algorithm A0-A7.
     """
     name: str
     citation_name: str
@@ -126,7 +129,7 @@ class LensSearchProfile:
 
 
 def core_lens_profiles() -> List[LensSearchProfile]:
-    """返回 main ablation：full + 两项核心机制消融。"""
+    """Return the main ablation: full plus the two core mechanism ablations."""
     return [
         LensSearchProfile.full(),
         LensSearchProfile.without_multi_signal_prior(),
@@ -135,10 +138,10 @@ def core_lens_profiles() -> List[LensSearchProfile]:
 
 
 def appendix_lens_profiles() -> List[LensSearchProfile]:
-    """返回 appendix-only profile，不进入 main ablation table。"""
+    """Return appendix-only profiles that stay out of the main ablation table."""
     return [LensSearchProfile.without_knowledge_reuse()]
 
 
 def all_lens_profiles() -> List[LensSearchProfile]:
-    """返回所有可构建 profile，包括 appendix-only 变体。"""
+    """Return every buildable profile, including the appendix-only variants."""
     return core_lens_profiles() + appendix_lens_profiles()

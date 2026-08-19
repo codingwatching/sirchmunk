@@ -1,17 +1,19 @@
-"""evaluation/golden_set.py — GoldenSet 固定测试集管理
+"""evaluation/golden_set.py — frozen test set management
 
-GoldenSet 的核心职责：
-  保证所有系统（Sirchmunk 和所有竞品）在完全相同的问题集上评估，
-  避免不同采样导致的测试集差异污染对比结果。
+Core responsibility of GoldenSet:
+  guarantee that every system (Sirchmunk and all competitors) is evaluated on exactly
+  the same question set, so differing sampling cannot contaminate the comparison.
 
-科学严谨性设计：
-  1. GoldenSet 由 sampling protocol / seed / sample IDs 唯一确定
-  2. checksum（SHA-256）覆盖 sample_id/question/gold/metadata，防止测试集被意外修改
-  3. sample_id_checksum 独立记录，用于跨系统配对检验
-  4. sampling_protocol / sampling_manifest 持久化，支持 sampled evaluation 审计
-  5. 与自改进循环（run_research_loop.py）完全隔离
+Scientific rigor by design:
+  1. A GoldenSet is uniquely determined by sampling protocol / seed / sample IDs
+  2. The SHA-256 checksum covers sample_id/question/gold/metadata to prevent accidental
+     modification of the test set
+  3. sample_id_checksum is recorded separately for paired cross-system testing
+  4. sampling_protocol / sampling_manifest are persisted to support sampled-evaluation
+     audits
+  5. Fully isolated from the self-improvement loop (run_research_loop.py)
 
-文件命名约定：
+File naming convention:
   sampled: benchmarks/{benchmark}/golden_set_{method}_{seed}_{n}_{checksum8}.json
 """
 from __future__ import annotations
@@ -36,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GoldenSet:
-    """固定测试集，所有系统使用相同的问题。"""
+    """Frozen test set; every system uses the same questions."""
     benchmark: str
     seed: int
     n_questions: int
@@ -50,11 +52,11 @@ class GoldenSet:
     schema_version: int = 2
 
     def to_gold_map(self) -> Dict[str, str]:
-        """返回 {sample_id: gold_answer} 映射。"""
+        """Return the {sample_id: gold_answer} mapping."""
         return {s["sample_id"]: s["gold_answer"] for s in self.samples}
 
     def to_question_map(self) -> Dict[str, str]:
-        """返回 {sample_id: question} 映射。"""
+        """Return the {sample_id: question} mapping."""
         return {s["sample_id"]: s["question"] for s in self.samples}
 
     def sample_ids(self) -> List[str]:
@@ -82,7 +84,7 @@ class GoldenSet:
             )
 
     def to_benchmark_samples(self):
-        """转换为 framework/schema.py 的 BenchmarkSample 列表（按需 import）。"""
+        """Convert to a list of BenchmarkSample from framework/schema.py (imported lazily)."""
         try:
             from framework.schema import BenchmarkSample
             return [
@@ -101,7 +103,7 @@ class GoldenSet:
             )
 
     def verify_checksum(self) -> bool:
-        """验证当前样本列表的 checksum 与存储值一致。"""
+        """Verify that the checksum of the current sample list matches the stored value."""
         return _compute_checksum(self.samples) == self.checksum
 
     def to_dict(self) -> Dict[str, Any]:
@@ -120,7 +122,7 @@ class GoldenSet:
         }
 
     def save(self, path: str) -> None:
-        """持久化到 JSON 文件。"""
+        """Persist to a JSON file."""
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -128,7 +130,7 @@ class GoldenSet:
 
     @classmethod
     def load(cls, path: str) -> "GoldenSet":
-        """从 JSON 文件加载，并验证 checksum。"""
+        """Load from a JSON file and verify the checksum."""
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"GoldenSet file not found: {path}")
@@ -157,7 +159,7 @@ class GoldenSet:
 
 
 class GoldenSetManager:
-    """GoldenSet 的工厂与持久化管理器。"""
+    """Factory and persistence manager for GoldenSet."""
 
     def __init__(self, benchmark_dir: str) -> None:
         self._dir = Path(benchmark_dir)
@@ -169,7 +171,7 @@ class GoldenSetManager:
         n: int,
         sampling_protocol: Optional[SamplingProtocol | Dict[str, Any]] = None,
     ) -> str:
-        """返回 GoldenSet 文件路径（不保证文件存在）。"""
+        """Return the GoldenSet file path; existence is not guaranteed."""
         protocol = _coerce_protocol(sampling_protocol)
         if protocol is None:
             return str(self._dir / f"golden_set_{seed}_{n}.json")
@@ -179,7 +181,7 @@ class GoldenSetManager:
         return str(self._dir / f"golden_set_{method}_{protocol.seed}_{target_n}_{checksum}.json")
 
     def exists(self, seed: int, n: int, sampling_protocol: Optional[SamplingProtocol | Dict[str, Any]] = None) -> bool:
-        """检查 GoldenSet 文件是否已存在。"""
+        """Check whether the GoldenSet file already exists."""
         return Path(self.get_path(seed, n, sampling_protocol=sampling_protocol)).exists()
 
     def get_or_create(
@@ -190,14 +192,15 @@ class GoldenSetManager:
         force_recreate: bool = False,
         sampling_protocol: Optional[SamplingProtocol | Dict[str, Any]] = None,
     ) -> GoldenSet:
-        """加载已有 GoldenSet 或新建并保存。
+        """Load an existing GoldenSet, or create and save a new one.
 
         Args:
-            adapter: BenchmarkAdapter 实例，提供 load_samples() 和 name。
-            seed: 随机种子。
-            n: 测试集大小（0 = 全量）。
-            force_recreate: 强制重新生成（即使文件已存在）。
-            sampling_protocol: 可选 SamplingProtocol；提供时使用协议生成 GoldenSet。
+            adapter: BenchmarkAdapter instance providing load_samples() and name.
+            seed: random seed.
+            n: test set size (0 = full set).
+            force_recreate: regenerate even when the file already exists.
+            sampling_protocol: optional SamplingProtocol; when provided the GoldenSet is
+                built through the protocol.
         """
         protocol = _coerce_protocol(sampling_protocol)
         path = self.get_path(seed, n, sampling_protocol=protocol)
@@ -329,7 +332,7 @@ def _safe_name(value: str) -> str:
 
 
 def _compute_checksum(samples: List[Dict[str, Any]]) -> str:
-    """计算样本列表的 SHA-256 checksum。"""
+    """Compute the SHA-256 checksum of a sample list."""
     canonical = []
     for sample in samples:
         canonical.append({

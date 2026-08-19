@@ -1,12 +1,13 @@
 """framework/orchestrator.py — ResearchOrchestrator
 
-外层研究循环：
-  benchmark运行 → 记录 → badcase分析 → 打印delta → 生成建议 → 人工确认 → 应用改动 → 重复
+Outer research loop:
+  run benchmark -> record -> badcase analysis -> print delta -> generate hypotheses ->
+  manual confirmation -> apply changes -> repeat
 
-收敛条件：
-  1. 达到 max_iterations
-  2. 用户选择 quit
-  3. 连续 convergence_window 次 accuracy delta < convergence_threshold
+Convergence conditions:
+  1. max_iterations reached
+  2. the user chooses quit
+  3. accuracy delta stays below convergence_threshold for convergence_window rounds
 """
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 class ResearchOrchestrator:
-    """研究编排器 — 将流水线各阶段组合为单一可调用对象。
+    """Research orchestrator that composes every pipeline stage into one callable object.
 
     Usage::
 
@@ -47,16 +48,16 @@ class ResearchOrchestrator:
     ) -> None:
         """
         Args:
-            adapter:           Benchmark 适配器实例。
-            experiments_path:  experiments.jsonl 路径。
-            dry_run:           若 True，CONFIG_CHANGE 不实际写文件。
+            adapter:           benchmark adapter instance.
+            experiments_path:  path of experiments.jsonl.
+            dry_run:           when True, CONFIG_CHANGE does not write the file.
         """
         self._adapter = adapter
         self._runner = UnifiedExperimentRunner(adapter)
         self._tracker = ExperimentTracker(experiments_path)
         self._confirm = HumanConfirmLoop(dry_run=dry_run)
 
-        # LLM 实例从 adapter 懒获取（避免重复构建）
+        # The LLM instance is lazily taken from the adapter to avoid rebuilding it
         self._llm = None
 
     async def run(
@@ -68,19 +69,21 @@ class ResearchOrchestrator:
         convergence_window: int = 3,
         skip_run_path: Optional[str] = None,
     ) -> None:
-        """启动研究循环。
+        """Start the research loop.
 
         Args:
-            max_iterations:       最大迭代次数。
-            limit:                每次实验的样本数（0=全量）。
-            seed:                 随机种子。
-            convergence_threshold:连续 delta < 此值时认为收敛（百分点）。
-            convergence_window:   收敛判断所需的连续轮数。
-            skip_run_path:        若提供，跳过运行直接从此 JSONL 加载结果做分析。
+            max_iterations:       maximum number of iterations.
+            limit:                samples per experiment (0 = full set).
+            seed:                 random seed.
+            convergence_threshold:convergence is declared once delta stays below this value
+                                  (percentage points).
+            convergence_window:   consecutive rounds required to declare convergence.
+            skip_run_path:        when provided, skip the run and analyze results loaded
+                                  from this JSONL.
         """
         adapter = self._adapter
 
-        # 延迟构建 LLM（借用 adapter 的搜索器里的 LLM）
+        # Build the LLM lazily, reusing the one inside the adapter searcher
         if self._llm is None:
             try:
                 searcher = adapter.build_searcher()
@@ -98,7 +101,7 @@ class ResearchOrchestrator:
         print(f"  Max iterations: {max_iterations}  |  Limit: {limit or 'ALL'}")
         print(f"{'='*64}\n")
 
-        # 打印历史
+        # Print history
         self._tracker.print_history(benchmark=adapter.name)
 
         for iteration in range(1, max_iterations + 1):
@@ -106,7 +109,7 @@ class ResearchOrchestrator:
             print(f"  Iteration {iteration}/{max_iterations}")
             print(f"{'─'*64}\n")
 
-            # ── Step 1: 运行实验 ──────────────────────────────────────
+            # ── Step 1: run the experiment ────────────────────────
             if skip_run_path and iteration == 1:
                 print(f"  [Orch] --skip-run: loading from {skip_run_path}")
                 results = UnifiedExperimentRunner.load_results_from_jsonl(skip_run_path)
@@ -123,11 +126,11 @@ class ResearchOrchestrator:
                 results, meta = await self._runner.run(limit=limit, seed=seed)
                 run_id = meta["run_id"]
 
-            # ── Step 2: 计算 metrics ──────────────────────────────────
+            # ── Step 2: compute metrics ─────────────────────────────
             metrics = _compute_basic_metrics(results)
             metrics["config"] = adapter.get_run_config()
 
-            # ── Step 3: 记录实验 ──────────────────────────────────────
+            # ── Step 3: record the experiment ─────────────────────
             self._tracker.record(
                 run_id=run_id,
                 benchmark=adapter.name,
@@ -138,7 +141,7 @@ class ResearchOrchestrator:
                 results_path=meta.get("results_path", ""),
             )
 
-            # ── Step 4: 打印 delta ────────────────────────────────────
+            # ── Step 4: print the delta ─────────────────────────────
             if prev_run_id:
                 delta = self._tracker.compare(prev_run_id, run_id)
                 if delta:
@@ -146,7 +149,7 @@ class ResearchOrchestrator:
 
             prev_run_id = run_id
 
-            # ── Step 5: BadCase 分析 ──────────────────────────────────
+            # ── Step 5: badcase analysis ────────────────────────────
             samples_map = self._build_samples_map(results)
             analysis_schema = adapter.get_analysis_schema()
             report = await analyzer.analyze(
@@ -156,14 +159,14 @@ class ResearchOrchestrator:
             )
             BadCaseAnalyzer.print_report(report)
 
-            # ── Step 6: 生成改进建议 ──────────────────────────────────
+            # ── Step 6: generate improvement hypotheses ─────────
             hypotheses = await advisor.suggest(
                 report=report,
                 config=adapter.get_run_config(),
                 env_file=adapter.env_file,
             )
 
-            # ── Step 7: 人工确认 ──────────────────────────────────────
+            # ── Step 7: manual confirmation ───────────────────────
             chosen, applied = self._confirm.review(hypotheses)
 
             if chosen is None or (
@@ -175,7 +178,7 @@ class ResearchOrchestrator:
             if not chosen:
                 print("  [Orch] 用户跳过本轮，继续下一次迭代。")
 
-            # ── Step 8: 收敛检测 ──────────────────────────────────────
+            # ── Step 8: convergence check ─────────────────────────
             converged, conv_msg = self._tracker.convergence_check(
                 benchmark=adapter.name,
                 threshold=convergence_threshold,
@@ -191,7 +194,7 @@ class ResearchOrchestrator:
                 if stop not in ("y", "yes"):
                     break
 
-        # 最终历史
+        # Final history
         print(f"\n{'='*64}")
         print("  研究循环结束，最终实验历史：")
         self._tracker.print_history(benchmark=adapter.name)
@@ -202,7 +205,7 @@ class ResearchOrchestrator:
 
     @staticmethod
     def _build_samples_map(results: List[PredictionResult]) -> Dict[str, BenchmarkSample]:
-        """从 results.raw 重建 {sample_id: BenchmarkSample}，供 BadCaseAnalyzer 使用。"""
+        """Rebuild {sample_id: BenchmarkSample} from results.raw for BadCaseAnalyzer."""
         from .schema import BenchmarkSample
         samples_map: Dict[str, BenchmarkSample] = {}
         for r in results:
@@ -224,7 +227,7 @@ class ResearchOrchestrator:
 
 
 def _compute_basic_metrics(results: List[PredictionResult]) -> dict:
-    """计算基本指标 dict（供 tracker 记录）。"""
+    """Compute the basic metrics dict recorded by the tracker."""
     n = len(results)
     if n == 0:
         return {"n": 0, "accuracy": 0.0, "coverage": 0.0}
@@ -278,5 +281,5 @@ def _percentile(values: List[float], percentile: int) -> float:
 
 
 def _user_quit_signal(hypotheses, chosen) -> bool:
-    """chosen 为 None（quit）时返回 True；chosen 为空列表（skip）时返回 False。"""
+    """Return True when chosen is None (quit); False when chosen is an empty list (skip)."""
     return chosen is None

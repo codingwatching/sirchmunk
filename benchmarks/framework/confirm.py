@@ -1,11 +1,14 @@
 """framework/confirm.py — HumanConfirmLoop
 
-CLI 人工确认层：展示改进建议 → 收集用户选择 → 执行 CONFIG_CHANGE。
+CLI manual confirmation layer: show improvement hypotheses -> collect the user choice ->
+apply CONFIG_CHANGE.
 
-设计原则：
-- CONFIG_CHANGE：框架自动写入 .env 文件，执行前展示完整 diff，**不静默修改**
-- PIPELINE_PATCH / PROMPT_FIX：只打印建议，提示"可将建议粘贴给 Qoder 执行"
-- 选 q：退出循环，保留所有已记录实验
+Design principles:
+- CONFIG_CHANGE: the framework writes the .env file, showing the full diff before
+  applying; it never modifies silently
+- PIPELINE_PATCH / PROMPT_FIX: only print the suggestion and hint that it can be pasted
+  to Qoder for execution
+- Choosing q: leave the loop and keep every recorded experiment
 """
 from __future__ import annotations
 
@@ -24,7 +27,7 @@ _SUBSEP = "─" * 64
 
 
 class HumanConfirmLoop:
-    """人工确认层。
+    """Manual confirmation layer.
 
     Usage::
 
@@ -35,19 +38,19 @@ class HumanConfirmLoop:
     def __init__(self, dry_run: bool = False) -> None:
         """
         Args:
-            dry_run: 若为 True，则不实际写 .env，只打印 diff。
+            dry_run: when True, do not write .env and only print the diff.
         """
         self._dry_run = dry_run
 
     def review(
         self, hypotheses: List[ImprovementHypothesis]
     ) -> Tuple[List[ImprovementHypothesis], List[ImprovementHypothesis]]:
-        """展示建议并收集用户确认。
+        """Show the hypotheses and collect the user confirmation.
 
         Returns:
             (chosen, applied)
-            - chosen:  用户选择的所有 hypothesis（含 PIPELINE_PATCH）
-            - applied: 实际执行（写 .env）的 hypothesis（仅 CONFIG_CHANGE）
+            - chosen:  every hypothesis the user selected, including PIPELINE_PATCH
+            - applied: the hypotheses actually applied by writing .env, CONFIG_CHANGE only
         """
         if not hypotheses:
             print("\n  (No improvement hypotheses generated.)\n")
@@ -74,7 +77,7 @@ class HumanConfirmLoop:
                     applied.append(h)
             elif h.change_type in (ChangeType.PIPELINE_PATCH, ChangeType.PROMPT_FIX):
                 self._print_code_guidance(h)
-            # SKIP 类不需要处理
+            # SKIP entries need no handling
 
         return chosen, applied
 
@@ -100,7 +103,7 @@ class HumanConfirmLoop:
                 ChangeType.SKIP:           "SKIP    ",
             }.get(h.change_type, "UNKNOWN ")
 
-            # Config 层级图标
+            # Config layer icons
             layer_val = getattr(h, "config_layer", None)
             if layer_val == ConfigLayer.GLOBAL or layer_val == 0:
                 layer_icon = "🌐 Layer-0 GLOBAL"
@@ -141,7 +144,7 @@ class HumanConfirmLoop:
 
     @staticmethod
     def _prompt_user(total: int) -> Optional[List[int]]:
-        """收集用户输入，返回 0-based 索引列表；None 表示退出；[] 表示 skip。"""
+        """Collect user input and return 0-based indices; None means quit, [] means skip."""
         while True:
             try:
                 raw = input("  选择 > ").strip().lower()
@@ -158,7 +161,7 @@ class HumanConfirmLoop:
             if raw == "all":
                 return list(range(total))
 
-            # 解析数字（空格或逗号分隔）
+            # Parse indices separated by spaces or commas
             tokens = re.split(r"[\s,]+", raw)
             indices = []
             valid = True
@@ -179,7 +182,7 @@ class HumanConfirmLoop:
                     break
 
             if valid and indices:
-                # 去重且保序
+                # Deduplicate while preserving order
                 seen = set()
                 unique = []
                 for i in indices:
@@ -193,15 +196,15 @@ class HumanConfirmLoop:
     # ------------------------------------------------------------------
 
     def _apply_config_change(self, h: ImprovementHypothesis) -> bool:
-        """将 config_changes 写入 .env 文件。
+        """Write config_changes into the .env file.
 
-        步骤：
-        1. 打印 diff
-        2. 用户再次确认（y/n）
-        3. 写文件
+        Steps:
+        1. print the diff
+        2. ask the user to confirm again (y/n)
+        3. write the file
 
         Returns:
-            True 表示成功应用。
+            True when the change was applied successfully.
         """
         env_path = Path(h.env_file) if h.env_file else None
         if not env_path or not env_path.exists():
@@ -211,7 +214,7 @@ class HumanConfirmLoop:
                 print(f"       {k}={v}")
             return False
 
-        # Layer 0 全局变更额外警告
+        # Extra warning for Layer 0 global changes
         layer_val = getattr(h, "config_layer", None)
         if layer_val == ConfigLayer.GLOBAL or layer_val == 0:
             print(f"\n  🌐 注意：此 CONFIG_CHANGE 包含全局配置键（Layer 0）")
@@ -219,11 +222,11 @@ class HumanConfirmLoop:
             print(f"     建议先在所有 benchmark 上做联合评估（将来 Pareto Gate）后再执行。")
             print()
 
-        # 读取当前内容
+        # Read the current content
         current_lines = env_path.read_text(encoding="utf-8").splitlines(keepends=True)
         new_lines, applied_keys = _apply_env_changes(current_lines, h.config_changes)
 
-        # 打印 diff
+        # Print the diff
         print(f"\n  📝 将修改 {h.env_file}：")
         print("  " + _SUBSEP)
         for k, v in h.config_changes.items():
@@ -239,7 +242,7 @@ class HumanConfirmLoop:
             print("  [DRY RUN] 未实际写入文件。\n")
             return False
 
-        # 二次确认
+        # Second confirmation
         try:
             confirm = input("  确认写入? [y/N] > ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -256,7 +259,7 @@ class HumanConfirmLoop:
 
     @staticmethod
     def _print_code_guidance(h: ImprovementHypothesis) -> None:
-        """打印代码修改建议，提示用户手动或通过 Qoder 执行。"""
+        """Print the code-change suggestion and hint the user to apply it manually or via Qoder."""
         print(f"\n  📌 [{h.change_type.value.upper()}] {h.title}")
         print("  " + _SUBSEP)
         if h.code_guidance:
@@ -276,10 +279,10 @@ def _apply_env_changes(
     lines: List[str],
     changes: dict,
 ) -> Tuple[List[str], dict]:
-    """将 changes 应用到 .env 行列表。
+    """Apply the changes to the list of .env lines.
 
-    - 若 key 已存在（含注释版本），覆盖其值
-    - 若 key 不存在，追加到文件末尾
+    - Overwrite the value when the key already exists, including a commented-out variant
+    - Append to the end of the file when the key does not exist
 
     Returns:
         (new_lines, old_values_map)   old_values_map: {key: old_value}
@@ -290,7 +293,7 @@ def _apply_env_changes(
 
     for i, line in enumerate(new_lines):
         stripped = line.strip()
-        # 跳过注释
+        # Skip comments
         if stripped.startswith("#"):
             continue
         if "=" not in stripped:
@@ -298,7 +301,7 @@ def _apply_env_changes(
         key, _, _ = stripped.partition("=")
         key = key.strip()
         if key in pending_keys:
-            # 保留行尾注释（如 KEY=VALUE  # comment）
+            # Preserve trailing comments such as KEY=VALUE  # comment
             _, _, rest = stripped.partition("=")
             comment_match = re.search(r"\s+#.*$", rest)
             comment = comment_match.group(0) if comment_match else ""
@@ -307,7 +310,7 @@ def _apply_env_changes(
             new_lines[i] = f"{key}={changes[key]}{comment}\n"
             pending_keys.discard(key)
 
-    # 追加未找到的 key
+    # Append keys that were not found
     if pending_keys:
         if new_lines and not new_lines[-1].endswith("\n"):
             new_lines.append("\n")

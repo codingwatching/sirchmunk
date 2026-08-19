@@ -1,24 +1,29 @@
 """evaluation/suite.py — BaselineEvaluationSuite
 
-竞品横向评估的执行引擎。
+Execution engine for cross-system competitor evaluation.
 
-核心设计：
-  1. 数据公平：所有系统使用完全相同的 GoldenSet（同 seed + 同问题集）
-  2. Judge 公平：全部预测通过同一个 BenchmarkAdapter.build_judge() 评分
-  3. 执行隔离：竞品评估与自改进循环完全独立，不共享任何状态
-  4. 断点续算：每个系统的结果实时写 JSONL，崩溃后可从已完成系统继续
+Core design:
+  1. Data fairness: every system uses exactly the same GoldenSet (same seed + same
+     question set)
+  2. Judge fairness: every prediction is scored by the same
+     BenchmarkAdapter.build_judge()
+  3. Execution isolation: competitor evaluation is fully independent from the
+     self-improvement loop and shares no state
+  4. Resumability: each system streams its results to JSONL, so a crash can resume from
+     the already finished systems
 
-支持三类竞品输入：
-  a. 实时 predict   : BaselineAdapter.predict() 在线调用
-  b. predict_by_id  : ManualImportAdapter 等按样本 ID 返回预计算预测
-  c. 已有 JSONL     : 通过 ManualImportAdapter 预加载后走路径 b
+Three kinds of competitor input are supported:
+  a. live predict   : BaselineAdapter.predict() called online
+  b. predict_by_id  : ManualImportAdapter and friends return precomputed predictions by
+                      sample ID
+  c. existing JSONL : preloaded through ManualImportAdapter and then routed to path b
 
-评估流程（单个竞品系统）：
+Evaluation flow for one competitor system:
   for sample in golden_set.samples:
-    1. 调用 baseline.predict(question, context_paths) 获取 prediction
-    2. 调用 judge.judge(prediction, gold, question) → judge_correct
-    3. 调用 judge.judge_coverage(prediction, question) → coverage
-    4. 组装 BaselineResult 并写入 JSONL
+    1. call baseline.predict(question, context_paths) to obtain the prediction
+    2. call judge.judge(prediction, gold, question) -> judge_correct
+    3. call judge.judge_coverage(prediction, question) -> coverage
+    4. assemble a BaselineResult and append it to JSONL
 """
 from __future__ import annotations
 
@@ -32,7 +37,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# 导入 baselines 接口（不依赖 framework/ 自改进模块）
+# Import the baselines interface (independent of the framework/ self-improvement modules)
 import sys as _sys
 _HERE = Path(__file__).parent.resolve()       # evaluation/
 _BENCHMARKS = _HERE.parent                    # benchmarks/
@@ -44,7 +49,7 @@ from framework.guards import BudgetExceeded, BudgetGuard, GuardConfig, SampleTim
 
 
 class BaselineEvaluationSuite:
-    """竞品横向评估套件。
+    """Cross-system competitor evaluation suite.
 
     Usage::
 
@@ -52,17 +57,17 @@ class BaselineEvaluationSuite:
         from evaluation.golden_set import GoldenSetManager
         from baselines import LocalBM25Baseline, NaiveRAGBaseline
 
-        # 准备 golden set
+        # Prepare the golden set
         manager = GoldenSetManager("benchmarks/hotpotqa")
         gs = manager.get_or_create(adapter=hotpot_adapter, seed=42, n=50)
 
-        # 定义竞品
+        # Define the competitors
         baselines = [
             LocalBM25Baseline(max_files=20000),
             NaiveRAGBaseline(max_files=5000),
         ]
 
-        # 运行
+        # Run
         suite = BaselineEvaluationSuite(
             bm_adapter=hotpot_adapter,
             baselines=baselines,
@@ -73,25 +78,30 @@ class BaselineEvaluationSuite:
 
     def __init__(
         self,
-        bm_adapter,                          # BenchmarkAdapter（提供数据 + judge）
+        bm_adapter,                          # BenchmarkAdapter (supplies data + judge)
         baselines: List[BaselineAdapter],
         output_dir: str,
-        max_concurrent: Optional[int] = None,  # 系统级并发（同时评估几个竞品）
+        max_concurrent: Optional[int] = None,  # System-level concurrency (how many competitors run at once)
         guard_config: Optional[GuardConfig | Dict[str, Any]] = None,
         corpus_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Args:
-            bm_adapter:     BenchmarkAdapter 实例（提供 get_search_paths + build_judge）。
-            baselines:      BaselineAdapter 列表。
-            output_dir:     竞品结果 JSONL 的输出目录。
-            max_concurrent: 同时运行的竞品系统数。留空时取 benchmark adapter 的并发
-                            配置（HotpotQA 为 HOTPOT_MAX_CONCURRENT），使该配置在系统
-                            维度真正生效，而不是停留在一个硬编码常量上。注意这只控制
-                            "同时跑几个竞品"；每个竞品内部的样本级并发由该竞品自己的
-                            get_max_concurrent() 决定，默认串行以避免 API 限流并保持
-                            延迟指标可比。
-            guard_config:   可选预算/超时守卫配置，用于将 baseline 失败精确分类。
+            bm_adapter:     BenchmarkAdapter instance (supplies get_search_paths +
+                            build_judge).
+            baselines:      list of BaselineAdapter.
+            output_dir:     output directory for competitor result JSONL files.
+            max_concurrent: how many competitor systems run at once. When left empty it
+                            takes the concurrency config of the benchmark adapter
+                            (HOTPOT_MAX_CONCURRENT for HotpotQA), so that setting truly
+                            takes effect at the system dimension instead of staying a
+                            hardcoded constant. Note this only controls "how many
+                            competitors run at once"; the sample-level concurrency inside
+                            each competitor is decided by its own get_max_concurrent(),
+                            which defaults to sequential to avoid API throttling and keep
+                            the latency metric comparable.
+            guard_config:   optional budget/timeout guard config used to classify baseline
+                            failures precisely.
         """
         self._bm_adapter = bm_adapter
         self._baselines = baselines
@@ -109,20 +119,23 @@ class BaselineEvaluationSuite:
         skip_prepare: bool = False,
         skip_cleanup: bool = False,
     ) -> Dict[str, List[BaselineResult]]:
-        """对 golden_set 中的所有样本，逐个系统进行评估。
+        """Evaluate every sample in golden_set, one system at a time.
 
         Args:
-            golden_set:    GoldenSet 实例，含所有要评估的样本。
-            skip_existing: 若某系统的结果 JSONL 已存在，跳过该系统（断点续算）。
-            skip_prepare:  复用 baseline 当前已有的索引状态，不再调用 prepare()。
-                           stale-index 对照臂依赖此选项保留上一个语料快照的索引。
-            skip_cleanup:  评估结束后不释放 baseline 资源，便于后续 stage 复用其
-                           索引状态（持久化索引的竞品在 cleanup 后可能无法再查询）。
+            golden_set:    GoldenSet instance holding all samples to evaluate.
+            skip_existing: skip a system when its result JSONL already exists
+                           (resumability).
+            skip_prepare:  reuse the current index state of the baseline and do not call
+                           prepare() again. The stale-index arm relies on this option to
+                           keep the index of the previous corpus snapshot.
+            skip_cleanup:  do not release baseline resources after evaluation, so a later
+                           stage can reuse the index state (a competitor with a persistent
+                           index may become unqueryable after cleanup).
 
         Returns:
             {system_name: [BaselineResult, ...]}
         """
-        # 检查竞品可用性
+        # Check competitor availability
         available = []
         for b in self._baselines:
             if b.is_available():
@@ -134,7 +147,7 @@ class BaselineEvaluationSuite:
             logger.warning("[Suite] No available baselines.")
             return {}
 
-        # 构建 judge（所有系统共用同一 judge 实例，保证公平性）
+        # Build the judge (all systems share one judge instance for fairness)
         judge = self._bm_adapter.build_judge()
         if judge is None:
             raise ValueError(
@@ -142,7 +155,7 @@ class BaselineEvaluationSuite:
                 "Judge is required for fair baseline comparison."
             )
 
-        # 系统级信号量控制并发
+        # System-level semaphore bounds concurrency
         semaphore = asyncio.Semaphore(self._max_concurrent)
         logger.info(
             "[Suite] system-level concurrency=%d over %d baseline(s); per-sample concurrency: %s",
@@ -209,7 +222,9 @@ class BaselineEvaluationSuite:
         judge: Any,
         out_path: str,
     ) -> List[BaselineResult]:
-        """评估单个竞品系统的所有样本，并分类预算/超时/导入缺失失败。"""
+        """Evaluate every sample of one competitor system and classify budget / timeout /
+        missing-import failures.
+        """
         results: List[BaselineResult] = []
         results_lock = asyncio.Lock()
         # One retrieval-contract check per baseline, on whichever sample finishes
@@ -494,7 +509,7 @@ class BaselineEvaluationSuite:
 
     @staticmethod
     def _load_results(path: str) -> List[BaselineResult]:
-        """从已有 JSONL 加载 BaselineResult 列表（断点续算用）。"""
+        """Load a list of BaselineResult from an existing JSONL (used for resumability)."""
         results = []
         with open(path, encoding="utf-8") as f:
             for line in f:

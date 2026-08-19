@@ -1,13 +1,16 @@
 """framework/advisor.py — ImprovementAdvisor
 
-职责：接收 BadCaseReport + 当前 config，输出 List[ImprovementHypothesis]。
+Responsibility: take a BadCaseReport plus the current config and emit
+List[ImprovementHypothesis].
 
-分两层：
-1. 信号驱动快路径（无 LLM）：基于 root_cause_breakdown 和 metrics 直接生成规则建议
-2. LLM 深度分析（1次 LLM call）：提供上下文，请 LLM 补充更深层假设
+Two layers:
+1. Signal-driven fast path (no LLM): generate rule suggestions directly from
+   root_cause_breakdown and metrics
+2. LLM deep analysis (one LLM call): supply context and ask the LLM for deeper hypotheses
 
-每条 hypothesis 只标注定性影响（low/medium/high），严禁承诺具体数字。
-PIPELINE_PATCH / PROMPT_FIX 类只给文字描述，不自动修改代码。
+Each hypothesis only carries a qualitative impact (low/medium/high); promising concrete
+numbers is forbidden. PIPELINE_PATCH / PROMPT_FIX entries only describe the change in
+words and never modify code automatically.
 """
 from __future__ import annotations
 
@@ -20,10 +23,10 @@ from .schema import BadCaseReport, ChangeType, ConfigLayer, ImpactLevel, Improve
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config 层级分类辅助
+# Config layer classification helpers
 # ---------------------------------------------------------------------------
 
-# Layer 0 全局配置键集合：修改这些键将影响所有 benchmark
+# Layer 0 global config keys: changing them affects every benchmark
 _GLOBAL_CONFIG_KEYS: frozenset = frozenset({
     "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL_NAME", "LLM_TIMEOUT",
     "EMBEDDING_MODEL_ID", "EMBEDDING_CACHE_DIR",
@@ -32,24 +35,24 @@ _GLOBAL_CONFIG_KEYS: frozenset = frozenset({
 
 
 def _classify_config_layer(hypothesis: ImprovementHypothesis) -> ConfigLayer:
-    """Classify a hypothesis into Config 三层隔离 layer.
+    """Classify a hypothesis into a three-layer config isolation layer.
 
-    分类规则：
-    - PIPELINE_PATCH / PROMPT_FIX 改的是 src/sirchmunk/ 中的共享代码 → Layer 0 GLOBAL
-    - CONFIG_CHANGE 改的是 _GLOBAL_CONFIG_KEYS 中的全局 key → Layer 0 GLOBAL
-    - CONFIG_CHANGE 改的是 benchmark 专属配置（如 HOTPOT_*）→ Layer 2 SPECIFIC
-    - 默认：Layer 2 SPECIFIC（保守策略）
+    Classification rules:
+    - PIPELINE_PATCH / PROMPT_FIX touch shared code under src/sirchmunk/ -> Layer 0 GLOBAL
+    - CONFIG_CHANGE touching a global key in _GLOBAL_CONFIG_KEYS -> Layer 0 GLOBAL
+    - CONFIG_CHANGE touching benchmark-specific config such as HOTPOT_* -> Layer 2 SPECIFIC
+    - Default: Layer 2 SPECIFIC (conservative)
     """
     if hypothesis.change_type in (ChangeType.PIPELINE_PATCH, ChangeType.PROMPT_FIX):
-        # 代码和 prompt 修改均影响全局
+        # Code and prompt changes are always global
         return ConfigLayer.GLOBAL
 
     if hypothesis.change_type == ChangeType.CONFIG_CHANGE:
         keys = set(hypothesis.config_changes.keys())
         if keys & _GLOBAL_CONFIG_KEYS:
-            # 包含全局 key → Layer 0
+            # Contains a global key -> Layer 0
             return ConfigLayer.GLOBAL
-        # 全是 benchmark 专属配置 → Layer 2
+        # Only benchmark-specific config -> Layer 2
         return ConfigLayer.SPECIFIC
 
     return ConfigLayer.SPECIFIC
@@ -109,7 +112,7 @@ Return ONLY a valid JSON array. Each element:
 
 
 class ImprovementAdvisor:
-    """改进建议引擎。
+    """Improvement hypothesis engine.
 
     Usage::
 
@@ -120,7 +123,7 @@ class ImprovementAdvisor:
     def __init__(self, llm: Optional[Any] = None) -> None:
         """
         Args:
-            llm: OpenAIChat 实例；为 None 时只给出规则驱动的建议。
+            llm: OpenAIChat instance; when None only rule-driven suggestions are produced.
         """
         self._llm = llm
         self._id_counter = 0
@@ -135,39 +138,39 @@ class ImprovementAdvisor:
         config: Dict[str, Any],
         env_file: str = "",
     ) -> List[ImprovementHypothesis]:
-        """生成改进假设列表。
+        """Produce the list of improvement hypotheses.
 
         Args:
-            report:   BadCaseReport（来自 BadCaseAnalyzer.analyze()）。
-            config:   当前运行配置字典（来自 adapter.get_run_config()）。
-            env_file: 受影响的 .env 文件相对路径（供 CONFIG_CHANGE 使用）。
+            report:   BadCaseReport from BadCaseAnalyzer.analyze().
+            config:   current run-config dict from adapter.get_run_config().
+            env_file: relative path of the affected .env file, used by CONFIG_CHANGE.
 
         Returns:
-            排序好的 ImprovementHypothesis 列表（高影响优先）。
+            A sorted list of ImprovementHypothesis, high impact first.
         """
         hypotheses: List[ImprovementHypothesis] = []
 
-        # ---- Layer 1: 信号驱动规则建议 ----
+        # ---- Layer 1: signal-driven rule suggestions ----
         hypotheses.extend(self._rule_based_suggestions(report, config, env_file))
 
-        # ---- Layer 2: LLM 深度分析 ----
+        # ---- Layer 2: LLM deep analysis ----
         if self._llm:
             llm_hypotheses = await self._llm_deep_analysis(report, config, env_file)
-            # 去重：标题相似的不重复添加
+            # Deduplicate: skip hypotheses with a similar title
             existing_titles = {h.title.lower() for h in hypotheses}
             for h in llm_hypotheses:
                 if h.title.lower() not in existing_titles:
                     hypotheses.append(h)
                     existing_titles.add(h.title.lower())
 
-        # 按 estimated_impact 降序排列
+        # Sort by estimated_impact descending
         _impact_order = {ImpactLevel.HIGH: 0, ImpactLevel.MEDIUM: 1, ImpactLevel.LOW: 2}
         hypotheses.sort(key=lambda h: _impact_order.get(h.estimated_impact, 3))
 
         return hypotheses
 
     # ------------------------------------------------------------------
-    # Layer 1: 规则驱动
+    # Layer 1: rule driven
     # ------------------------------------------------------------------
 
     def _rule_based_suggestions(
@@ -176,7 +179,7 @@ class ImprovementAdvisor:
         config: Dict[str, Any],
         env_file: str,
     ) -> List[ImprovementHypothesis]:
-        """基于 root_cause_breakdown 和 metrics 生成规则建议。"""
+        """Generate rule suggestions from root_cause_breakdown and metrics."""
         results: List[ImprovementHypothesis] = []
         rc = report.root_cause_breakdown
         total_bad = max(report.total_badcases, 1)
@@ -192,7 +195,7 @@ class ImprovementAdvisor:
         top_k_key = str(config.get("top_k_env_key") or _benchmark_env_key(env_file, "TOP_K_FILES"))
         mode_key = str(config.get("mode_env_key") or _benchmark_env_key(env_file, "MODE"))
 
-        # --- 规则 1: 检索失败率高 → 提升 top_k ---
+        # --- Rule 1: high retrieval failure rate -> raise top_k ---
         if retrieval_pct > 0.35 or no_cov_pct > 0.40:
             new_top_k = min(current_top_k + 5, 20)
             if new_top_k > current_top_k:
@@ -215,7 +218,7 @@ class ImprovementAdvisor:
                 h.config_layer = _classify_config_layer(h)  # Layer 2 (SPECIFIC)
                 results.append(h)
 
-        # --- 规则 2: 证据不完整率高 → 切换 DEEP 模式 ---
+        # --- Rule 2: high incomplete-evidence rate -> switch to DEEP mode ---
         if evidence_partial_pct > 0.25 and current_mode == "FAST":
             h = ImprovementHypothesis(
                 hypothesis_id=self._next_id(),
@@ -236,7 +239,7 @@ class ImprovementAdvisor:
             h.config_layer = _classify_config_layer(h)  # Layer 2 (SPECIFIC)
             results.append(h)
 
-        # --- 规则 3: 合成错误率高 → 强化答案/证据校验 ---
+        # --- Rule 3: high synthesis error rate -> tighten answer/evidence validation ---
         if synthesis_pct > 0.30:
             h = ImprovementHypothesis(
                 hypothesis_id=self._next_id(),
@@ -259,7 +262,7 @@ class ImprovementAdvisor:
             h.config_layer = _classify_config_layer(h)
             results.append(h)
 
-        # --- 规则 4: judge_suspect 超过阈值 → 提醒人工审查 ---
+        # --- Rule 4: judge_suspect above threshold -> flag for manual review ---
         if report.judge_suspect_ids:
             pct = len(report.judge_suspect_ids) / total_bad
             if pct > 0.05:
@@ -290,7 +293,7 @@ class ImprovementAdvisor:
         return results
 
     # ------------------------------------------------------------------
-    # Layer 2: LLM 深度分析
+    # Layer 2: LLM deep analysis
     # ------------------------------------------------------------------
 
     async def _llm_deep_analysis(
@@ -299,7 +302,7 @@ class ImprovementAdvisor:
         config: Dict[str, Any],
         env_file: str,
     ) -> List[ImprovementHypothesis]:
-        """单次 LLM call，生成补充假设。"""
+        """One LLM call that produces supplementary hypotheses."""
         metrics_summary = (
             f"Accuracy: {report.accuracy:.1f}%  Coverage: {report.coverage:.1f}%  "
             f"Total: {report.total_samples}  Badcases: {report.total_badcases}"
@@ -311,7 +314,7 @@ class ImprovementAdvisor:
 
         pattern_summary = report.pattern_summary or "(not available)"
 
-        # 只展示关键 config 字段
+        # Show only the key config fields
         key_config = {
             k: v for k, v in config.items()
             if any(s in k.lower() for s in (
@@ -340,7 +343,7 @@ class ImprovementAdvisor:
             return []
 
     def _dict_to_hypothesis(self, item: Dict[str, Any], env_file: str) -> ImprovementHypothesis:
-        """将 LLM 输出 dict 转为 ImprovementHypothesis，并自动标注 config_layer。"""
+        """Convert an LLM output dict into an ImprovementHypothesis and tag config_layer."""
         try:
             ct = ChangeType(item.get("change_type", "config_change"))
         except ValueError:
@@ -363,24 +366,24 @@ class ImprovementAdvisor:
             env_file=str(item.get("env_file") or env_file),
             code_guidance=str(item.get("code_guidance", "")),
         )
-        # 自动标注层级
+        # Annotate the config layer automatically
         h.config_layer = _classify_config_layer(h)
         return h
 
     @staticmethod
     def _parse_json_array(raw: str) -> List[Dict[str, Any]]:
-        """从 LLM 响应中提取 JSON 数组。"""
+        """Extract the JSON array from an LLM response."""
         import re
-        # 去除 markdown code fences
+        # Strip markdown code fences
         cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
-        # 尝试直接解析
+        # Try a direct parse first
         try:
             result = json.loads(cleaned)
             if isinstance(result, list):
                 return result
         except (json.JSONDecodeError, ValueError):
             pass
-        # 提取第一个 [...] 块
+        # Extract the first [...] block
         m = re.search(r"\[.*\]", cleaned, re.DOTALL)
         if m:
             try:

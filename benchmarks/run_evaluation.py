@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""benchmarks/run_evaluation.py — 竞品横向评估 CLI
+"""benchmarks/run_evaluation.py — competitor comparison CLI
 
-此脚本与 run_research_loop.py 完全独立：
-  - run_research_loop.py : Sirchmunk 自改进循环（迭代优化自身）
-  - run_evaluation.py    : 横向对比（固定测试集，生成论文表格）
+This script is fully independent from run_research_loop.py:
+  - run_research_loop.py : the Sirchmunk self-improvement loop (iterates on itself)
+  - run_evaluation.py    : cross-system comparison (frozen test set, paper tables)
 
-使用方式::
+Usage::
 
-    # 1. 导入竞品预测 JSONL + 本文结果 → 生成完整比较表格
+    # 1. Import competitor prediction JSONL + our results -> full comparison table
     python benchmarks/run_evaluation.py \
       --benchmark hotpotqa \
       --env benchmarks/hotpotqa/.env.hotpotqa.frozen \
@@ -16,7 +16,7 @@
       --sirchmunk-results benchmarks/hotpotqa/output/results_YYYYMMDD.jsonl \
       --output-dir benchmarks/hotpotqa/output/paper_table/
 
-    # 2. 只填写已发表数字（不重新 Judge，直接写入表格）
+    # 2. Fill in published numbers only (no re-judging, written straight to the table)
     python benchmarks/run_evaluation.py \\
       --benchmark hotpotqa \\
       --env benchmarks/hotpotqa/.env.hotpotqa.frozen \\
@@ -24,7 +24,7 @@
       --sirchmunk-results benchmarks/hotpotqa/output/results_YYYYMMDD.jsonl \\
       --output-dir benchmarks/hotpotqa/output/paper_table/
 
-    # 3. 仅生成表格（不运行任何 baseline，纯汇聚已有结果）
+    # 3. Table only (runs no baseline, purely aggregates existing results)
     python benchmarks/run_evaluation.py \\
       --benchmark hotpotqa \\
       --env benchmarks/hotpotqa/.env.hotpotqa.frozen \\
@@ -42,7 +42,7 @@ import logging
 import sys
 from pathlib import Path
 
-# ── sys.path 注入 ─────────────────────────────────────────────────────
+# ── sys.path injection ──────────────────────────────────────────────
 _SCRIPT_DIR  = Path(__file__).parent.resolve()   # benchmarks/
 _PROJECT_ROOT = _SCRIPT_DIR.parent               # sirchmunk/
 _SRC = _PROJECT_ROOT / "src"
@@ -75,12 +75,12 @@ from evaluation.sampling_protocol import (  # noqa: E402
 
 
 def _load_bm_adapter(benchmark: str, env_file: str):
-    """加载 BenchmarkAdapter（通过共享registry）。"""
+    """Load a BenchmarkAdapter through the shared registry."""
     return load_benchmark_adapter(benchmark, env_file)
 
 
 def _parse_published(spec: str) -> dict:
-    """解析 'Name:acc=29.3,cov=100.0,lat=5.2' 格式。"""
+    """Parse the 'Name:acc=29.3,cov=100.0,lat=5.2' format."""
     name, _, rest = spec.partition(":")
     metrics = {}
     for kv in rest.split(","):
@@ -233,7 +233,7 @@ async def _main() -> int:
         logger.error("加载 BenchmarkAdapter 失败: %s", exc)
         return 1
 
-    # 输出目录
+    # Output directory
     out_dir = args.output_dir or str(
         Path(_SCRIPT_DIR) / args.benchmark / "output" / "paper_table"
     )
@@ -252,7 +252,7 @@ async def _main() -> int:
         logger.info("Using --sampling-protocol=%s; CLI sampling-method/golden-n/strata options are ignored.", args.sampling_protocol)
     sampling_protocol = _build_sampling_protocol(args, bm_adapter)
 
-    # ── 初始化 PaperTableGenerator ──────────────────────────────────
+    # ── Initialize PaperTableGenerator ───────────────────────────
     from evaluation.table_generator import PaperTableGenerator
     from framework.runner import UnifiedExperimentRunner
 
@@ -284,7 +284,7 @@ async def _main() -> int:
             print(json.dumps(_golden_summary(golden_set), indent=2, ensure_ascii=False))
             return 0
 
-    # ── 加载本文结果 ─────────────────────────────────────────────────
+    # ── Load the results of this work ──────────────────────────
     if args.sirchmunk_results:
         results_path = str(Path(args.sirchmunk_results).resolve())
         if not Path(results_path).exists():
@@ -302,7 +302,7 @@ async def _main() -> int:
         )
         logger.info("本文系统: %d 条结果", len(sirchmunk_results))
 
-    # ── 运行真实 / SDK 竞品 ─────────────────────────────────────────
+    # ── Run live / SDK competitors ────────────────────────────
     if args.baselines and not args.table_only:
         from evaluation.suite import BaselineEvaluationSuite
 
@@ -331,7 +331,7 @@ async def _main() -> int:
             )
             baseline_results = await suite.run(golden_set)
             for bm, results in baseline_results.items():
-                # 找 citation_name
+                # Resolve citation_name
                 citation = next(
                     (b.citation_name for b in baseline_list if b.name == bm),
                     bm,
@@ -340,7 +340,7 @@ async def _main() -> int:
                 gen.add_system_results(system_name=citation, results=results, question_type_key=question_type_key)
                 logger.info("竞品 '%s': %d 条结果", citation, len(results))
 
-    # ── 导入预计算 JSONL 竞品（重新 Judge）────────────────────────────
+    # ── Import precomputed JSONL competitors and re-judge ──
     if args.import_baseline and not args.table_only:
         from evaluation.suite import BaselineEvaluationSuite
         from baselines import ManualImportAdapter
@@ -385,7 +385,7 @@ async def _main() -> int:
                     )
                     gen.add_system_results(system_name=citation, results=results, question_type_key=question_type_key)
 
-    # ── 直接导入已发表数字（无需 Judge）──────────────────────────────
+    # ── Import published numbers directly, no judging ───
     for spec in (args.import_published or []):
         try:
             parsed = _parse_published(spec)
@@ -400,7 +400,7 @@ async def _main() -> int:
         except Exception as exc:
             logger.warning("解析 --import-published 失败: '%s' (%s)", spec, exc)
 
-    # ── 生成表格 ─────────────────────────────────────────────────────
+    # ── Generate tables ──────────────────────────────────────────
     paths = gen.generate(
         output_dir=out_dir,
         caption=args.caption,

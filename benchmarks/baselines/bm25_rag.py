@@ -1,15 +1,19 @@
 """baselines/bm25_rag.py — BM25-RAG baseline
 
-论文主表 baseline：固定 chunk → BM25 检索 top-k chunks → 同一 LLM 生成答案。
+Main-table paper baseline: fixed chunking -> BM25 retrieval of top-k chunks -> the
+same LLM generates the answer.
 
-与 LocalBM25Baseline 的区别：
-- LocalBM25Baseline 是 quickstart/local smoke baseline，可选轻量 LLM 合成，但不作为论文主表 baseline。
-- BM25RAGBaseline 使用固定 chunk 级 BM25 选择 chunks，再调用生成 LLM；适合作为论文主表 sparse RAG baseline。
+Difference from LocalBM25Baseline:
+- LocalBM25Baseline is the quickstart / local smoke baseline with optional light LLM
+  synthesis, and is not used as a main-table paper baseline.
+- BM25RAGBaseline selects chunks with fixed chunk-level BM25 and then calls the
+  generation LLM, which makes it a suitable sparse RAG baseline for the main table.
 
-公平性：
-- prepare() 记录 index build / preprocessing / storage 成本。
-- predict() 只统计 query-time latency。
-- 使用 BenchmarkAdapter 的 search paths，和 LENS 使用同一 GoldenSet 文档。
+Fairness:
+- prepare() records index build / preprocessing / storage cost.
+- predict() only accounts for query-time latency.
+- It uses the BenchmarkAdapter search paths, so it reads the same GoldenSet
+  documents as LENS.
 """
 from __future__ import annotations
 

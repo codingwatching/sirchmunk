@@ -1,8 +1,8 @@
 #!/bin/bash
 # Paper experiment queue (2026-08-12): wait for the running G_500 dynamic run,
 # then execute the remaining paper experiments sequentially to avoid API
-# concurrency contention. Task list mirrors the tables in
-# temp/papers/overleaf_version/lens_submission/aaai2027-lens-arxiv-v1.tex:
+# concurrency contention. Task list mirrors the paper result tables (the paper
+# source itself is kept outside this repository):
 #   T1  dynamic nested stages 125,250      -> tab:evidence_recall + lifecycle tables
 #   T2  stale-index arm (D_125 -> D_250)   -> tab:staleness
 #   T3  fullwiki ReAct + closed_book (n=150, dev150 ids) -> tab:fullwiki / tab:scale fullwiki column + no-retrieval reference

@@ -1,7 +1,8 @@
-"""framework/adapter.py — BenchmarkAdapter 抽象基类
+"""framework/adapter.py — BenchmarkAdapter abstract base class
 
-所有 benchmark 必须实现此接口以接入研究流水线。
-依赖倒置：UnifiedExperimentRunner 只依赖本抽象，不依赖具体 benchmark。
+Every benchmark must implement this interface to join the research pipeline.
+Dependency inversion: UnifiedExperimentRunner depends only on this abstraction, never
+on a concrete benchmark.
 """
 from __future__ import annotations
 
@@ -12,41 +13,41 @@ from .schema import BenchmarkSample
 
 
 class BenchmarkAdapter(ABC):
-    """Benchmark 接入适配器抽象基类。
+    """Abstract base class for benchmark onboarding adapters.
 
-    实现者需覆盖全部 abstractmethod。
-    可选 hook（带默认实现）：``extra_result_fields``。
+    Implementers must override every abstractmethod.
+    Optional hook with a default implementation: ``extra_result_fields``.
     """
 
     # ------------------------------------------------------------------
-    # 必须实现
+    # Must be implemented
     # ------------------------------------------------------------------
 
     @property
     @abstractmethod
     def name(self) -> str:
-        """Benchmark 名称，用于日志与文件命名。"""
+        """Benchmark name, used for logging and file naming."""
 
     @property
     @abstractmethod
     def env_file(self) -> str:
-        """主配置 .env 文件的绝对路径。"""
+        """Absolute path of the main .env config file."""
 
     @abstractmethod
     def load_samples(self, limit: int = 0, seed: int = 42) -> List[BenchmarkSample]:
-        """加载问题集。
+        """Load the question set.
 
         Args:
-            limit: 0 表示全量；>0 表示随机采样 limit 条（使用 seed）。
-            seed:  随机种子，保证复现性。
+            limit: 0 means the full set; >0 samples `limit` questions using `seed`.
+            seed:  random seed that keeps sampling reproducible.
 
         Returns:
-            BenchmarkSample 列表。
+            A list of BenchmarkSample.
         """
 
     @abstractmethod
     def validate_corpus(self) -> Tuple[int, List[str]]:
-        """验证语料库完整性。
+        """Validate corpus integrity.
 
         Returns:
             (found_count, missing_doc_names)
@@ -54,72 +55,78 @@ class BenchmarkAdapter(ABC):
 
     @abstractmethod
     def get_search_paths(self, sample: BenchmarkSample) -> List[str]:
-        """返回针对该样本的搜索路径列表。
+        """Return the list of search paths for the given sample.
 
-        singleDoc 模式返回单个 PDF 路径；
-        sharedCorpus 模式返回整个语料目录。
+        singleDoc mode returns a single PDF path; sharedCorpus mode returns the whole
+        corpus directory.
         """
 
     @abstractmethod
     def get_run_config(self) -> Dict[str, Any]:
-        """返回可序列化的运行配置字典，用于 config_hash 计算与实验记录。"""
+        """Return a serializable run-config dict for config_hash and experiment records."""
 
     @abstractmethod
     def build_searcher(self) -> Any:
-        """构建 AgenticSearch 实例（或兼容接口的搜索器）。"""
+        """Build an AgenticSearch instance, or any searcher with a compatible interface."""
 
     @abstractmethod
     def build_judge(self) -> Optional[Any]:
-        """构建 LLM Judge 实例；无 judge 时返回 None。"""
+        """Build the LLM judge instance, or return None when no judge is used."""
 
     @abstractmethod
     def get_output_dir(self) -> str:
-        """输出目录的绝对路径。"""
+        """Absolute path of the output directory."""
 
     @abstractmethod
     def get_work_path(self) -> str:
-        """AgenticSearch work_path 的绝对路径。"""
+        """Absolute path of the AgenticSearch work_path."""
 
     # ------------------------------------------------------------------
-    # 可选 hook（提供默认实现）
+    # Optional hooks with default implementations
     # ------------------------------------------------------------------
 
     def extra_result_fields(self, sample: BenchmarkSample) -> Dict[str, Any]:
-        """返回需要写入结果 JSONL 的 benchmark 特有字段。
+        """Return benchmark-specific fields to write into the result JSONL.
 
-        默认将 sample.metadata 全量透传。
-        子类可覆盖以精细控制。
+        By default the whole sample.metadata is passed through.
+        Subclasses may override for finer control.
         """
         return dict(sample.metadata)
 
     def get_max_concurrent(self) -> int:
-        """样本级并发度，默认 3。
+        """Sample-level concurrency, default 3.
 
-        语义分两层，不要混用：
-        - 本系统自身运行（UnifiedExperimentRunner）：同时处理多少个样本。
-        - 竞品评估（BaselineEvaluationSuite）：同时评估多少个竞品系统。
+        The semantics have two layers that must not be mixed:
+        - This system running itself (UnifiedExperimentRunner): how many samples are
+          processed concurrently.
+        - Competitor evaluation (BaselineEvaluationSuite): how many competitor systems
+          are evaluated concurrently.
 
-        它不控制单个竞品内部的样本并发，后者由各 BaselineAdapter 自己的
-        get_max_concurrent() 声明，默认串行。
+        It does not control per-competitor internal sample concurrency, which each
+        BaselineAdapter declares through its own get_max_concurrent(); the default there
+        is sequential.
         """
         return 3
 
     def get_baseline_sample_concurrency(self) -> int:
-        """竞品内部样本级并发的统一覆盖值，0 = 不覆盖。
+        """Unified override for per-competitor sample concurrency, 0 = no override.
 
-        默认不覆盖，即每个 BaselineAdapter 维持自己声明的（通常为串行）。
-        设为正整数可以把所有支持并发查询的竞品抬到同一并发度，这对多轮
-        LLM 竞品（如 ReAct）的墙钟时间影响数量级。代价是延迟列的测量条件随之
-        改变，因此实测并发度会随结果一起记录，供表格和审计使用。
+        By default nothing is overridden, so each BaselineAdapter keeps its own
+        declaration (usually sequential). Setting a positive integer lifts every
+        competitor that supports concurrent queries to the same concurrency, which
+        changes wall-clock time by an order of magnitude for multi-round LLM competitors
+        such as ReAct. The cost is that the measurement condition of the latency column
+        changes with it, so the realized concurrency is recorded alongside the results
+        for tables and audits.
         """
         return 0
 
     def get_request_delay(self) -> float:
-        """每次请求间延迟（秒），默认 0.5。"""
+        """Delay between requests in seconds, default 0.5."""
         return 0.5
 
     def get_search_kwargs(self) -> Dict[str, Any]:
-        """传递给 searcher.search() 的额外关键字参数。"""
+        """Extra keyword arguments forwarded to searcher.search()."""
         return {}
 
     def get_protocol_spec(self, run_id: str, seed: int, limit: int) -> Dict[str, Any]:

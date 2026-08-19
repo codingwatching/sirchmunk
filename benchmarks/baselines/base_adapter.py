@@ -1,16 +1,17 @@
-"""baselines/base_adapter.py — BaselineAdapter 抽象基类
+"""baselines/base_adapter.py — BaselineAdapter abstract base class
 
-竞品系统适配器接口，完全独立于 framework/ 自改进循环。
+Competitor system adapter interface, fully independent from the framework/
+self-improvement loop.
 
-设计原则：
-- 比 BenchmarkAdapter 更薄：只需实现 predict() 和若干属性
-- 不涉及 build_searcher / work_path / Config 三层隔离 等自改进相关概念
-- 数据结构自成体系，通过 evaluation/suite.py 与 framework/schema.py 桥接
+Design principles:
+- Thinner than BenchmarkAdapter: only predict() and a few properties are required
+- No build_searcher / work_path / three-layer config isolation concepts
+- Self-contained data structures, bridged to framework/schema.py via evaluation/suite.py
 
-竞品接入方式对应关系：
-    有 Python SDK      → SdkBaseline (baselines/sdk_baseline.py)
-    有 HTTP API        → 继承 BaselineAdapter，在 predict() 中发 HTTP 请求
-    只有发表数字        → ManualImportAdapter (baselines/sdk_baseline.py)
+How to onboard a competitor:
+    Has a Python SDK    -> SdkBaseline (baselines/sdk_baseline.py)
+    Has an HTTP API     -> subclass BaselineAdapter and issue the HTTP call in predict()
+    Published numbers   -> ManualImportAdapter (baselines/sdk_baseline.py)
 """
 from __future__ import annotations
 
@@ -30,7 +31,7 @@ except ImportError:  # pragma: no cover - allows direct module loading in isolat
 
 
 # ---------------------------------------------------------------------------
-# 核心数据结构
+# Core data structures
 # ---------------------------------------------------------------------------
 
 
@@ -60,24 +61,24 @@ class BaselineSetupResult:
 
 @dataclass
 class BaselinePrediction:
-    """单次预测结果，由 BaselineAdapter.predict() 返回。"""
+    """A single prediction returned by BaselineAdapter.predict()."""
     answer: str
-    elapsed: float              # 耗时（秒）
-    tokens_used: int = 0        # 消耗 token 数（若可获取）
+    elapsed: float              # Elapsed time in seconds
+    tokens_used: int = 0        # Consumed tokens when available
     metadata: Dict[str, Any] = field(default_factory=dict)
     """metadata 可存放系统特有信息（如检索到的文档列表等）。"""
 
 
 @dataclass
 class BaselineResult:
-    """经过 Judge 评估后的单样本完整结果。
+    """Complete per-sample result after judging.
 
-    由 BaselineEvaluationSuite 生成，用于 PaperTableGenerator 汇聚。
-    字段命名有意对齐 framework/schema.py 的 PredictionResult，
-    以便 PaperTableGenerator 统一处理。
+    Produced by BaselineEvaluationSuite and consumed by PaperTableGenerator.
+    Field names deliberately mirror PredictionResult in framework/schema.py so that
+    PaperTableGenerator can handle both uniformly.
     """
     sample_id: str
-    system_name: str                    # 对应 BaselineAdapter.citation_name
+    system_name: str                    # Mirrors BaselineAdapter.citation_name
     question: str
     gold_answer: str
     prediction: str
@@ -87,7 +88,7 @@ class BaselineResult:
     elapsed: float = 0.0
     tokens_used: int = 0
     judge_tokens: int = 0
-    question_type: str = ""             # 从 sample metadata 提取，用于分类统计
+    question_type: str = ""             # Taken from sample metadata for grouped statistics
     error: Optional[str] = None
     failure_reason: str = ""
     telemetry: Dict[str, Any] = field(default_factory=dict)
@@ -95,15 +96,16 @@ class BaselineResult:
 
 
 # ---------------------------------------------------------------------------
-# 抽象基类
+# Abstract base class
 # ---------------------------------------------------------------------------
 
 
 class BaselineAdapter(ABC):
-    """竞品系统适配器抽象基类。
+    """Abstract base class for competitor system adapters.
 
-    实现者只需覆盖 predict()、name 和 citation_name。
-    is_available() 可选覆盖（用于在运行前检查 API key / SDK 等依赖）。
+    Implementers only need to override predict(), name and citation_name.
+    is_available() is an optional override used to check dependencies such as an API key
+    or SDK before the run starts.
 
     Usage::
 
@@ -124,23 +126,23 @@ class BaselineAdapter(ABC):
     result_schema_version = "baseline_result_v2"
 
     # ------------------------------------------------------------------
-    # 必须实现
+    # Must be implemented
     # ------------------------------------------------------------------
 
     @property
     @abstractmethod
     def name(self) -> str:
-        """系统内部标识符（用于文件命名、日志），不含空格。
-        
-        例如: "gpt4o_zeroshot", "naive_rag_v2"
+        """Internal system identifier used for file naming and logs, no spaces.
+
+        For example: "gpt4o_zeroshot", "naive_rag_v2"
         """
 
     @property
     @abstractmethod
     def citation_name(self) -> str:
-        """论文表格中的展示名称（允许空格、括号）。
-        
-        例如: "GPT-4o (zero-shot)", "Naive RAG", "LENS (ours)"
+        """Display name used in paper tables; spaces and parentheses are allowed.
+
+        For example: "GPT-4o (zero-shot)", "Naive RAG", "LENS (ours)"
         """
 
     @abstractmethod
@@ -149,20 +151,21 @@ class BaselineAdapter(ABC):
         question: str,
         context_paths: List[str],
     ) -> BaselinePrediction:
-        """给定问题和文档路径，返回答案。
+        """Answer the question given the document paths.
 
         Args:
-            question:      原始问题文本。
-            context_paths: 与本题相关的文档路径列表（由 BenchmarkAdapter
-                           提供，与 Sirchmunk 使用相同路径，保证对比公平）。
-                           竞品可以使用这些路径，也可以忽略（如纯参数化模型）。
+            question:      raw question text.
+            context_paths: document paths relevant to this question, provided by
+                           BenchmarkAdapter. They are the same paths Sirchmunk uses so
+                           the comparison stays fair. A competitor may use them or
+                           ignore them, for instance a purely parametric model.
 
         Returns:
-            BaselinePrediction，包含答案文本和耗时。
+            A BaselinePrediction holding the answer text and elapsed time.
         """
 
     # ------------------------------------------------------------------
-    # 检索契约（评估口径的前提）
+    # Retrieval contract (precondition for comparable metrics)
     # ------------------------------------------------------------------
 
     # How this system obtains its answers. Every baseline is compared on the
@@ -241,7 +244,7 @@ class BaselineAdapter(ABC):
         return problems
 
     # ------------------------------------------------------------------
-    # 可选覆盖
+    # Optional overrides
     # ------------------------------------------------------------------
 
     async def prepare(self, golden_set: Any = None, bm_adapter: Any = None) -> BaselineSetupResult:
@@ -395,10 +398,10 @@ class BaselineAdapter(ABC):
         return "unknown"
 
     def is_available(self) -> bool:
-        """检查系统依赖是否满足（API key、SDK import 等）。
+        """Check whether system dependencies are satisfied (API key, SDK import, ...).
 
-        运行前调用，返回 False 时该系统被跳过并记录警告。
-        默认返回 True（乐观假设）。
+        Called before the run; returning False skips the system and logs a warning.
+        Defaults to True (optimistic assumption).
         """
         return True
 
@@ -407,25 +410,26 @@ class BaselineAdapter(ABC):
         return False
 
     def get_max_concurrent(self) -> int:
-        """最大并发请求数。默认 1（串行），避免 API 限流。"""
+        """Maximum concurrent requests. Default 1 (sequential) to avoid API throttling."""
         return 1
 
     def supports_query_concurrency(self) -> bool:
-        """本竞品是否允许多个样本同时查询。
+        """Whether this competitor allows several samples to be queried concurrently.
 
-        默认 True。声明 False 的竞品不会被 benchmark 级的并发覆盖影响，用于
-        查询路径共享可变实例、并发安全性未经验证的情形。
+        Defaults to True. A competitor declaring False is never affected by the
+        benchmark-level concurrency override; use it when the query path shares mutable
+        state or its concurrency safety has not been verified.
         """
         return True
 
     def get_request_delay(self) -> float:
-        """每次请求间延迟（秒）。默认 1.0。"""
+        """Delay between requests in seconds. Default 1.0."""
         return 1.0
 
     def extra_metadata(self) -> Dict[str, Any]:
-        """附加到 BaselineResult.metadata 的系统级元数据。
-        
-        如: {"model": "gpt-4o-2024-05-13", "temperature": 0}
+        """System-level metadata attached to BaselineResult.metadata.
+
+        For example: {"model": "gpt-4o-2024-05-13", "temperature": 0}
         """
         return {}
 

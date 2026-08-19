@@ -1,8 +1,9 @@
 """framework/runner.py — UnifiedExperimentRunner
 
-统一异步实验执行器，通过 BenchmarkAdapter 接口与具体 benchmark 解耦。
-每次 run() 返回 List[PredictionResult] 并将原始结果写入 output/ JSONL。
-同时收集 git_commit + config_hash 以保证可复现性。
+Unified asynchronous experiment executor, decoupled from any concrete benchmark through
+the BenchmarkAdapter interface.
+Each run() returns List[PredictionResult] and writes the raw results to output/ JSONL.
+It also collects git_commit + config_hash to keep runs reproducible.
 """
 from __future__ import annotations
 
@@ -37,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 def _get_git_commit() -> str:
-    """获取当前 HEAD commit hash（前 12 位）；失败时返回 'unknown'。"""
+    """Return the first 12 characters of the current HEAD commit hash, or 'unknown'."""
     try:
         import subprocess
         result = subprocess.run(
@@ -52,7 +53,7 @@ def _get_git_commit() -> str:
 
 
 def _config_hash(config: dict) -> str:
-    """对配置字典计算 SHA-256 前 16 位，用于快速标识配置版本。"""
+    """Compute the first 16 characters of the config dict SHA-256 to identify a config version."""
     try:
         serialized = json.dumps(config, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(serialized.encode()).hexdigest()[:16]
@@ -109,13 +110,14 @@ def _validate_stage_config(config: Dict[str, Any]) -> None:
 
 
 class UnifiedExperimentRunner:
-    """统一实验执行器。
+    """Unified experiment executor.
 
-    设计原则：
-    - 只依赖 BenchmarkAdapter 接口，不 import 具体 benchmark 代码
-    - 单问题执行逻辑完全通过 adapter 的 build_searcher / build_judge 获取
-    - 结果实时写入 output/ JSONL（防止崩溃丢失）
-    - 收集并返回实验元数据（git_commit, config_hash, run_id）
+    Design principles:
+    - Depends only on the BenchmarkAdapter interface; never imports concrete benchmark code
+    - Per-question execution is fully obtained through the adapter build_searcher /
+      build_judge
+    - Results stream to output/ JSONL so a crash cannot lose them
+    - Collects and returns experiment metadata (git_commit, config_hash, run_id)
     """
 
     def __init__(self, adapter: BenchmarkAdapter) -> None:
@@ -135,20 +137,23 @@ class UnifiedExperimentRunner:
         stage: str = "exploration",
         system_name: str = "sirchmunk",
     ) -> tuple[List[PredictionResult], dict]:
-        """执行完整实验。
+        """Run the full experiment.
 
         Args:
-            limit: 0 表示全量；>0 表示随机采样。
-            seed:  随机种子。
-            run_id: 外部指定的 run_id；为 None 时自动生成时间戳 ID。
-            resume: 若 True，同 run_id 重跑会读取 checkpoint 并跳过已完成样本。
-            config_overrides: P3队列传入的运行期覆盖配置，不修改adapter/env。
-            stage: exploration 或 frozen；用于artifact和registry区分调优/冻结评估。
-            system_name: 系统名称，默认 sirchmunk。
+            limit: 0 means the full set; >0 samples randomly.
+            seed:  random seed.
+            run_id: externally supplied run_id; a timestamp ID is generated when None.
+            resume: when True, rerunning the same run_id reads the checkpoint and skips
+                finished samples.
+            config_overrides: runtime overrides passed in by the P3 queue; the adapter and
+                env files are left untouched.
+            stage: exploration or frozen; separates tuning from frozen evaluation in
+                artifacts and the registry.
+            system_name: system name, defaults to sirchmunk.
 
         Returns:
-            (results, meta) 其中 meta 含 run_id / git_commit / config_hash /
-            results_path / timestamp。
+            (results, meta) where meta holds run_id / git_commit / config_hash /
+            results_path / timestamp.
         """
         adapter = self._adapter
         ts = local_timestamp()
@@ -163,7 +168,7 @@ class UnifiedExperimentRunner:
         config.setdefault("frozen_evaluation", stage == "frozen")
         _validate_stage_config(config)
 
-        # 加载样本
+        # Load samples
         samples = adapter.load_samples(limit=limit, seed=seed)
         sample_ids = [sample.sample_id for sample in samples]
         config["sample_count"] = len(samples)
@@ -176,13 +181,13 @@ class UnifiedExperimentRunner:
         logger.info("[Runner] %d samples loaded  sample_id_checksum=%s", len(samples), config["sample_id_checksum"])
         logger.info("=" * 60)
 
-        # 验证语料库
+        # Validate the corpus
         found, missing = adapter.validate_corpus()
         logger.info("[Runner] Corpus: %d found, %d missing", found, len(missing))
         if missing:
             logger.warning("[Runner] Missing: %s", missing[:5])
 
-        # 构建搜索器 & judge（共享单例，避免重复初始化）
+        # Build searcher and judge as shared singletons to avoid re-initialization
         searcher = adapter.build_searcher()
         judge = adapter.build_judge()
 
@@ -200,7 +205,7 @@ class UnifiedExperimentRunner:
             retry_config_kwargs["retryable_markers"] = retry_markers
         retry_policy = RetryPolicy(RetryConfig(**retry_config_kwargs))
 
-        # 准备输出路径与ResearchOps artifact目录
+        # Prepare the output paths and the ResearchOps artifact directory
         out_dir = Path(adapter.get_output_dir())
         out_dir.mkdir(parents=True, exist_ok=True)
         results_path = str(out_dir / f"results_{ts}.jsonl")
@@ -284,7 +289,7 @@ class UnifiedExperimentRunner:
             env_file=getattr(adapter, "env_file", ""),
         )
 
-        # 并发执行
+        # Concurrent execution
         semaphore = asyncio.Semaphore(adapter.get_max_concurrent())
         completed_rows = checkpoint.load_completed_rows(sample_ids) if resume else []
         results: List[PredictionResult] = rows_to_prediction_results(completed_rows)
@@ -341,7 +346,7 @@ class UnifiedExperimentRunner:
                     result = self._error_result(sample, exc, retry_attempts=1, retried=False)
                 except Exception as exc:
                     result = self._error_result(sample, exc, retry_attempts=1, retried=False)
-                # 实时写入（append mode，防崩溃）
+                # Stream results in append mode so a crash cannot lose them
                 raw_row = self._result_to_row(result, sample, adapter)
                 per_sample_eval = self._result_to_per_sample_eval(result, sample)
                 raw_row["per_sample_eval"] = per_sample_eval
@@ -366,7 +371,7 @@ class UnifiedExperimentRunner:
                     acc_tag, cov_tag, result.elapsed,
                 )
 
-                # 请求间延迟
+                # Inter-request delay
                 delay = adapter.get_request_delay()
                 if delay > 0:
                     await asyncio.sleep(delay)
@@ -465,7 +470,7 @@ class UnifiedExperimentRunner:
 
     @classmethod
     def load_results_from_jsonl(cls, results_path: str) -> List[PredictionResult]:
-        """从已有 JSONL 文件加载 PredictionResult 列表（--skip-run 模式）。"""
+        """Load a list of PredictionResult from an existing JSONL (--skip-run mode)."""
         results = []
         with open(results_path, encoding="utf-8") as f:
             for line in f:
@@ -490,7 +495,7 @@ class UnifiedExperimentRunner:
     # ------------------------------------------------------------------
 
     async def _run_single(self, sample, searcher, judge, adapter) -> PredictionResult:
-        """执行单个样本的搜索 + 评估。"""
+        """Run search plus evaluation for a single sample."""
         t0 = time.time()
         prediction = ""
         telemetry: dict = {}
@@ -537,7 +542,7 @@ class UnifiedExperimentRunner:
 
         elapsed = time.time() - t0
 
-        # LLM Judge 评估
+        # LLM judge evaluation
         if judge is not None:
             try:
                 judge_result = await judge.judge(
@@ -650,7 +655,7 @@ class UnifiedExperimentRunner:
 
     @staticmethod
     def _result_to_row(result: PredictionResult, sample, adapter) -> dict:
-        """将 PredictionResult + 样本 metadata 合并为 JSONL 行。"""
+        """Merge a PredictionResult with the sample metadata into a JSONL row."""
         row = {
             "sample_id": result.sample_id,
             "question": sample.question,

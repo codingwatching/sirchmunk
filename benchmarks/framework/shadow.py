@@ -1,17 +1,20 @@
 """framework/shadow.py — ShadowEvaluator
 
-轻量级跨 benchmark 预评估，专用于 CONFIG_CHANGE 类型的 Layer 0/1 假设。
+Lightweight cross-benchmark pre-evaluation, dedicated to Layer 0/1 hypotheses of type
+CONFIG_CHANGE.
 
-核心思路：
-  在正式全量实验之前，用每个 benchmark 约 10% 的样本估算变更效果。
-  成本：~10-15 题 × N benchmarks，vs 全量 150 题 × N benchmarks。
-  仅支持 CONFIG_CHANGE（能通过覆盖 search_kwargs 实现）。
-  PIPELINE_PATCH / PROMPT_FIX 无法通过此方式预估，跳过并提示人工评审。
+Core idea:
+  Before the full experiment, estimate the effect of a change using about 10% of the
+  samples of each benchmark.
+  Cost: ~10-15 questions x N benchmarks, versus the full 150 questions x N benchmarks.
+  Only CONFIG_CHANGE is supported, because it can be realized by overriding search_kwargs.
+  PIPELINE_PATCH / PROMPT_FIX cannot be estimated this way; they are skipped with a hint
+  for manual review.
 
-工作机制：
-  1. 从 hypothesis.config_changes 提取可映射为 search_kwargs 的键
-  2. 对每个 adapter，以 base_kwargs + overrides 运行小批量
-  3. 与 baseline 对比，返回 ImpactMatrix
+How it works:
+  1. extract the keys of hypothesis.config_changes that map to search_kwargs
+  2. run a small batch per adapter with base_kwargs + overrides
+  3. compare against the baseline and return an ImpactMatrix
 """
 from __future__ import annotations
 
@@ -24,25 +27,25 @@ from .schema import ChangeType, ConfigLayer, ImprovementHypothesis, PredictionRe
 
 logger = logging.getLogger(__name__)
 
-# env key → search kwarg 映射规则：剥去 benchmark 前缀后 lowercase
-# 支持的 search kwargs（与 AgenticSearch.search() 参数对应）
+# env key -> search kwarg rule: strip the benchmark prefix, then lowercase
+# Supported search kwargs, mirroring AgenticSearch.search() parameters
 _SEARCH_KWARG_NAMES = frozenset({
     "mode", "top_k_files", "max_token_budget", "enable_dir_scan",
 })
 
-# benchmark 专属前缀列表（新增 benchmark 时在此添加前缀即可）
+# Benchmark-specific prefixes; add a prefix here when adding a benchmark
 _BM_PREFIXES = ("HOTPOT_", "MECHANISM_")
 
 
 @dataclass
 class BmShadowResult:
-    """单个 benchmark 的 shadow 评估结果。"""
+    """Shadow evaluation result of a single benchmark."""
     benchmark: str
     n_samples: int
     accuracy: float
     coverage: float
     avg_latency: float
-    applicable: bool = True    # False 表示该假设的 config_changes 对本 bm 无适用 kwarg
+    applicable: bool = True    # False means this hypothesis has no applicable kwarg for the benchmark
     error: Optional[str] = None
 
     def accuracy_delta(self, baseline: float) -> float:
@@ -54,7 +57,7 @@ class BmShadowResult:
 
 @dataclass
 class ShadowImpactMatrix:
-    """假设在所有 benchmark 上的预估影响矩阵。"""
+    """Estimated impact matrix of a hypothesis across all benchmarks."""
     hypothesis_id: str
     results: Dict[str, BmShadowResult] = field(default_factory=dict)
     # {bm: {accuracy_delta, coverage_delta}}（vs baseline_vector）
@@ -62,7 +65,7 @@ class ShadowImpactMatrix:
 
     @property
     def pareto_status(self) -> str:
-        """根据 accuracy delta 判断 Pareto 状态。"""
+        """Derive the Pareto status from the accuracy delta."""
         applicable = {bm: r for bm, r in self.results.items() if r.applicable}
         if not applicable:
             return "unknown"
@@ -100,10 +103,10 @@ class ShadowImpactMatrix:
 
 
 def _env_key_to_search_kwarg(key: str) -> Optional[str]:
-    """将 env key 映射为 search kwarg 名称。
+    """Map an env key to a search kwarg name.
 
-    规则：剥去 benchmark 前缀（HOTPOT_、MECHANISM_ 等）后 lowercase。
-    不在 _SEARCH_KWARG_NAMES 白名单中的 key 返回 None。
+    Rule: strip the benchmark prefix (HOTPOT_, MECHANISM_, ...) and lowercase the rest.
+    Keys outside the _SEARCH_KWARG_NAMES allowlist return None.
     """
     upper_key = key.upper()
     for prefix in _BM_PREFIXES:
@@ -115,22 +118,23 @@ def _env_key_to_search_kwarg(key: str) -> Optional[str]:
 
 
 def _coerce_kwarg(kwarg_name: str, value: str) -> Any:
-    """将字符串 value 强制转为 search kwarg 期望的类型。"""
+    """Coerce a string value into the type expected by the search kwarg."""
     if kwarg_name == "top_k_files":
         return int(value)
     if kwarg_name == "max_token_budget":
         return int(value)
     if kwarg_name == "enable_dir_scan":
         return str(value).lower() in ("true", "1", "yes")
-    # mode 等字符串类型直接返回
+    # String-typed values such as mode are returned as-is
     return value
 
 
 class ShadowEvaluator:
-    """跨 benchmark 轻量预评估器。
+    """Lightweight cross-benchmark pre-evaluator.
 
-    仅支持 CONFIG_CHANGE 类型且 config_changes 能映射到 search_kwargs 的假设。
-    PIPELINE_PATCH / PROMPT_FIX 无法预评估，返回空结果并记录日志。
+    Supports only CONFIG_CHANGE hypotheses whose config_changes map onto search_kwargs.
+    PIPELINE_PATCH / PROMPT_FIX cannot be pre-evaluated: an empty result is returned and
+    the reason is logged.
 
     Usage::
 
@@ -151,21 +155,21 @@ class ShadowEvaluator:
         sample_fraction: float = 0.10,
         seed: int = 99,
     ) -> ShadowImpactMatrix:
-        """对所有 adapter 并发运行小批量评估，返回影响矩阵。
+        """Run a small batch on every adapter concurrently and return the impact matrix.
 
         Args:
-            hypothesis:       要评估的改进假设。
-            adapters:         所有已注册的 BenchmarkAdapter 列表。
-            baseline_vector:  当前基线指标向量 {bm: {accuracy, coverage, ...}}。
-            sample_fraction:  采样比例（默认 10%）。
-            seed:             用于复现的随机种子。
+            hypothesis:       improvement hypothesis to evaluate.
+            adapters:         list of every registered BenchmarkAdapter.
+            baseline_vector:  current baseline metric vector {bm: {accuracy, coverage, ...}}.
+            sample_fraction:  sampling fraction (default 10%).
+            seed:             random seed used for reproducibility.
 
         Returns:
-            ShadowImpactMatrix，含每个 benchmark 的 delta 估算。
+            A ShadowImpactMatrix holding the delta estimate of each benchmark.
         """
         matrix = ShadowImpactMatrix(hypothesis_id=hypothesis.hypothesis_id)
 
-        # 只支持 CONFIG_CHANGE
+        # Only CONFIG_CHANGE is supported
         if hypothesis.change_type != ChangeType.CONFIG_CHANGE:
             logger.info(
                 "[Shadow] %s: skip non-CONFIG_CHANGE (%s)",
@@ -178,7 +182,7 @@ class ShadowEvaluator:
                 )
             return matrix
 
-        # 并发运行每个 adapter 的 shadow eval
+        # Run the shadow eval of each adapter concurrently
         tasks = {
             adapter.name: asyncio.create_task(
                 self._eval_single_adapter(
@@ -202,7 +206,7 @@ class ShadowEvaluator:
                 )
             matrix.results[bm_name] = result
 
-        # 计算 delta vs baseline
+        # Compute the delta against the baseline
         for bm, r in matrix.results.items():
             if not r.applicable or r.error:
                 continue
@@ -223,8 +227,8 @@ class ShadowEvaluator:
         sample_fraction: float,
         seed: int,
     ) -> BmShadowResult:
-        """运行单个 adapter 的 shadow 评估。"""
-        # 构建 search_kwargs 覆盖
+        """Run the shadow evaluation of a single adapter."""
+        # Build the search_kwargs override
         overrides: Dict[str, Any] = {}
         for env_key, new_val in hypothesis.config_changes.items():
             kwarg = _env_key_to_search_kwarg(env_key)
@@ -237,18 +241,18 @@ class ShadowEvaluator:
                 accuracy=0, coverage=0, avg_latency=0, applicable=False,
             )
 
-        # 计算样本数（最少 5 题，最多 30 题）
+        # Resolve the sample count (at least 5, at most 30 questions)
         full_samples = adapter.load_samples(limit=0, seed=seed)
         n = max(5, min(30, int(len(full_samples) * sample_fraction)))
         samples = adapter.load_samples(limit=n, seed=seed)
 
-        # 使用原搜索器，覆盖 search_kwargs
+        # Reuse the original searcher and override search_kwargs
         searcher = adapter.build_searcher()
         judge = adapter.build_judge()
         base_kwargs = dict(adapter.get_search_kwargs())
         base_kwargs.update(overrides)
 
-        # 顺序执行（shadow eval 不需要并发，降低 API 压力）
+        # Run sequentially: shadow eval needs no concurrency and this lowers API pressure
         correct = 0
         coverage_count = 0
         elapsed_list = []

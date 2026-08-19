@@ -13,19 +13,19 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# ── sys.path 注入 ─────────────────────────────────────────────────────
+# ── sys.path injection ──────────────────────────────────────────────
 _HERE = Path(__file__).parent.resolve()      # benchmarks/hotpotqa/
 _BENCHMARKS_ROOT = _HERE.parent              # benchmarks/
 _PROJECT_ROOT = _BENCHMARKS_ROOT.parent      # sirchmunk/
 _SRC = _PROJECT_ROOT / "src"
 
-# Layer 0 全局共享配置文件路径（可选）
+# Optional path to the Layer 0 shared global config file
 _GLOBAL_ENV = _BENCHMARKS_ROOT / ".env.global"
 
-# Layer 1 HotpotQA 共享配置文件路径（可选，profile 可覆盖）
+# Optional Layer 1 HotpotQA shared config path, overridable per profile
 _HOTPOT_BASE_ENV = _HERE / ".env.hotpotqa.base"
 
-# HotpotQA 专属 work_path（固定，不受 CWD 影响）
+# HotpotQA-specific work_path, fixed and independent of the CWD
 _HOTPOT_WORK_PATH = str(_HERE / ".work")
 
 for _p in (str(_SRC),):
@@ -52,7 +52,7 @@ from hotpotqa.metrics import compute_hotpotqa_metrics  # noqa: E402
 
 
 def _load_env_file(path: str | Path) -> Dict[str, str]:
-    """简单解析 .env 文件为 dict（不依赖 python-dotenv）。"""
+    """Parse a .env file into a dict without depending on python-dotenv."""
     result: Dict[str, str] = {}
     p = Path(path)
     if not p.exists():
@@ -72,7 +72,7 @@ def _default_base_env_path() -> Path:
 
 
 def _load_env_layers(profile_env_file: str) -> tuple[Dict[str, str], List[str]]:
-    """加载 HotpotQA 多层 env，优先级为 global < base < profile < os.environ。"""
+    """Load the layered HotpotQA env with precedence global < base < profile < os.environ."""
     env: Dict[str, str] = {}
     sources: List[str] = []
     for path in (_GLOBAL_ENV, _default_base_env_path(), Path(profile_env_file)):
@@ -84,11 +84,11 @@ def _load_env_layers(profile_env_file: str) -> tuple[Dict[str, str], List[str]]:
 
 
 class HotpotQAAdapter(BenchmarkAdapter):
-    """HotpotQA 适配器（占位实现）。
+    """HotpotQA adapter.
 
-    当前状态：接口已完整实现，数据加载使用 parquet 文件。
-    如需完整运行，确保 HOTPOT_DATASET_DIR 正确配置，
-    并安装 pyarrow / pandas 依赖。
+    Current state: the interface is fully implemented and data loading reads parquet
+    files. For a complete run, make sure HOTPOT_DATASET_DIR is configured correctly
+    and the pyarrow / pandas dependencies are installed.
 
     Usage::
 
@@ -163,7 +163,7 @@ class HotpotQAAdapter(BenchmarkAdapter):
         return self._env_file
 
     # ------------------------------------------------------------------
-    # BenchmarkAdapter 接口
+    # BenchmarkAdapter interface
     # ------------------------------------------------------------------
 
     def load_samples(self, limit: int = 0, seed: int = 42) -> List[BenchmarkSample]:
@@ -316,10 +316,10 @@ class HotpotQAAdapter(BenchmarkAdapter):
         }
 
     def build_searcher(self) -> Any:
-        """构建并缓存 AgenticSearch 实例。
+        """Build and cache the AgenticSearch instance.
 
-        work_path 使用 self.get_work_path()（benchmarks/hotpotqa/.work），
-        与 FinanceBenchAdapter 的 .work 完全隔离。
+        work_path comes from self.get_work_path() (benchmarks/hotpotqa/.work) and is
+        fully isolated from the .work directory of FinanceBenchAdapter.
         """
         if self._searcher is None:
             from sirchmunk.llm.openai_chat import OpenAIChat
@@ -332,7 +332,7 @@ class HotpotQAAdapter(BenchmarkAdapter):
             )
             self._searcher = AgenticSearch(
                 llm=llm,
-                work_path=self.get_work_path(),  # 使用隔离后的绝对路径
+                work_path=self.get_work_path(),  # Use the isolated absolute path
                 reuse_knowledge=self._get_bool("HOTPOT_REUSE_KNOWLEDGE", False),
                 verbose=False,
                 # Evaluation scores a refusal like a wrong answer, so the
@@ -370,7 +370,7 @@ class HotpotQAAdapter(BenchmarkAdapter):
         return self._judge
 
     def get_output_dir(self) -> str:
-        """HotpotQA 输出目录：相对路径以 benchmark 目录为基准。"""
+        """HotpotQA output directory: relative paths resolve against the benchmark dir."""
         raw = self._get("HOTPOT_OUTPUT_DIR", "./output")
         p = Path(raw)
         if p.is_absolute():
@@ -378,22 +378,24 @@ class HotpotQAAdapter(BenchmarkAdapter):
         return str((_HERE / p).resolve())
 
     def get_work_path(self) -> str:
-        """返回 HotpotQA 专属 work_path（固定为 benchmarks/hotpotqa/.work）。
+        """Return the HotpotQA-specific work_path, fixed to benchmarks/hotpotqa/.work.
 
-        不受 HOTPOT_OUTPUT_DIR 或 CWD 影响，与 FinanceBenchAdapter 缓存完全隔离。
+        It is unaffected by HOTPOT_OUTPUT_DIR or the CWD and stays fully isolated from
+        the FinanceBenchAdapter cache.
         """
         return _HOTPOT_WORK_PATH
 
     def get_max_concurrent(self) -> int:
-        """HOTPOT_MAX_CONCURRENT：LENS 自身运行的样本并发 + 同时评估的竞品数。
+        """HOTPOT_MAX_CONCURRENT: LENS sample concurrency plus concurrent competitors.
 
-        不影响单个竞品内部的样本并发，后者由 HOTPOT_BASELINE_SAMPLE_CONCURRENT
-        统一覆盖，未设时保留各 BaselineAdapter 自己的声明。
+        It does not affect per-competitor internal sample concurrency, which is
+        controlled by HOTPOT_BASELINE_SAMPLE_CONCURRENT; when that is unset, each
+        BaselineAdapter keeps its own declaration.
         """
         return self._get_int("HOTPOT_MAX_CONCURRENT", 3)
 
     def get_baseline_sample_concurrency(self) -> int:
-        """HOTPOT_BASELINE_SAMPLE_CONCURRENT：竞品内部样本并发，0 = 不覆盖。"""
+        """HOTPOT_BASELINE_SAMPLE_CONCURRENT: per-competitor sample concurrency, 0 = no override."""
         return self._get_int("HOTPOT_BASELINE_SAMPLE_CONCURRENT", 0)
 
     def get_request_delay(self) -> float:
