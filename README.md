@@ -24,7 +24,7 @@
 
 <div align="center">
 
-🔍 **Agentic Search** &nbsp;•&nbsp; 🧠 **Knowledge Clustering** &nbsp;•&nbsp; 📊 **Monte Carlo Evidence Sampling**<br>
+🔍 **Agentic Search** &nbsp;•&nbsp; 🧠 **Knowledge Clustering** &nbsp;•&nbsp; 📊 **Budgeted Evidence Exploration**<br>
 ⚡ **Indexless Retrieval** &nbsp;•&nbsp; 🔄 **Self-Evolving Knowledge Base** &nbsp;•&nbsp; 💬 **Real-time Chat**
 
 </div>
@@ -205,7 +205,7 @@ For reproducible experiments, see [`benchmarks/README.md`](benchmarks/README.md)
 * 🚀 **Feb 12, 2026**: Sirchmunk v0.0.3: Upgraded MCP Integration & Core Search Algorithms
   - **MCP Boost**: Enhanced Model Context Protocol support with updated setup guides.
   - **Granular Search**: Added glob pattern (include/exclude) support; auto-filters temp/cache files.
-  - **New Docs**: Deep dives into "Monte Carlo Evidence Sampling" and "Self-Evolving Knowledge Clusters."
+  - **New Docs**: Deep dives into "Budgeted Evidence Exploration" and "Self-Evolving Knowledge Clusters."
   - **System Stability**: Refactored search pipeline and implemented SHA256 deterministic IDs for Knowledge Clusters.
 
 
@@ -271,7 +271,7 @@ async def main():
         paths=["/path/to/documents"],
     )
     
-    # DEEP mode: comprehensive analysis with Monte Carlo sampling, 10-30s
+    # DEEP mode: comprehensive analysis with budgeted evidence exploration, 10-30s
     result_deep: str = await searcher.search(
         query="How does transformer attention work?",
         paths=["/path/to/documents"],
@@ -347,7 +347,7 @@ sirchmunk search "How does authentication work?"
 # Search in specific paths
 sirchmunk search "find all API endpoints" ./src ./docs
 
-# DEEP mode: comprehensive analysis with Monte Carlo sampling
+# DEEP mode: comprehensive analysis with budgeted evidence exploration
 sirchmunk search "database architecture" --mode DEEP
 
 # Quick filename search
@@ -596,45 +596,41 @@ print(response.json())
 
 ## 🏗️ How it Works
 
-### Sirchmunk Framework
+### LENS Framework
 
 <div align="center">
-  <img src="assets/pic/Sirchmunk_Architecture.png" alt="Sirchmunk Architecture" width="85%">
+  <img src="assets/pic/Sirchmunk_LENS_Framework.png" alt="LENS framework: budgeted evidence exploration over latent evidence space" width="95%">
+  <p><sub>LENS reframes in-context search as budgeted evidence exploration over a latent evidence space induced by dynamic raw documents.</sub></p>
 </div>
 
 ### Core Components
 
 | Component             | Description                                                              |
 |:----------------------|:-------------------------------------------------------------------------|
-| **AgenticSearch**     | Search orchestrator with LLM-enhanced retrieval capabilities             |
-| **KnowledgeBase**     | Transforms raw results into structured knowledge clusters with evidences |
-| **EvidenceProcessor** | Evidence processing based on the MonteCarlo Importance Sampling          |
+| **AgenticSearch**     | Search orchestrator with FAST / DEEP / FILENAME_ONLY modes and budget-aware evidence localization |
+| **KnowledgeBase**     | Persists source-grounded evidence clusters as reusable warm priors for later queries |
+| **EvidenceProcessor** | Consolidates candidate regions into compact, traceable evidence units     |
 | **GrepRetriever**     | High-performance _indexless_ file search with parallel processing        |
 | **OpenAIChat**        | Unified LLM interface supporting streaming and usage tracking            |
 | **MonitorTracker**    | Real-time system and application metrics collection                      |
 
-### Monte Carlo Evidence Sampling
+### Budgeted Evidence Exploration
 
-Traditional retrieval systems read entire documents or rely on fixed-size chunks, leading to either wasted tokens or lost context. Sirchmunk takes a fundamentally different approach inspired by **Monte Carlo methods** — treating evidence extraction as a **sampling problem** rather than a parsing problem.
+Traditional retrieval systems read entire documents or rely on fixed-size chunks, leading to either wasted tokens or lost context. LENS instead treats the relevant evidence as latent and query-conditioned: the system first forms a low-cost prior over likely evidence regions, then spends LLM calls only where observations are most useful.
 
-<div align="center">
-  <img src="assets/pic/Sirchmunk_MonteCarloSamplingAlgo.png" alt="Monte Carlo Evidence Sampling" width="85%">
-  <p><sub>Monte Carlo Evidence Sampling — A three-phase exploration-exploitation strategy for extracting relevant evidence from large documents.</sub></p>
-</div>
+The workflow has three layers:
 
-The algorithm operates in three phases:
+1. **Low-cost prior:** lexical anchors, document-path structure, compiled summaries, historical source-grounded evidence, and lightweight corpus scans narrow the candidate subspace before expensive oracle calls.
 
-1. **Phase 1 — Cast the Net (Exploration):** Fuzzy anchor matching combined with stratified random sampling. The system identifies seed regions of potential relevance while maintaining broad coverage through randomized probing — ensuring no high-value region is missed.
+2. **Budget-constrained sequential inference:** candidate regions are proposed, observed by an LLM relevance oracle, and used to update the belief state until the budget-aware stopping rule says the evidence is sufficient.
 
-2. **Phase 2 — Focus (Exploitation):** Gaussian importance sampling centered around high-scoring seeds from Phase 1. The sampling density concentrates on the most promising regions, extracting surrounding context and scoring each snippet for relevance.
-
-3. **Phase 3 — Synthesize:** The top-K scored snippets are passed to the LLM, which synthesizes them into a coherent Region of Interest (ROI) summary with a confidence flag — enabling the pipeline to decide whether evidence is sufficient or a ReAct agent should be invoked for deeper exploration.
+3. **Consolidation and synthesis:** selected regions are merged into a compact source-grounded evidence set, synthesized into an answer, and optionally persisted as reusable knowledge for follow-up queries.
 
 **Key properties:**
 
-- **Document-agnostic:** The same algorithm works equally well on a 2-page memo and a 500-page technical manual — no document-specific chunking heuristics needed.
-- **Token-efficient:** Only the most relevant regions are sent to the LLM, dramatically reducing token consumption compared to full-document approaches.
-- **Exploration-exploitation balance:** Random exploration prevents tunnel vision, while importance sampling ensures depth where it matters most.
+- **Index-free over raw documents:** Search can run directly over dynamic files without pre-materializing a persistent embedding or chunk index.
+- **Source-grounded:** The final answer is paired with traceable evidence regions instead of opaque vector hits.
+- **Budget-aware:** LLM calls are spent adaptively on uncertain or high-value evidence regions, with explicit telemetry for cost and latency.
 
 ### Self-Evolving Knowledge Clusters
 
@@ -646,7 +642,7 @@ A KnowledgeCluster is a richly annotated object that captures the full cognitive
 
 | Field | Purpose |
 |:------|:--------|
-| **Evidences** | Source-linked snippets extracted via Monte Carlo sampling, each with file path, summary, and raw text |
+| **Evidences** | Source-linked evidence regions localized by LENS, each with file path, summary, and raw text |
 | **Content** | LLM-synthesized markdown with structured analysis and references |
 | **Patterns** | 3–5 distilled design principles or mechanisms identified from the evidence |
 | **Confidence** | A consensus score \[0, 1\] indicating the reliability of the cluster |
@@ -668,7 +664,7 @@ A KnowledgeCluster is a richly annotated object that captures the full cognitive
  │     ┌──────────────────────────────┐
  │     │  Phase 1–3: Full Search      │
  │     │  (keywords → retrieval →     │
- │     │   Monte Carlo → LLM synth)   │
+ │     │   evidence localization →   │
  │     └──────────┬───────────────────┘
  │                ▼
  │     ┌──────────────────────────────┐
@@ -685,7 +681,7 @@ A KnowledgeCluster is a richly annotated object that captures the full cognitive
 
 1. **Reuse Check (Phase 0):** Before any retrieval, the query is embedded and compared against all stored clusters via cosine similarity. If a high-confidence match is found, the existing cluster is returned instantly — saving LLM tokens and search time entirely.
 
-2. **Creation (Phase 1–3):** When no reuse match is found, the full pipeline runs: keyword extraction, file retrieval, Monte Carlo evidence sampling, and LLM synthesis produce a new `KnowledgeCluster`.
+2. **Creation (Phase 1–3):** When no reuse match is found, the full pipeline runs: keyword extraction, file retrieval, budgeted evidence localization, and LLM synthesis produce a new `KnowledgeCluster`.
 
 3. **Persistence (Phase 5):** The cluster is stored in an in-memory DuckDB table and periodically flushed to Parquet files. Atomic writes and mtime-based reload ensure multi-process safety.
 
@@ -775,7 +771,7 @@ curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{"query": "How does authentication work?"}'
 
-# DEEP mode (comprehensive analysis with Monte Carlo sampling)
+# DEEP mode (comprehensive analysis with budgeted evidence exploration)
 curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
@@ -1076,7 +1072,7 @@ Sirchmunk takes an **indexless approach**:
 1. **No pre-indexing**: Direct file search without vector database setup
 2. **Self-evolving**: Knowledge clusters evolve based on search patterns
 3. **Multi-level retrieval**: Adaptive keyword granularity for better recall
-4. **Evidence-based**: Monte Carlo sampling for precise content extraction
+4. **Evidence-based**: Budgeted evidence localization for precise, source-grounded extraction
 
 </details>
 
