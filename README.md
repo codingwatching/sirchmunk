@@ -11,12 +11,13 @@
 [![TailwindCSS](https://img.shields.io/badge/Tailwind-3.4-06B6D4?style=flat-square&logo=tailwindcss&logoColor=white)](https://tailwindcss.com/)
 [![DuckDB](https://img.shields.io/badge/DuckDB-OLAP-FFF000?style=flat-square&logo=duckdb&logoColor=black)](https://duckdb.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
+[![arXiv](https://img.shields.io/badge/arXiv-2608.16185-b31b1b?style=flat-square)](https://arxiv.org/pdf/2608.16185)
 [![ripgrep-all](https://img.shields.io/badge/ripgrep--all-Search-E67E22?style=flat-square&logo=rust&logoColor=white)](https://github.com/phiresky/ripgrep-all)
 [![OpenAI](https://img.shields.io/badge/OpenAI-API-412991?style=flat-square&logo=openai&logoColor=white)](https://github.com/openai/openai-python)
 [![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square)](https://github.com/kreuzberg-dev/kreuzberg)
 [![MCP](https://img.shields.io/badge/MCP-Python_SDK-8B5CF6?style=flat-square&logo=python&logoColor=white)](https://github.com/modelcontextprotocol/python-sdk)
 
-📖 **[Documentation](https://modelscope.github.io/sirchmunk-web/)**
+📄 **[Paper](https://arxiv.org/pdf/2608.16185)** · 📖 **[Documentation](https://modelscope.github.io/sirchmunk-web/)**
 
 [**Quick Start**](#-quick-start) · [**Key Features**](#-key-features) · [**MCP Server**](#-mcp-server) · [**Web UI**](#️-web-ui) · [**Docker**](#-docker-deployment) · [**How it Works**](#️-how-it-works) · [**FAQ**](#-faq)
 
@@ -24,7 +25,7 @@
 
 <div align="center">
 
-🔍 **Agentic Search** &nbsp;•&nbsp; 🧠 **Knowledge Clustering** &nbsp;•&nbsp; 📊 **Monte Carlo Evidence Sampling**<br>
+🔍 **Agentic Search** &nbsp;•&nbsp; 🧠 **Knowledge Clustering** &nbsp;•&nbsp; 📊 **Budgeted Evidence Exploration**<br>
 ⚡ **Indexless Retrieval** &nbsp;•&nbsp; 🔄 **Self-Evolving Knowledge Base** &nbsp;•&nbsp; 💬 **Real-time Chat**
 
 </div>
@@ -66,6 +67,8 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 
 > For more technical details, refer to the [Sirchmunk blog](https://modelscope.github.io/sirchmunk-web/blog)
+
+For reproducible experiments, see [`benchmarks/README.md`](benchmarks/README.md). It documents the frozen sampled evaluation workflow, dynamic `G_n/D_n` corpus snapshots, lifecycle-cost accounting, and LENS ablation variants.
 
 
 ---
@@ -189,21 +192,21 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 <summary><b>Older releases (v0.0.2 – v0.0.5)</b></summary>
 
 * 🚀 **Mar 5, 2026**: Sirchmunk v0.0.5
-  - **Breaking Change**: Unified Search API: Streamlined search() interface with a new SearchContext object and simplified parameter control (return_context).
+  - **Breaking Change**: Unified Search API: Streamlined search() interface with a new SearchContext object and response_format-based output control.
   - **Robust RAG Chat**: Significantly improved conversational reliability through new retry mechanisms and granular exception handling.
   - **Stable MCP Integration**: Fixed mcp run initialization issues, ensuring seamless server deployment for Model Context Protocol users.
   - **PyPI Web UI Fix**: Corrected Next.js source bundling to support flawless Web UI startup for standard pip install users.
 
 * 🚀 **Feb 27, 2026**: Sirchmunk v0.0.4
   - **Docker Support**: First-class Docker deployment with pre-built images for seamless containerized setup.
-  - **FAST Search Mode**: New default greedy search mode using 2-level keyword cascade and context-window sampling — significantly faster retrieval with only 2 LLM calls (2-5s vs 10-30s).
+  - **FAST Search Mode**: Added a greedy search mode using 2-level keyword cascade and context-window sampling — significantly faster retrieval with only 2 LLM calls (2-5s vs 10-30s).
   - **Simplified Deployment**: Streamlined CLI and Web UI configuration workflows for quicker onboarding.
   - **Windows Compatibility**: Fixed compatibility issues for Windows environments.
 
 * 🚀 **Feb 12, 2026**: Sirchmunk v0.0.3: Upgraded MCP Integration & Core Search Algorithms
   - **MCP Boost**: Enhanced Model Context Protocol support with updated setup guides.
   - **Granular Search**: Added glob pattern (include/exclude) support; auto-filters temp/cache files.
-  - **New Docs**: Deep dives into "Monte Carlo Evidence Sampling" and "Self-Evolving Knowledge Clusters."
+  - **New Docs**: Deep dives into "Budgeted Evidence Exploration" and "Self-Evolving Knowledge Clusters."
   - **System Stability**: Refactored search pipeline and implemented SHA256 deterministic IDs for Knowledge Clusters.
 
 
@@ -263,17 +266,19 @@ async def main():
     
     searcher = AgenticSearch(llm=llm)
     
-    # FAST mode (default): greedy search, 2 LLM calls, 2-5s
+    # DEEP mode (default): rich Markdown report with budgeted evidence exploration
     result: str = await searcher.search(
         query="How does transformer attention work?",
         paths=["/path/to/documents"],
+        mode="DEEP",
+        response_format="rich",
     )
     
-    # DEEP mode: comprehensive analysis with Monte Carlo sampling, 10-30s
-    result_deep: str = await searcher.search(
+    # FAST mode: greedy search, 2 LLM calls, 2-5s
+    result_fast: str = await searcher.search(
         query="How does transformer attention work?",
         paths=["/path/to/documents"],
-        mode="DEEP",
+        mode="FAST",
     )
     
     print(result)
@@ -339,14 +344,14 @@ sirchmunk serve --host 0.0.0.0 --port 8000
 #### Search
 
 ```bash
-# Search in current directory (FAST mode by default)
+# Search in current directory (DEEP mode with rich output by default)
 sirchmunk search "How does authentication work?"
 
 # Search in specific paths
 sirchmunk search "find all API endpoints" ./src ./docs
 
-# DEEP mode: comprehensive analysis with Monte Carlo sampling
-sirchmunk search "database architecture" --mode DEEP
+# FAST mode: greedy search with 2 LLM calls
+sirchmunk search "database architecture" --mode FAST
 
 # Quick filename search
 sirchmunk search "config" --mode FILENAME_ONLY
@@ -458,7 +463,7 @@ After running `sirchmunk init`, a `~/.sirchmunk/mcp_config.json` file is generat
 
 ### Features
 
-- **Multi-Mode Search**: FAST mode (default, greedy 2-5s), DEEP mode for comprehensive analysis, FILENAME_ONLY for fast file discovery
+- **Multi-Mode Search**: DEEP mode (default, comprehensive 10-30s), FAST mode (greedy 2-5s), FILENAME_ONLY for fast file discovery
 - **Knowledge Cluster Management**: Automatic extraction, storage, and reuse of knowledge
 - **Standard MCP Protocol**: Works with stdio and Streamable HTTP transports
 
@@ -599,45 +604,43 @@ print(response.json())
 
 ## 🏗️ How it Works
 
-### Sirchmunk Framework
+### LENS Framework
 
 <div align="center">
-  <img src="assets/pic/Sirchmunk_Architecture.png" alt="Sirchmunk Architecture" width="85%">
+  <img src="assets/pic/Sirchmunk_LENS_Framework.png" alt="LENS framework: budgeted evidence exploration over latent evidence space" width="95%">
+  <p><sub>LENS reframes in-context search as budgeted evidence exploration over a latent evidence space induced by dynamic raw documents.</sub></p>
 </div>
+
+For the full technical treatment of Sirchmunk and LENS, see the [Sirchmunk main paper](https://arxiv.org/pdf/2608.16185).
 
 ### Core Components
 
 | Component             | Description                                                              |
 |:----------------------|:-------------------------------------------------------------------------|
-| **AgenticSearch**     | Search orchestrator with LLM-enhanced retrieval capabilities             |
-| **KnowledgeBase**     | Transforms raw results into structured knowledge clusters with evidences |
-| **EvidenceProcessor** | Evidence processing based on the MonteCarlo Importance Sampling          |
+| **AgenticSearch**     | Search orchestrator with FAST / DEEP / FILENAME_ONLY modes and budget-aware evidence localization |
+| **KnowledgeBase**     | Persists source-grounded evidence clusters as reusable warm priors for later queries |
+| **EvidenceProcessor** | Consolidates candidate regions into compact, traceable evidence units     |
 | **GrepRetriever**     | High-performance _indexless_ file search with parallel processing        |
 | **OpenAIChat**        | Unified LLM interface supporting streaming and usage tracking            |
 | **MonitorTracker**    | Real-time system and application metrics collection                      |
 
-### Monte Carlo Evidence Sampling
+### Budgeted Evidence Exploration
 
-Traditional retrieval systems read entire documents or rely on fixed-size chunks, leading to either wasted tokens or lost context. Sirchmunk takes a fundamentally different approach inspired by **Monte Carlo methods** — treating evidence extraction as a **sampling problem** rather than a parsing problem.
+Traditional retrieval systems read entire documents or rely on fixed-size chunks, leading to either wasted tokens or lost context. LENS instead treats the relevant evidence as latent and query-conditioned: the system first forms a low-cost prior over likely evidence regions, then spends LLM calls only where observations are most useful.
 
-<div align="center">
-  <img src="assets/pic/Sirchmunk_MonteCarloSamplingAlgo.png" alt="Monte Carlo Evidence Sampling" width="85%">
-  <p><sub>Monte Carlo Evidence Sampling — A three-phase exploration-exploitation strategy for extracting relevant evidence from large documents.</sub></p>
-</div>
+The workflow has three layers:
 
-The algorithm operates in three phases:
+1. **Low-cost prior:** lexical anchors, document-path structure, compiled summaries, historical source-grounded evidence, and lightweight corpus scans narrow the candidate subspace before expensive oracle calls.
 
-1. **Phase 1 — Cast the Net (Exploration):** Fuzzy anchor matching combined with stratified random sampling. The system identifies seed regions of potential relevance while maintaining broad coverage through randomized probing — ensuring no high-value region is missed.
+2. **Budget-constrained sequential inference:** candidate regions are proposed, observed by an LLM relevance oracle, and used to update the belief state until the budget-aware stopping rule says the evidence is sufficient.
 
-2. **Phase 2 — Focus (Exploitation):** Gaussian importance sampling centered around high-scoring seeds from Phase 1. The sampling density concentrates on the most promising regions, extracting surrounding context and scoring each snippet for relevance.
-
-3. **Phase 3 — Synthesize:** The top-K scored snippets are passed to the LLM, which synthesizes them into a coherent Region of Interest (ROI) summary with a confidence flag — enabling the pipeline to decide whether evidence is sufficient or a ReAct agent should be invoked for deeper exploration.
+3. **Consolidation and synthesis:** selected regions are merged into a compact source-grounded evidence set, synthesized into an answer, and optionally persisted as reusable knowledge for follow-up queries.
 
 **Key properties:**
 
-- **Document-agnostic:** The same algorithm works equally well on a 2-page memo and a 500-page technical manual — no document-specific chunking heuristics needed.
-- **Token-efficient:** Only the most relevant regions are sent to the LLM, dramatically reducing token consumption compared to full-document approaches.
-- **Exploration-exploitation balance:** Random exploration prevents tunnel vision, while importance sampling ensures depth where it matters most.
+- **Index-free over raw documents:** Search can run directly over dynamic files without pre-materializing a persistent embedding or chunk index.
+- **Source-grounded:** The final answer is paired with traceable evidence regions instead of opaque vector hits.
+- **Budget-aware:** LLM calls are spent adaptively on uncertain or high-value evidence regions, with explicit telemetry for cost and latency.
 
 ### Self-Evolving Knowledge Clusters
 
@@ -649,7 +652,7 @@ A KnowledgeCluster is a richly annotated object that captures the full cognitive
 
 | Field | Purpose |
 |:------|:--------|
-| **Evidences** | Source-linked snippets extracted via Monte Carlo sampling, each with file path, summary, and raw text |
+| **Evidences** | Source-linked evidence regions localized by LENS, each with file path, summary, and raw text |
 | **Content** | LLM-synthesized markdown with structured analysis and references |
 | **Patterns** | 3–5 distilled design principles or mechanisms identified from the evidence |
 | **Confidence** | A consensus score \[0, 1\] indicating the reliability of the cluster |
@@ -671,7 +674,7 @@ A KnowledgeCluster is a richly annotated object that captures the full cognitive
  │     ┌──────────────────────────────┐
  │     │  Phase 1–3: Full Search      │
  │     │  (keywords → retrieval →     │
- │     │   Monte Carlo → LLM synth)   │
+ │     │   evidence localization →   │
  │     └──────────┬───────────────────┘
  │                ▼
  │     ┌──────────────────────────────┐
@@ -688,7 +691,7 @@ A KnowledgeCluster is a richly annotated object that captures the full cognitive
 
 1. **Reuse Check (Phase 0):** Before any retrieval, the query is embedded and compared against all stored clusters via cosine similarity. If a high-confidence match is found, the existing cluster is returned instantly — saving LLM tokens and search time entirely.
 
-2. **Creation (Phase 1–3):** When no reuse match is found, the full pipeline runs: keyword extraction, file retrieval, Monte Carlo evidence sampling, and LLM synthesis produce a new `KnowledgeCluster`.
+2. **Creation (Phase 1–3):** When no reuse match is found, the full pipeline runs: keyword extraction, file retrieval, budgeted evidence localization, and LLM synthesis produce a new `KnowledgeCluster`.
 
 3. **Persistence (Phase 5):** The cluster is stored in an in-memory DuckDB table and periodically flushed to Parquet files. Atomic writes and mtime-based reload ensure multi-process safety.
 
@@ -757,12 +760,14 @@ When the server is running (`sirchmunk serve` or `sirchmunk web serve`), the Sea
 - **Priority:** explicit non-empty request `paths` → `SIRCHMUNK_SEARCH_PATHS` → cwd.
 
 ```bash
-# FAST mode (default, greedy search with 2 LLM calls)
+# DEEP mode (default rich report with budgeted evidence exploration)
 curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "How does authentication work?",
-    "paths": ["/path/to/project"]
+    "paths": ["/path/to/project"],
+    "mode": "DEEP",
+    "response_format": "rich"
   }'
 
 # Single path as a string (equivalent to a one-element list)
@@ -778,13 +783,14 @@ curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{"query": "How does authentication work?"}'
 
-# DEEP mode (comprehensive analysis with Monte Carlo sampling)
+# DEEP mode (comprehensive analysis with budgeted evidence exploration)
 curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "database connection pooling",
     "paths": ["/path/to/project/src"],
-    "mode": "DEEP"
+    "mode": "DEEP",
+    "response_format": "rich"
   }'
 
 # Filename search (no LLM required)
@@ -808,7 +814,7 @@ curl -X POST http://localhost:8584/api/v1/search \
     "max_loops": 10,
     "include_patterns": ["*.py", "*.java"],
     "exclude_patterns": ["*test*", "*__pycache__*"],
-    "return_context": true
+    "response_format": "rich"
   }'
 
 # Check server status
@@ -837,7 +843,8 @@ response = requests.post(
 data = response.json()
 if data["success"]:
     payload = data.get("data") or {}
-    # API returns type "summary" | "files" | "context"
+    # API returns type "summary" | "files" | "context".
+    # For summary responses, `format` is "rich" (default) or "minimal".
     print(payload.get("summary", payload))
 ```
 
@@ -917,7 +924,8 @@ curl -N -X POST "http://localhost:8584/api/v1/search/stream" \
   -d '{
     "query": "How does authentication work?",
     "paths": ["/path/to/project"],
-    "mode": "FAST"
+    "mode": "DEEP",
+    "response_format": "rich"
   }'
 ```
 
@@ -931,7 +939,8 @@ url = "http://localhost:8584/api/v1/search/stream"
 payload = {
     "query": "How does authentication work?",
     "paths": ["/path/to/project"],
-    "mode": "FAST",
+    "mode": "DEEP",
+    "response_format": "rich",
 }
 
 event_type = ""
@@ -1036,7 +1045,8 @@ async function searchStream(baseUrl, body) {
 await searchStream("http://localhost:8584", {
   query: "How does authentication work?",
   paths: ["/path/to/project"],
-  mode: "FAST",
+  mode: "DEEP",
+  response_format: "rich",
 });
 ```
 
@@ -1053,7 +1063,7 @@ await searchStream("http://localhost:8584", {
 |-----------|------|---------|-------------|
 | `query` | `string` | *required* | Search query or question |
 | `paths` | `string` \| `string[]` | *optional* | One path or many. Omit / `null` / `""` / `[]` / only blanks → server `SIRCHMUNK_SEARCH_PATHS` (e.g. `~/.sirchmunk/.env`), then cwd. Request paths override env. |
-| `mode` | `string` | `"FAST"` | `FAST`, `DEEP`, or `FILENAME_ONLY` |
+| `mode` | `string` | `"DEEP"` | `DEEP`, `FAST`, or `FILENAME_ONLY` |
 | `enable_dir_scan` | `bool` | `true` | Enable directory scanning (FAST/DEEP) for file discovery |
 | `max_depth` | `int` | `null` | Maximum directory depth |
 | `top_k_files` | `int` | `null` | Number of top files to return |
@@ -1061,7 +1071,7 @@ await searchStream("http://localhost:8584", {
 | `max_token_budget` | `int` | `null` | LLM token budget (DEEP mode, default 128K) |
 | `include_patterns` | `string[]` | `null` | File glob patterns to include |
 | `exclude_patterns` | `string[]` | `null` | File glob patterns to exclude |
-| `return_context` | `bool` | `false` | Return SearchContext with cluster and telemetry |
+| `response_format` | `string` | `"rich"` | `"rich"` Markdown report, `"minimal"` short answer, `"context"` SearchContext object, or `"json"` serialized context |
 
 > **Note:** `FILENAME_ONLY` mode does not require an LLM API key. `FAST` and `DEEP` modes require a configured LLM.
 
@@ -1079,7 +1089,7 @@ Sirchmunk takes an **indexless approach**:
 1. **No pre-indexing**: Direct file search without vector database setup
 2. **Self-evolving**: Knowledge clusters evolve based on search patterns
 3. **Multi-level retrieval**: Adaptive keyword granularity for better recall
-4. **Evidence-based**: Monte Carlo sampling for precise content extraction
+4. **Evidence-based**: Budgeted evidence localization for precise, source-grounded extraction
 
 </details>
 

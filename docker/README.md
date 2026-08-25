@@ -77,7 +77,8 @@ curl -X POST http://localhost:8584/api/v1/search \
   -d '{
     "query": "your search question here",
     "paths": ["/mnt/docs"],
-    "mode": "FAST"
+    "mode": "DEEP",
+    "response_format": "rich"
   }'
 ```
 
@@ -91,7 +92,8 @@ response = requests.post(
     json={
         "query": "your search question here",
         "paths": ["/mnt/docs"],
-        "mode": "FAST",           # "FAST" (default), "DEEP", or "FILENAME_ONLY"
+        "mode": "DEEP",           # "DEEP" (default), "FAST", or "FILENAME_ONLY"
+        "response_format": "rich", # "rich" (default), "minimal", "context", or "json"
         "enable_dir_scan": True,  # enable directory scanning (DEEP/FAST)
         "max_depth": 5,           # optional: max directory depth
         "top_k_files": 3,         # optional: number of top files to return
@@ -112,12 +114,12 @@ else:
 |---|---|---|---|
 | `query` | string | Yes | Search query or question |
 | `paths` | list | No | Directories or files to search (e.g., `["/mnt/docs"]`); falls back to `SIRCHMUNK_SEARCH_PATHS` if unset |
-| `mode` | string | No | `"FAST"` (default, greedy search 2-5s), `"DEEP"` (comprehensive analysis 10-30s), or `"FILENAME_ONLY"` (file discovery <1s) |
+| `mode` | string | No | `"DEEP"` (default, comprehensive analysis 10-30s), `"FAST"` (greedy search 2-5s), or `"FILENAME_ONLY"` (file discovery <1s) |
 | `enable_dir_scan` | bool | No | Enable directory scanning for file discovery in DEEP/FAST (default: true) |
 | `max_depth` | int | No | Maximum directory depth to search |
 | `top_k_files` | int | No | Number of top files to return |
 | `max_token_budget` | int | No | LLM token budget (DEEP mode) |
-| `return_context` | bool | No | Return full SearchContext with KnowledgeCluster and telemetry (default: false) |
+| `response_format` | string | No | `"rich"` (default), `"minimal"`, `"context"`, or `"json"` |
 
 ### 4. Manage the container
 

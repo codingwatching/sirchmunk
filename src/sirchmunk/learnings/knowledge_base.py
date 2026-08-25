@@ -4,13 +4,14 @@ import json
 import hashlib
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 
 from sirchmunk.learnings.evidence_processor import (
-    MonteCarloEvidenceSampling,
+    LensEvidenceSampler,
     RoiResult,
 )
+from sirchmunk.learnings.lens_config import LensConfig
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import EVIDENCE_SUMMARY
 from sirchmunk.schema.knowledge import (
@@ -37,6 +38,7 @@ class KnowledgeBase:
         metadata_map: Dict[str, Any] = None,
         work_path: Union[str, Path] = None,
         log_callback: LogCallback = None,
+        lens_config: Optional[LensConfig] = None,
     ):
         """
         Initialize the KnowledgeBase with an LLM and metadata mapping.
@@ -59,10 +61,13 @@ class KnowledgeBase:
         self.metadata_path: Path = (
             self.work_path / StorageStructure.CACHE_DIR / StorageStructure.METADATA_DIR
         )
-        
+
         # Store log_callback for passing to child components
         self.log_callback = log_callback
-        
+
+        # LENS configuration (lazy-loaded from env if not provided)
+        self.lens_config = lens_config or LensConfig.from_env()
+
         # Create bound logger with callback - returns AsyncLogger instance
         self._log = create_logger(log_callback=log_callback)
 
@@ -167,11 +172,12 @@ class KnowledgeBase:
                         if segments:
                             doc_content = "\n\n---\n\n".join(segments)
 
-            sampler = MonteCarloEvidenceSampling(
+            sampler = LensEvidenceSampler(
                 llm=self.llm,
                 doc_content=doc_content,
                 verbose=verbose,
                 log_callback=self.log_callback,
+                lens_config=self.lens_config,
             )
             roi_result: RoiResult = await sampler.get_roi(
                 query=query,

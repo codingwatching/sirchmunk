@@ -33,8 +33,8 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
         "- Answer questions about content in local files or codebases\n"
         "- Locate specific files by name or content pattern\n\n"
         "Modes:\n"
-        "- DEEP: Comprehensive search with LLM-powered analysis. Reads file contents, "
-        "extracts evidence via Monte Carlo sampling, and synthesizes an answer. (10-30s)\n"
+        "- DEEP: Comprehensive search with LLM-powered budgeted evidence exploration. Reads file contents, "
+        "localizes source-grounded evidence, and synthesizes an answer. (10-30s)\n"
         "- FILENAME_ONLY: Fast filename pattern matching across directories. (<1s)\n"
     ),
     inputSchema={
@@ -62,10 +62,10 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
             "mode": {
                 "type": "string",
                 "enum": ["FAST", "DEEP", "FILENAME_ONLY"],
-                "default": "FAST",
+                "default": "DEEP",
                 "description": (
-                    "Search mode: FAST (greedy search with 2 LLM calls, 2-5s), "
-                    "DEEP (comprehensive content analysis with LLM, 10-30s), "
+                    "Search mode: DEEP (default, comprehensive content analysis with LLM, 10-30s), "
+                    "FAST (greedy search with 2 LLM calls, 2-5s), "
                     "FILENAME_ONLY (fast file discovery by name pattern, <1s)"
                 ),
             },
@@ -116,10 +116,14 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
                     "Examples: ['*.pyc', '*.log', 'node_modules', '.git']"
                 ),
             },
-            "return_context": {
-                "type": "boolean",
-                "default": False,
-                "description": "Return full SearchContext with KnowledgeCluster, answer, and pipeline telemetry",
+            "response_format": {
+                "type": "string",
+                "enum": ["rich", "minimal", "context", "json"],
+                "default": "rich",
+                "description": (
+                    "Output format: rich Markdown evidence report, minimal short answer, "
+                    "full context object, or serialized context JSON."
+                ),
             },
         },
         "required": ["query"],
@@ -215,7 +219,7 @@ async def handle_sirchmunk_search(
         raise ValueError("Missing required argument: query")
     
     # Extract optional arguments with defaults
-    mode = arguments.get("mode", "FAST")
+    mode = (arguments.get("mode", "DEEP") or "DEEP").upper()
     max_depth = arguments.get("max_depth")
     top_k_files = arguments.get("top_k_files")
     max_loops = arguments.get("max_loops")
@@ -223,7 +227,9 @@ async def handle_sirchmunk_search(
     enable_dir_scan = arguments.get("enable_dir_scan", True)
     include = arguments.get("include")
     exclude = arguments.get("exclude")
-    return_context = arguments.get("return_context", False)
+    response_format = (arguments.get("response_format", "rich") or "rich").lower()
+    if arguments.get("return_context"):
+        response_format = "context"
     
     logger.info(f"Handling sirchmunk_search: mode={mode}, query='{query[:50]}...'")
     
@@ -240,7 +246,7 @@ async def handle_sirchmunk_search(
             enable_dir_scan=enable_dir_scan,
             include=include,
             exclude=exclude,
-            return_context=return_context,
+            response_format=response_format,
         )
         
         # Format response based on result type
@@ -255,10 +261,15 @@ async def handle_sirchmunk_search(
             # FILENAME_ONLY mode: list of file matches
             response_text = _format_filename_results(result, query)
         
-        elif hasattr(result, "answer"):
-            # SearchContext object — extract the answer
-            response_text = result.answer or str(result)
-        
+        elif isinstance(result, dict):
+            response_text = json.dumps(result, indent=2, ensure_ascii=False)
+
+        elif hasattr(result, "to_dict"):
+            if response_format in ("context", "json"):
+                response_text = json.dumps(result.to_dict(), indent=2, ensure_ascii=False)
+            else:
+                response_text = result.answer or str(result)
+
         else:
             response_text = str(result)
         
@@ -372,11 +383,11 @@ def _format_filename_results(results: List[Dict[str, Any]], query: str) -> str:
         Formatted string representation
     """
     lines = [
-        f"# Filename Search Results",
-        f"",
+        "# Filename Search Results",
+        "",
         f"**Query**: `{query}`",
         f"**Found**: {len(results)} matching file(s)",
-        f"",
+        "",
     ]
     
     for i, result in enumerate(results, 1):
@@ -414,11 +425,11 @@ def _format_cluster_list(clusters: List[Dict[str, Any]], sort_by: str) -> str:
         Formatted string representation
     """
     lines = [
-        f"# Knowledge Clusters",
-        f"",
+        "# Knowledge Clusters",
+        "",
         f"**Total**: {len(clusters)} cluster(s)",
         f"**Sorted by**: {sort_by}",
-        f"",
+        "",
     ]
     
     for i, cluster in enumerate(clusters, 1):

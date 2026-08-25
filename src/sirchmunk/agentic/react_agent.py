@@ -27,12 +27,88 @@ logger = logging.getLogger(__name__)
 # ---- Helpers ----
 
 _ANSWER_PATTERN = re.compile(r"<ANSWER>(.*?)</ANSWER>", re.DOTALL)
+_SUFFICIENCY_PATTERN = re.compile(
+    r"<EVIDENCE_SUFFICIENCY>\s*(sufficient|partial|absent)\s*</EVIDENCE_SUFFICIENCY>",
+    re.IGNORECASE,
+)
+
+# Patterns indicating JSON/code garbage in extracted answers
+_GARBAGE_PATTERNS = [
+    re.compile(r'^\s*[{\[].*[}\]]\s*$', re.DOTALL),  # JSON object/array
+    re.compile(r'^\s*```', re.MULTILINE),              # code fence
+    re.compile(r'^\s*\{\s*"', re.DOTALL),             # JSON-like start
+]
 
 
 def _extract_answer(text: str) -> Optional[str]:
-    """Extract content within <ANSWER>...</ANSWER> tags."""
+    """Extract content within <ANSWER>...</ANSWER> tags.
+
+    Includes post-extraction garbage check: if extracted content looks like
+    JSON/code, attempt to find natural language within it.
+    """
     m = _ANSWER_PATTERN.search(text)
-    return m.group(1).strip() if m else None
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    # Post-extraction check: if content matches JSON/code patterns, clean it
+    if raw and _is_garbage_content(raw):
+        cleaned = _strip_garbage_from_answer(raw)
+        if cleaned:
+            return cleaned
+    return raw
+
+
+def _extract_sufficiency(text: str) -> Optional[str]:
+    """Extract the agent's own rating of the evidence behind its answer.
+
+    Returned verbatim from the tag so the caller's answer policy can decide how
+    to present a weakly supported answer. Absent when the agent omitted the tag,
+    which the caller must treat as unknown rather than as any particular rating.
+    """
+    m = _SUFFICIENCY_PATTERN.search(text or "")
+    return m.group(1).strip().lower() if m else None
+
+
+def _record_sufficiency(context: SearchContext, content: str) -> None:
+    """Attach the evidence rating to ``context.telemetry`` when present.
+
+    ``telemetry`` is an ad-hoc bag the pipeline attaches on demand rather than a
+    declared field, so it is created here when missing; ``SearchContext.to_dict``
+    exports whatever it holds.
+    """
+    sufficiency = _extract_sufficiency(content)
+    if not sufficiency:
+        return
+    telemetry = getattr(context, "telemetry", None)
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+        setattr(context, "telemetry", telemetry)
+    telemetry["evidence_sufficiency"] = sufficiency
+
+
+def _is_garbage_content(text: str) -> bool:
+    """Check if extracted answer content looks like JSON/code garbage."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    for pat in _GARBAGE_PATTERNS:
+        if pat.search(stripped):
+            return True
+    return False
+
+
+def _strip_garbage_from_answer(text: str) -> Optional[str]:
+    """Try to extract natural language from a garbage answer."""
+    # Remove code fences
+    cleaned = re.sub(r'```[^`]*```', '', text, flags=re.DOTALL).strip()
+    # Remove JSON blocks
+    cleaned = re.sub(r'\{[^}]*\}', '', cleaned).strip()
+    cleaned = re.sub(r'\[[^\]]*\]', '', cleaned).strip()
+    # Remove markdown formatting residuals
+    cleaned = re.sub(r'[\*`#]', '', cleaned).strip()
+    if cleaned and len(cleaned) > 1:
+        return cleaned
+    return None
 
 
 def _parse_tool_call(text: str, available_tools: List[str]) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -133,11 +209,17 @@ class ReActSearchAgent:
         max_loops: int = 10,
         max_token_budget: int = 64000,
         log_callback: LogCallback = None,
+        answer_style_instruction: str = "",
     ) -> None:
         self.llm = llm
         self.registry = tool_registry
         self.max_loops = max_loops
         self.max_token_budget = max_token_budget
+        # Optional caller-supplied constraint appended to the system prompt
+        # (e.g. a minimal-answer-span contract so evaluated systems share the
+        # same output register). Empty by default: behavior is unchanged
+        # unless the caller opts in.
+        self.answer_style_instruction = (answer_style_instruction or "").strip()
         self._logger = create_logger(log_callback=log_callback, enable_async=True)
 
     # ---- Public API ----
@@ -147,6 +229,8 @@ class ReActSearchAgent:
         query: str,
         images: Optional[List[str]] = None,
         initial_keywords: Optional[List[str]] = None,
+        preloaded_observations: Optional[str] = None,
+        subgoals: Optional[List[str]] = None,
     ) -> Tuple[str, SearchContext]:
         """Execute a full ReAct search session.
 
@@ -155,6 +239,13 @@ class ReActSearchAgent:
             images: Optional image URLs (reserved for future multimodal support).
             initial_keywords: Optional pre-extracted keywords to use for the
                 first keyword_search call, bypassing the LLM's first turn.
+            preloaded_observations: Optional evidence block (e.g. prior-warmed
+                retrieval results) injected as the first observation so the
+                answering agent starts from gathered evidence instead of an
+                empty context. The agent still owns every subsequent action.
+            subgoals: Optional explicit per-fact requirements the answer must
+                satisfy, listed for the agent as a checklist. Complements the
+                free-form reasoning with a structured target set.
 
         Returns:
             Tuple of (final_answer_text, search_context).
@@ -175,7 +266,7 @@ class ReActSearchAgent:
             },
             {
                 "role": "user",
-                "content": self._build_user_message(query, images),
+                "content": self._build_user_message(query, images, subgoals),
             },
         ]
 
@@ -185,6 +276,37 @@ class ReActSearchAgent:
 
         tool_names = self.registry.tool_names
         final_answer: Optional[str] = None
+
+        # Prior-warmed start: inject gathered evidence as the first observation.
+        # The agent reads it as if it had just retrieved it, then decides the
+        # next action itself — this raises the starting evidence quality without
+        # taking control away from the answering agent.
+        if preloaded_observations and preloaded_observations.strip():
+            context.increment_loop()
+            messages.append({
+                "role": "assistant",
+                "content": (
+                    "I'll begin from the evidence already gathered for this "
+                    "question, then decide what else is needed."
+                ),
+            })
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"**Preloaded evidence** (starting leads from a broad prior "
+                    f"retrieval — it may be incomplete and may contain unrelated "
+                    f"files):\n{preloaded_observations}\n\n"
+                    "Treat this as leads, not conclusions. For each thing you "
+                    "still need to establish that is not already stated "
+                    "verbatim above, issue a keyword_search with the specific "
+                    "entity name to confirm it before answering — do not answer "
+                    "from the leads alone if a required fact is unconfirmed.\n\n"
+                    f"{self._build_continuation_prompt(context)}"
+                ),
+            })
+            await self._logger.info(
+                f"[ReAct] Prior-warmed with {len(preloaded_observations)} chars of evidence"
+            )
 
         # Optionally execute pre-extracted keywords before the first LLM call
         if initial_keywords and "keyword_search" in tool_names:
@@ -236,6 +358,7 @@ class ReActSearchAgent:
             answer = _extract_answer(content)
             if answer:
                 final_answer = answer
+                _record_sufficiency(context, content)
                 await self._logger.success(f"[ReAct] Answer found at loop {context.loop_count}")
                 break
 
@@ -292,7 +415,11 @@ class ReActSearchAgent:
                 "content": (
                     "You have reached the retrieval limit. "
                     "Please synthesize your best answer from ALL evidence collected so far. "
-                    "Wrap it in <ANSWER>...</ANSWER> tags."
+                    "Wrap it in <ANSWER>...</ANSWER> tags.\n\n"
+                    "CRITICAL: Your answer must be a concise natural language span "
+                    "(a name, date, number, or yes/no phrase). "
+                    "Do NOT output JSON, code blocks, tool calls, or markdown formatting. "
+                    "If you cannot determine the answer, output your best guess as a simple phrase."
                 ),
             })
             llm_response = await self._call_llm(messages)
@@ -303,6 +430,13 @@ class ReActSearchAgent:
                 total_tok = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
             context.add_llm_tokens(total_tok, usage=usage if usage else None)
             final_answer = _extract_answer(content) or content
+            _record_sufficiency(context, content)
+
+            # If the forced synthesis still produced garbage, strip and retry
+            if final_answer and _is_garbage_content(final_answer):
+                cleaned = _strip_garbage_from_answer(final_answer)
+                if cleaned:
+                    final_answer = cleaned
 
         await self._logger.success(f"[ReAct] Completed: {context.summary()}")
 
@@ -320,10 +454,9 @@ class ReActSearchAgent:
         """
         return await self.llm.achat(messages=messages, stream=False)
 
-    @staticmethod
-    def _build_system_prompt(context: SearchContext, tool_descriptions: str) -> str:
+    def _build_system_prompt(self, context: SearchContext, tool_descriptions: str) -> str:
         """Format the system prompt with tool descriptions and context state."""
-        return REACT_SYSTEM_PROMPT.format(
+        prompt = REACT_SYSTEM_PROMPT.format(
             tool_descriptions=tool_descriptions,
             budget_remaining=context.budget_remaining,
             files_read=len(context.read_file_ids),
@@ -331,14 +464,25 @@ class ReActSearchAgent:
             loop_count=context.loop_count,
             max_loops=context.max_loops,
         )
+        if self.answer_style_instruction:
+            prompt += f"\n## Answer Style\n{self.answer_style_instruction}\n"
+        return prompt
 
     @staticmethod
     def _build_user_message(
         query: str,
         images: Optional[List[str]] = None,
+        subgoals: Optional[List[str]] = None,
     ) -> str:
         """Build the initial user message."""
         parts = [query]
+        if subgoals:
+            checklist = "\n".join(f"- {g}" for g in subgoals if str(g).strip())
+            if checklist:
+                parts.append(
+                    "\nTo answer this, you need to establish each of the "
+                    f"following from the evidence:\n{checklist}"
+                )
         if images:
             parts.append(f"\n[Attached {len(images)} image(s) — multimodal analysis not yet supported]")
         return "\n".join(parts)

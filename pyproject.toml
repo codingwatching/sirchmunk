@@ -58,9 +58,11 @@ mcp = {file = ["requirements/mcp.txt"]}
 web = {file = ["requirements/web.txt"]}
 docs = {file = ["requirements/docs.txt"]}
 tests = {file = ["requirements/tests.txt"]}
+benchmarks = {file = ["requirements/benchmarks.txt"]}
 all = {file = [
   "requirements/mcp.txt",
   "requirements/web.txt",
   "requirements/docs.txt",
   "requirements/tests.txt",
+  "requirements/benchmarks.txt",
 ]}

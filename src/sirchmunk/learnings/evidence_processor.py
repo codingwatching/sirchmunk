@@ -5,10 +5,11 @@ import math
 import random
 import re
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from rapidfuzz import fuzz, process
 
+from sirchmunk.learnings.lens_config import LensConfig
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import EVALUATE_EVIDENCE_SAMPLE, ROI_RESULT_SUMMARY
 from sirchmunk.utils import create_logger, LogCallback
@@ -71,6 +72,8 @@ class RoiResult:
 class MonteCarloEvidenceSampling:
     """
     Monte Carlo Evidence Importance Sampling for Document Retrieval.
+
+    Also available as ``LensEvidenceSampler`` (preferred alias for new code).
     """
 
     def __init__(
@@ -79,6 +82,7 @@ class MonteCarloEvidenceSampling:
         doc_content: str,
         verbose: bool = True,
         log_callback: LogCallback = None,
+        lens_config: Optional[LensConfig] = None,
     ):
         self.llm = llm
         self.doc = doc_content
@@ -107,6 +111,86 @@ class MonteCarloEvidenceSampling:
         self._log = create_logger(log_callback=log_callback)
 
         self.llm_usages: List[Dict[str, Any]] = []
+
+        # --- LENS evaluator (strategy pattern) ---
+        self.lens_config = lens_config or LensConfig.from_env()
+
+        # Deferred imports to avoid circular dependency
+        # (lens_protocols and batch_ranking_evaluator import SampleWindow from this module)
+        from sirchmunk.learnings.batch_ranking_evaluator import (
+            BatchRankingEvaluator,
+            PointwiseEvaluator,
+        )
+
+        if self.lens_config.enable_batch_ranking:
+            self._evaluator = BatchRankingEvaluator(
+                llm=self.llm,
+                config=self.lens_config,
+                log_callback=log_callback,
+            )
+        else:
+            self._evaluator = PointwiseEvaluator(
+                llm=self.llm,
+                log_callback=log_callback,
+            )
+
+        # --- Phase 2: Sampling Strategy ---
+        # Deferred imports to prevent circular reference
+        # (multi_arm_navigator imports SampleWindow from this module)
+        from sirchmunk.learnings.multi_arm_navigator import (
+            MultiArmNavigator,
+            LegacySampler,
+        )
+
+        if self.lens_config.enable_multi_arm:
+            self._sampling_strategy = MultiArmNavigator(
+                config=self.lens_config,
+                doc_content=doc_content,
+                doc_len=self.doc_len,
+                log_callback=log_callback,
+            )
+        else:
+            self._sampling_strategy = LegacySampler(
+                sampler_ref=self, config=self.lens_config
+            )
+
+        # --- Phase 2: Adaptive Proposal Mixer (only effective with multi_arm) ---
+        from sirchmunk.learnings.adaptive_proposal_mixer import AdaptiveProposalMixer
+
+        self._proposal_mixer: Any = (
+            AdaptiveProposalMixer(config=self.lens_config)
+            if self.lens_config.enable_adaptive_mix
+            else None
+        )
+
+        # --- Phase 2: Reasoning Chain Exploiter ---
+        from sirchmunk.learnings.reasoning_chain_exploiter import (
+            ReasoningChainExploiter,
+        )
+
+        self._reasoning_exploiter: Any = (
+            ReasoningChainExploiter(
+                config=self.lens_config, log_callback=log_callback
+            )
+            if self.lens_config.enable_reasoning_exploit
+            else None
+        )
+
+        # --- Phase 3: Stop Strategy ---
+        from sirchmunk.learnings.statistical_stop_decider import (
+            StatisticalStopDecider,
+            ThresholdStop,
+        )
+
+        if self.lens_config.enable_statistical_stop:
+            self._stop_strategy = StatisticalStopDecider(
+                config=self.lens_config, log_callback=log_callback
+            )
+        else:
+            self._stop_strategy = ThresholdStop()
+
+        # Multi-source intent (can be set externally before calling get_roi)
+        self._multi_source_intent: Optional[float] = None
 
     def _get_content(self, start: int) -> Tuple[int, int, str]:
         """
@@ -465,78 +549,66 @@ class MonteCarloEvidenceSampling:
         keywords = keywords or {}
 
         all_candidates: List[SampleWindow] = []
-        top_seeds: List[SampleWindow] = []
 
         for r in range(1, self.max_rounds + 1):
             if self.verbose:
                 await self._log.info(f"--- Round {r}/{self.max_rounds} ---")
-            current_samples = []
 
-            if r == 1:
-                # === Strategy: Fuzz Anchors + Random Supplement ===
-                # 1. Get Fuzz Anchors (Exploitation)
-                # Note: Now async to support log callback
-                fuzz_samples = await self._get_fuzzy_anchors(
-                    query=query,
-                    keywords=list(keywords.keys()),
-                    threshold=10.0,
+            # 1. Sampling (strategy dispatch)
+            current_samples = await self._sampling_strategy.next_round(
+                round_num=r,
+                query=query,
+                keywords=keywords,
+                prev_candidates=all_candidates if r > 1 else None,
+                doc_content=self.doc,
+                doc_len=self.doc_len,
+            )
+
+            if not current_samples:
+                if self.verbose:
+                    await self._log.info("No new samples generated this round, skipping.")
+                continue
+
+            # 2. Evaluate (Phase 1 BatchRanking or pointwise)
+            evaluated = await self._evaluator.evaluate(current_samples, query, keywords)
+            all_candidates.extend(evaluated)
+
+            for s in evaluated:
+                await self._log.info(
+                    f"  [Pos {s.start_idx:6d} | Src: {s.source:8s}] Score: {s.score} | {s.reasoning[:30]}..."
                 )
-                current_samples.extend(fuzz_samples)
 
-                # 2. Supplement with Random Sampling (Exploration)
-                needed_random = self.random_exploration_num
-                if len(fuzz_samples) == 0:
-                    needed_random += 3  # Downgrade to random mode
-
-                random_samples = self._sample_stratified_supplement(needed_random)
-                current_samples.extend(random_samples)
-
-                if self.verbose:
-                    await self._log.info(
-                        f"Sampling Distribution: Fuzz Anchors={len(fuzz_samples)}, Random Exploration={len(random_samples)}"
+            # 3. Reasoning chain exploitation (optional)
+            if self._reasoning_exploiter:
+                signals = self._reasoning_exploiter.extract_signals(evaluated, query)
+                if self._reasoning_exploiter.should_exploit(signals):
+                    hints = self._reasoning_exploiter.generate_sampling_hints(
+                        signals, query
                     )
+                    if hints:
+                        # Merge hints into keywords for next round
+                        keywords = {
+                            **keywords,
+                            **{h: 1.0 for h in hints},
+                        }
+                        if self.verbose:
+                            await self._log.info(
+                                f"   ReasoningExploiter: injected {len(hints)} hints → {hints}"
+                            )
 
-            else:
-                # === Subsequent Rounds: Gaussian Focusing ===
-                # Filter low score seeds
-                valid_seeds = [s for s in top_seeds if s.score >= 4.0]
-
-                if not valid_seeds:
-                    await self._log.warning(
-                        "No high-value regions found, attempting global random sampling again..."
-                    )
-                    current_samples = self._sample_stratified_supplement(
-                        self.samples_per_round
-                    )
-                else:
-                    max_score = valid_seeds[0].score
-                    if self.verbose:
-                        await self._log.info(
-                            f"Focusing: Based on {len(valid_seeds)} seeds (Max Score: {max_score})"
-                        )
-                    current_samples = self._sample_gaussian(valid_seeds, r)
-
-            if not current_samples and self.verbose:
-                await self._log.info("No new samples generated this round, skipping.")
-            else:
-                evaluated = await self._evaluate_batch(current_samples, query)
-                all_candidates.extend(evaluated)
-
-                for s in evaluated:
-                    await self._log.info(
-                        f"  [Pos {s.start_idx:6d} | Src: {s.source:8s}] Score: {s.score} | {s.reasoning[:30]}..."
-                    )
-
-            # Sort and update seeds
-            all_candidates.sort(key=lambda x: x.score, reverse=True)
-            top_seeds = all_candidates[: self.top_k_seeds]
-
-            # Early stopping check
-            if top_seeds and top_seeds[0].score >= confidence_threshold:
-                if self.verbose:
-                    await self._log.info(
-                        f"High confidence target found (Score >= {confidence_threshold}), stopping early."
-                    )
+            # 4. Stop decision (Protocol dispatch)
+            should_stop, reason = await self._stop_strategy.should_stop(
+                all_candidates=all_candidates,
+                query=query,
+                round_num=r,
+                max_rounds=self.max_rounds,
+                confidence_threshold=confidence_threshold,
+                tokens_remaining=getattr(self, '_tokens_remaining', float('inf')),
+                multi_source_intent=self._multi_source_intent or 0.0,
+            )
+            if should_stop:
+                if self.verbose and self._log:
+                    await self._log.info(f"  [LENS Stop] {reason}")
                 break
 
         # --- Final Result Processing ---
@@ -548,9 +620,12 @@ class MonteCarloEvidenceSampling:
                 snippets=[],
             )
 
+        # Sort all candidates by score descending for deterministic selection
+        all_candidates.sort(key=lambda c: c.score, reverse=True)
+
         # Collect top candidates that are relevant enough
-        # Using 4.0 as a soft threshold for relevance inclusion
-        relevant_candidates = [c for c in all_candidates if c.score >= 4.0]
+        relevance_floor = self.lens_config.relevance_floor
+        relevant_candidates = [c for c in all_candidates if c.score >= relevance_floor]
 
         # If nothing meets the threshold, fallback to the single best candidate
         if not relevant_candidates:
@@ -569,7 +644,7 @@ class MonteCarloEvidenceSampling:
                 ],
             )
 
-        # Take up to top_k_seeds (e.g., 2 or 3) as the final set for summarization
+        # Take top_k highest-scoring candidates for summarization
         final_candidates = relevant_candidates[:top_k]
         best_score = final_candidates[0].score
 
@@ -599,3 +674,7 @@ class MonteCarloEvidenceSampling:
             is_found=True,
             snippets=roi_snippets,
         )
+
+
+# Preferred alias for new code — backward-compatible rename.
+LensEvidenceSampler = MonteCarloEvidenceSampling

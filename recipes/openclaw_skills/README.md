@@ -87,12 +87,14 @@ curl -s -X POST "http://localhost:8584/api/v1/search" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "your question",
-    "mode": "FAST"
+    "mode": "DEEP",
+    "response_format": "rich"
   }'
 ```
 
 - **`paths`** is optional in the request body. If omitted, the server uses `SIRCHMUNK_SEARCH_PATHS` from its environment, then falls back to its working directory.
-- **`mode`** can be `FAST` (default, 2-5 s), `DEEP` (comprehensive, 10-30 s), or `FILENAME_ONLY` (no LLM).
+- **`mode`** can be `DEEP` (default, comprehensive, 10-30 s), `FAST` (2-5 s), or `FILENAME_ONLY` (no LLM).
+- **`response_format`** can be `rich` (default Markdown evidence report), `minimal`, `context`, or `json`.
 
 See the main [HTTP Client Access (Search API)](../../README.md#-http-client-access-search-api) section for the full parameter reference, SSE streaming endpoint, and client examples in Python / JavaScript.
 

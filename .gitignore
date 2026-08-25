@@ -147,6 +147,9 @@ venv.bak/
 .env
 *.mcp_env
 tests/.env.test
+benchmarks/.env.global
+benchmarks/hotpotqa/.env.hotpotqa*
+!benchmarks/hotpotqa/*.example
 
 # Spyder project settings
 .spyderproject
@@ -266,9 +269,29 @@ web/out/
 
 
 # benchmarks
+benchmarks/.env.global
+benchmarks/experiments.jsonl
+benchmarks/multi_experiments.jsonl
+benchmarks/**/*experiments*.jsonl
+benchmarks/**/golden_set*.json
+benchmarks/**/sampling_*_sample_ids.json
+benchmarks/**/sampling_*_manifest.json
+benchmarks/**/sampling_*_protocol.json
+benchmarks/**/*queue*.json
+benchmarks/**/*registry*.jsonl
+benchmarks/**/logs/
+benchmarks/**/results/
+benchmarks/**/output/
+benchmarks/**/runs/
+benchmarks/**/checkpoints/
+benchmarks/**/artifacts/
+benchmarks/**/.work/
+benchmarks/**/lifecycle_eval/
+benchmarks/**/scaling_study/
+benchmarks/**/corpus_subsets/
 benchmarks/*/data/
 benchmarks/*/.env*
-benchmarks/*/logs/
-benchmarks/*/results/
-benchmarks/*/output/
-benchmarks/*/.work/
+!benchmarks/**/*.example
+benchmarks/**/.env*.example
+# Keep the Layer 0 template referenced by benchmarks/README.md quick start.
+!benchmarks/.env.global.example

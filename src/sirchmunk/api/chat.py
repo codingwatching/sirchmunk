@@ -493,7 +493,7 @@ manager = ChatConnectionManager()
 class SearchRequest(BaseModel):
     query: str
     paths: Union[str, List[str]]  # Expects absolute file/directory paths from user's local filesystem
-    mode: Optional[str] = "FAST"
+    mode: Optional[str] = "DEEP"
     max_depth: Optional[int] = 5
     top_k_files: Optional[int] = 3
 
@@ -542,7 +542,7 @@ def get_search_instance(log_callback=None):
 
     try:
         envs = get_envs()
-    except Exception as e:
+    except Exception:
         logger.warning("LLM configuration incomplete, check LLM_BASE_URL/LLM_API_KEY/LLM_MODEL_NAME")
         envs = {
             "base_url": os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
@@ -662,7 +662,7 @@ def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[
             res = filedialog.askdirectory(**kwargs)
             selected_paths = [res] if res else []
 
-    except Exception as e:
+    except Exception:
         logger.warning("File dialog error")
         selected_paths = []
 
@@ -805,13 +805,14 @@ async def _run_rag_search(
         list of evidence dicts extracted from the SearchContext cluster.
     """
     search_engine = get_search_instance(log_callback=search_log_callback)
+    search_mode = (search_mode or "DEEP").upper()
 
     result = await search_engine.search(
         query=message,
         paths=paths,
         mode=search_mode,
         top_k_files=3,
-        return_context=True,
+        response_format="context",
     )
 
     references: List[Dict[str, Any]] = []
@@ -845,7 +846,7 @@ async def _chat_rag(
     kb_name: str,
     websocket: WebSocket,
     manager: ChatConnectionManager,
-    search_mode: str = "FAST",
+    search_mode: str = "DEEP",
     *,
     history: Optional[List[Dict[str, str]]] = None,
 ) -> tuple[str, Dict[str, Any]]:
@@ -873,8 +874,6 @@ async def _chat_rag(
             api_key=envs["api_key"], base_url=envs["base_url"], model=envs["model_name"],
         )
         search_query = await _rewrite_query_with_context(message, history, rewrite_llm)
-
-    last_error: Optional[Exception] = None
 
     for attempt in range(_RAG_PIPELINE_MAX_RETRIES + 1):
         try:
@@ -909,7 +908,6 @@ async def _chat_rag(
             return search_result, sources
 
         except Exception as e:
-            last_error = e
             friendly = _classify_error(e)
 
             if _is_transient_llm_error(e) and attempt < _RAG_PIPELINE_MAX_RETRIES:
@@ -1010,7 +1008,7 @@ async def _chat_rag_web_search(
     kb_name: str,
     websocket: WebSocket,
     manager: ChatConnectionManager,
-    search_mode: str = "FAST",
+    search_mode: str = "DEEP",
     *,
     history: Optional[List[Dict[str, str]]] = None,
 ) -> tuple[str, Dict[str, Any]]:
@@ -1147,11 +1145,10 @@ async def chat_websocket(websocket: WebSocket):
             
             message = request_data.get("message", "")
             session_id = request_data.get("session_id")
-            history = request_data.get("history", [])
             kb_name = request_data.get("kb_name", "")
             enable_rag = request_data.get("enable_rag", False)
             enable_web_search = request_data.get("enable_web_search", False)
-            search_mode = request_data.get("search_mode", "FAST")
+            search_mode = str(request_data.get("search_mode", "DEEP") or "DEEP").upper()
 
             logger.debug("Chat request: rag=%s, mode=%s", enable_rag, search_mode)
             
@@ -1169,7 +1166,7 @@ async def chat_websocket(websocket: WebSocket):
             if session_id not in chat_sessions:
                 chat_sessions[session_id] = {
                     "session_id": session_id,
-                    "title": f"Chat Session",
+                    "title": "Chat Session",
                     "messages": [],
                     "created_at": datetime.now().isoformat(),
                     "updated_at": datetime.now().isoformat(),
@@ -1288,7 +1285,7 @@ async def chat_websocket(websocket: WebSocket):
             
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-    except Exception as e:
+    except Exception:
         logger.error("WebSocket error occurred")
         logger.exception("WebSocket exception details")
         try:
@@ -1296,7 +1293,7 @@ async def chat_websocket(websocket: WebSocket):
                 "type": "error",
                 "message": "An internal error occurred. Please try again."
             }), websocket)
-        except:
+        except Exception:
             pass
         manager.disconnect(websocket)
 
@@ -1448,7 +1445,7 @@ async def browse_files(request: Request, path: str = "", show_hidden: bool = Fal
         logger.warning("Permission denied for path %s from %s", abs_path, client_ip)
         audit_logger.log(client_ip=client_ip, action="browse", path=path, result="permission_denied")
         return {"success": False, "error": "Permission denied: path is not in the allowed list"}
-    except Exception as e:
+    except Exception:
         logger.exception("Unexpected error in file browser")
         audit_logger.log(client_ip=client_ip, action="browse", path=path, result="error")
         return {"success": False, "error": "An error occurred"}
@@ -1522,7 +1519,7 @@ async def load_chat_session(session_id: str):
     
     return {
         "success": True,
-        "message": f"Chat session loaded successfully",
+        "message": "Chat session loaded successfully",
         "data": {
             "session_id": session_id,
             "title": session.get("title", "Chat Session"),

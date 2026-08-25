@@ -20,6 +20,7 @@ from .config import Config
 
 if TYPE_CHECKING:
     from sirchmunk.schema.knowledge import KnowledgeCluster
+    from sirchmunk.schema.search_context import SearchContext
 
 
 logger = logging.getLogger(__name__)
@@ -168,7 +169,7 @@ class SirchmunkService:
         self,
         query: str,
         paths: Optional[Union[str, List[str]]] = None,
-        mode: str = "FAST",
+        mode: str = "DEEP",
         max_depth: Optional[int] = None,
         top_k_files: Optional[int] = None,
         max_loops: Optional[int] = None,
@@ -176,8 +177,9 @@ class SirchmunkService:
         enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
-        return_context: bool = False,
-    ) -> Union[str, "SearchContext", List[Dict[str, Any]], None]:
+        return_context: Optional[bool] = None,
+        response_format: str = "rich",
+    ) -> Union[str, "SearchContext", List[Dict[str, Any]], Dict[str, Any], None]:
         """Search and retrieve various types of raw documents using AgenticSearch.
         
         Supports DEEP mode (parallel multi-path + ReAct refinement) and
@@ -187,7 +189,7 @@ class SirchmunkService:
             query: Search query or question to find relevant documents
             paths: Paths to search in (files or directories).
                 Optional — falls back to configured default or cwd.
-            mode: Search mode (FAST, DEEP, FILENAME_ONLY)
+            mode: Search mode (DEEP default, FAST, FILENAME_ONLY)
             max_depth: Maximum directory depth to search
             top_k_files: Number of top files to return
             max_loops: Maximum ReAct iterations (DEEP mode)
@@ -195,11 +197,14 @@ class SirchmunkService:
             enable_dir_scan: Enable directory scanning (DEEP mode)
             include: File patterns to include (glob)
             exclude: File patterns to exclude (glob)
-            return_context: Whether to return full SearchContext object
+            return_context: Deprecated compatibility shim; True maps to
+                response_format="context". Use response_format directly in new code.
+            response_format: Output format (rich, minimal, context, json)
         
         Returns:
-            Search results: str (summary), SearchContext (if return_context=True),
-            List[Dict] (FILENAME_ONLY), or None (if no results)
+            Search results: str (rich Markdown or minimal answer), SearchContext
+            (if response_format=context), serialized dict (response_format=json),
+            List[Dict] (FILENAME_ONLY), or None
         
         Raises:
             RuntimeError: If service is not initialized
@@ -209,8 +214,14 @@ class SirchmunkService:
             raise RuntimeError("Sirchmunk service is not initialized")
         
         # Validate mode
+        mode = (mode or "DEEP").upper()
         if mode not in ("FAST", "DEEP", "FILENAME_ONLY"):
             raise ValueError(f"Invalid mode: {mode}. Must be FAST, DEEP, or FILENAME_ONLY")
+        response_format = (response_format or "rich").lower()
+        if return_context:
+            response_format = "context"
+        if response_format not in ("rich", "minimal", "context", "json"):
+            raise ValueError("response_format must be rich, minimal, context, or json")
         
         # Normalize paths
         if isinstance(paths, str):
@@ -243,7 +254,7 @@ class SirchmunkService:
                 "enable_dir_scan": enable_dir_scan,
                 "include": include,
                 "exclude": exclude,
-                "return_context": return_context,
+                "response_format": response_format,
             }
             if max_loops is not None:
                 kwargs["max_loops"] = max_loops
