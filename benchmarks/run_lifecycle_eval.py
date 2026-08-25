@@ -12,7 +12,6 @@ import asyncio
 import importlib
 import logging
 import sys
-from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List
@@ -28,7 +27,7 @@ from baselines import BM25RAGBaseline, HybridRAGBaseline, LocalBM25Baseline, Nai
 from baselines.base_adapter import BaselineAdapter  # noqa: E402
 from evaluation.table_generator import PaperTableGenerator  # noqa: E402
 from framework.baseline_lifecycle import BaselineLifecycleManager  # noqa: E402
-from framework.lifecycle_schema import (
+from framework.lifecycle_schema import (  # noqa: E402
     BaselineLifecycleRecord,
     BaselinePhase,
     ResourceBudget,

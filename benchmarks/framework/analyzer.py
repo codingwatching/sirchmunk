@@ -12,7 +12,6 @@ Single Responsibility: this module only analyzes and never modifies config or co
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 from collections import defaultdict
@@ -309,7 +308,7 @@ class BadCaseAnalyzer:
         """Print the report to stdout in structured Markdown."""
         sep = "=" * 64
         print(f"\n{sep}")
-        print(f"  BadCase Analysis Report")
+        print("  BadCase Analysis Report")
         print(f"  Total: {report.total_samples}  |  "
               f"Accuracy: {report.accuracy:.1f}%  |  "
               f"Coverage: {report.coverage:.1f}%")

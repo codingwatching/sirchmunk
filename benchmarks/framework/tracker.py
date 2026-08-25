@@ -51,7 +51,9 @@ class ExperimentDelta:
         self.notes = notes
 
     def print_summary(self) -> None:
-        sign = lambda v: f"+{v:.2f}" if v >= 0 else f"{v:.2f}"
+        def sign(v: float) -> str:
+            return f"+{v:.2f}" if v >= 0 else f"{v:.2f}"
+
         regression_tag = "  ⚠️  REGRESSION DETECTED" if self.is_regression else ""
         print(f"\n── Experiment Delta: {self.run_id_a} → {self.run_id_b} ──")
         print(f"  Accuracy:  {sign(self.accuracy_delta)}%{regression_tag}")

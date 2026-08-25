@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 import re
-import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -125,14 +124,14 @@ class HumanConfirmLoop:
             print(f"    Description: {h.description[:160]}")
 
             if h.change_type == ChangeType.CONFIG_CHANGE and h.config_changes:
-                print(f"    Changes:")
+                print("    Changes:")
                 for k, v in h.config_changes.items():
                     print(f"      {k} = {v}")
                 if h.env_file:
                     print(f"    File: {h.env_file}")
 
             if h.change_type in (ChangeType.PIPELINE_PATCH, ChangeType.PROMPT_FIX):
-                print(f"    Guidance: (see details below after selection)")
+                print("    Guidance: (see details below after selection)")
 
         print(f"\n{_SUBSEP}")
         print("  请选择操作：")
@@ -209,7 +208,7 @@ class HumanConfirmLoop:
         env_path = Path(h.env_file) if h.env_file else None
         if not env_path or not env_path.exists():
             print(f"\n  ⚠️  .env 文件不存在: {h.env_file}，跳过自动写入。")
-            print(f"     请手动应用以下变更：")
+            print("     请手动应用以下变更：")
             for k, v in h.config_changes.items():
                 print(f"       {k}={v}")
             return False
@@ -217,9 +216,9 @@ class HumanConfirmLoop:
         # Extra warning for Layer 0 global changes
         layer_val = getattr(h, "config_layer", None)
         if layer_val == ConfigLayer.GLOBAL or layer_val == 0:
-            print(f"\n  🌐 注意：此 CONFIG_CHANGE 包含全局配置键（Layer 0）")
-            print(f"     将影响所有已注册的 benchmark！")
-            print(f"     建议先在所有 benchmark 上做联合评估（将来 Pareto Gate）后再执行。")
+            print("\n  🌐 注意：此 CONFIG_CHANGE 包含全局配置键（Layer 0）")
+            print("     将影响所有已注册的 benchmark！")
+            print("     建议先在所有 benchmark 上做联合评估（将来 Pareto Gate）后再执行。")
             print()
 
         # Read the current content

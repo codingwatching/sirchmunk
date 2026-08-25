@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -62,8 +62,11 @@ class MultiDelta:
         print(f"  Pareto Status: {status_icon}  {self.pareto_status.upper()}")
         print(f"  {'Benchmark':<25} {'Δacc%':>7} {'Δcov%':>7} {'Δlat':>7}")
         print("  " + "─" * 50)
+
+        def s(v: float) -> str:
+            return f"+{v:.2f}" if v >= 0 else f"{v:.2f}"
+
         for bm, d in sorted(self.per_bm_delta.items()):
-            s = lambda v: f"+{v:.2f}" if v >= 0 else f"{v:.2f}"
             print(f"  {bm:<25} {s(d.get('accuracy_delta', 0)):>7} "
                   f"{s(d.get('coverage_delta', 0)):>7} "
                   f"{s(d.get('latency_delta', 0)):>7}")

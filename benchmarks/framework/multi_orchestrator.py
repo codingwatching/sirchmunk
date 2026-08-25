@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
 from typing import Dict, List, Optional
 
 from .adapter import BenchmarkAdapter
@@ -121,7 +120,7 @@ class MultiAdapterOrchestrator:
         prev_run_id: Optional[str] = None
 
         print(f"\n{'='*68}")
-        print(f"  Multi-Benchmark Research Loop")
+        print("  Multi-Benchmark Research Loop")
         print(f"  Benchmarks: {', '.join(bm_names)}")
         print(f"  Max iterations: {max_iterations}  |  Limit/bm: {limit_per_bm or 'ALL'}")
         print(f"{'='*68}\n")

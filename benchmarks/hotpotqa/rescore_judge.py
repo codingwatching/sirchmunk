@@ -73,7 +73,6 @@ async def main() -> int:
     args = ap.parse_args()
 
     from hotpotqa.adapter import HotpotQAAdapter
-    from hotpotqa.judge import HotpotQAJudge
 
     os.environ.setdefault("HOTPOT_ENABLE_LLM_JUDGE", "true")
     adapter = HotpotQAAdapter(args.env)

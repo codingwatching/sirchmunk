@@ -30,22 +30,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
-from datetime import datetime, timezone
+import sys as _sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-logger = logging.getLogger(__name__)
-
-# Import the baselines interface (independent of the framework/ self-improvement modules)
-import sys as _sys
 _HERE = Path(__file__).parent.resolve()       # evaluation/
 _BENCHMARKS = _HERE.parent                    # benchmarks/
 if str(_BENCHMARKS) not in _sys.path:
     _sys.path.insert(0, str(_BENCHMARKS))
 
-from baselines.base_adapter import BaselineAdapter, BaselineResult
-from framework.guards import BudgetExceeded, BudgetGuard, GuardConfig, SampleTimeout, TimeoutGuard
+from baselines.base_adapter import BaselineAdapter, BaselineResult  # noqa: E402
+from framework.guards import BudgetExceeded, BudgetGuard, GuardConfig, SampleTimeout, TimeoutGuard  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 class BaselineEvaluationSuite:

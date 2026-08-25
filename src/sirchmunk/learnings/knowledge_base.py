@@ -61,13 +61,13 @@ class KnowledgeBase:
         self.metadata_path: Path = (
             self.work_path / StorageStructure.CACHE_DIR / StorageStructure.METADATA_DIR
         )
-        
+
         # Store log_callback for passing to child components
         self.log_callback = log_callback
-        
+
         # LENS configuration (lazy-loaded from env if not provided)
         self.lens_config = lens_config or LensConfig.from_env()
-        
+
         # Create bound logger with callback - returns AsyncLogger instance
         self._log = create_logger(log_callback=log_callback)
 

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import math
 import random
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 
 def bootstrap_ci(

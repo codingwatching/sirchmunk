@@ -6,7 +6,7 @@ import itertools
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List
 
 
 @dataclass

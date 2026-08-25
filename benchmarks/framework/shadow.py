@@ -23,7 +23,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .schema import ChangeType, ConfigLayer, ImprovementHypothesis, PredictionResult
+from .schema import ChangeType, ImprovementHypothesis
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,10 @@ class ShadowImpactMatrix:
         print(f"  Pareto预估: {icon} {self.pareto_status.upper()}")
         print(f"  {'Benchmark':<25} {'n':>4} {'Δacc%':>7} {'Δcov%':>7}")
         print("  " + "─" * 46)
+
+        def s(v: float) -> str:
+            return f"+{v:.1f}" if v >= 0 else f"{v:.1f}"
+
         for bm, r in sorted(self.results.items()):
             if not r.applicable:
                 print(f"  {bm:<25} {'N/A':>4} {'n/a':>7} {'n/a':>7}  (not applicable)")
@@ -97,7 +101,6 @@ class ShadowImpactMatrix:
             d = self.deltas.get(bm, {})
             delta_acc = d.get("accuracy_delta", 0)
             delta_cov = d.get("coverage_delta", 0)
-            s = lambda v: f"+{v:.1f}" if v >= 0 else f"{v:.1f}"
             print(f"  {bm:<25} {r.n_samples:>4} {s(delta_acc):>7} {s(delta_cov):>7}")
         print()
 

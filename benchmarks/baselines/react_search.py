@@ -12,7 +12,6 @@ Scope:
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .base_adapter import BaselineAdapter, BaselinePrediction, BaselineSetupResult
