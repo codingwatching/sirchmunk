@@ -2,18 +2,52 @@
 import asyncio
 import json
 import math
+import os
 import re
+import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from loguru import logger
 
-from ..utils.constants import GREP_CONCURRENT_LIMIT, DEFAULT_SIRCHMUNK_WORK_PATH
+from ..utils.constants import (
+    DEFAULT_SIRCHMUNK_WORK_PATH,
+    GREP_CONCURRENT_LIMIT,
+    GREP_FALLBACK_CONCURRENT_LIMIT,
+    GREP_FALLBACK_TIMEOUT,
+    GREP_FALLBACK_TO_RG,
+    GREP_KEYWORD_CONCURRENT_LIMIT,
+    GREP_PROCESS_KILL_TIMEOUT,
+    GREP_QUEUE_TIMEOUT,
+    GREP_RGA_BACKOFF_SECONDS,
+    GREP_TIMEOUT,
+)
 from ..utils.file_utils import StorageStructure
 from .base import BaseRetriever
 
 RGA_SEMAPHORE = asyncio.Semaphore(value=GREP_CONCURRENT_LIMIT)
+RG_FALLBACK_SEMAPHORE = asyncio.Semaphore(value=GREP_FALLBACK_CONCURRENT_LIMIT)
+_RGA_BACKOFF_UNTIL = 0.0
+
+
+class SearchProcessTimeoutError(RuntimeError):
+    """Raised when a search subprocess cannot start or finish within its budget."""
+
+    def __init__(self, command: str, stage: str, timeout: float) -> None:
+        self.command = command
+        self.stage = stage
+        self.timeout = timeout
+        super().__init__(f"{command} {stage} timed out ({timeout}s).")
+
+
+class SearchExecutableNotFoundError(RuntimeError):
+    """Raised when a configured search executable is unavailable."""
+
+    def __init__(self, command: str) -> None:
+        self.command = command
+        super().__init__(f"Search executable '{command}' was not found.")
 
 
 class GrepRetriever(BaseRetriever):
@@ -58,7 +92,7 @@ class GrepRetriever(BaseRetriever):
         rga_no_cache: bool = False,
         rga_cache_max_blob_len: int = 10000000,
         rga_cache_path: Optional[Union[str, Path]] = None,
-        timeout: float = 60.0,
+        timeout: float = GREP_TIMEOUT,
     ) -> List[Dict[str, Any]]:
         """Search for terms in files using ripgrep-all, supporting AND/OR/NOT logic.
 
@@ -338,82 +372,250 @@ class GrepRetriever(BaseRetriever):
             )
 
     @staticmethod
-    async def _run_rga_async(
-            args: List[str], json_output: bool = True, timeout: float = 60.0
-    ) -> Dict[str, Any]:
-        cmd = ["rga", "--no-config"]
-        if json_output:
-            cmd.append("--json")
-        cmd.extend(args)
-
+    async def _terminate_process(
+        process: asyncio.subprocess.Process,
+        communicate_task: Optional[asyncio.Task] = None,
+    ) -> None:
+        """Terminate a search process tree and wait until it is reaped."""
         try:
-            await asyncio.wait_for(RGA_SEMAPHORE.acquire(), timeout=timeout)
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"rga search timed out while waiting for a queue slot ({timeout}s)."
-            )
-
-        try:
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            elif os.name == "nt" and process.returncode is None:
+                killer = await asyncio.create_subprocess_exec(
+                    "taskkill",
+                    "/PID",
+                    str(process.pid),
+                    "/T",
+                    "/F",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
                 )
-            except FileNotFoundError:
-                raise RuntimeError("ripgrep-all ('rga') not found. Please install it first.")
-
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout
+                await asyncio.wait_for(
+                    killer.wait(), timeout=GREP_PROCESS_KILL_TIMEOUT
                 )
-
-                stdout_str = stdout.decode().strip()
-                stderr_str = stderr.decode().strip()
-                returncode = process.returncode
-
-                if returncode != 0:
-                    if "ripgrep" in stderr_str.lower() or " rg " in stderr_str:
-                        raise RuntimeError(
-                            f"ripgrep-all depends on 'ripgrep' (rg), but it's missing or failed: {stderr_str}"
-                        )
-                    elif returncode > 1:
-                        # Exit code 2 means "some errors occurred" (e.g.
-                        # preprocessor failures on individual files), but
-                        # valid matches may still be present in stdout.
-                        # Only raise if there is NO stdout content at all.
-                        if not stdout_str:
-                            raise RuntimeError(
-                                f"rga execution failed with code {returncode}: {stderr_str}"
-                            )
-                        # Log the errors but continue to parse results
-                        logger.warning(
-                            f"rga returned exit code {returncode} with partial errors "
-                            f"(first 300 chars): {stderr_str[:300]}"
-                        )
-
-                # Parse JSON Lines — also for exit code 2 when stdout has content
-                parsed_stdout = stdout_str
-                if json_output and returncode in (0, 1, 2) and stdout_str:
-                    try:
-                        parsed_stdout = [
-                            json.loads(line) for line in stdout_str.splitlines() if line
-                        ]
-                    except json.JSONDecodeError as e:
-                        raise RuntimeError(f"Failed to parse rga JSON output: {e}")
-
-                return {
-                    "returncode": returncode,
-                    "stdout": parsed_stdout,
-                    "stderr": stderr_str,
-                }
-            except asyncio.TimeoutError:
+            elif process.returncode is None:
+                process.kill()
+        except (
+            asyncio.TimeoutError,
+            FileNotFoundError,
+            ProcessLookupError,
+            PermissionError,
+        ):
+            if process.returncode is None:
                 try:
                     process.kill()
                 except ProcessLookupError:
                     pass
-                raise RuntimeError(f"rga process execution timed out ({timeout}s).")
 
+        try:
+            if communicate_task is not None:
+                await asyncio.wait_for(
+                    asyncio.shield(communicate_task),
+                    timeout=GREP_PROCESS_KILL_TIMEOUT,
+                )
+            else:
+                await asyncio.wait_for(
+                    process.wait(), timeout=GREP_PROCESS_KILL_TIMEOUT
+                )
+        except (asyncio.TimeoutError, ProcessLookupError):
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(
+                        process.wait(), timeout=GREP_PROCESS_KILL_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Search process {} could not be reaped within {:.1f}s",
+                        process.pid,
+                        GREP_PROCESS_KILL_TIMEOUT,
+                    )
+
+    @staticmethod
+    def _parse_async_result(
+        command: str,
+        returncode: int,
+        stdout: bytes,
+        stderr: bytes,
+        *,
+        json_output: bool,
+    ) -> Dict[str, Any]:
+        """Decode and validate output from an asynchronous search command."""
+        stdout_str = stdout.decode(errors="replace").strip()
+        stderr_str = stderr.decode(errors="replace").strip()
+
+        if returncode != 0 and returncode > 1:
+            if not stdout_str:
+                raise RuntimeError(
+                    f"{command} execution failed with code {returncode}: {stderr_str}"
+                )
+            logger.warning(
+                f"{command} returned exit code {returncode} with partial errors "
+                f"(first 300 chars): {stderr_str[:300]}"
+            )
+
+        parsed_stdout: Union[str, List[Dict[str, Any]]] = stdout_str
+        if json_output and returncode in (0, 1, 2) and stdout_str:
+            try:
+                parsed_stdout = [
+                    json.loads(line) for line in stdout_str.splitlines() if line
+                ]
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"Failed to parse {command} JSON output: {exc}"
+                ) from exc
+
+        return {
+            "returncode": returncode,
+            "stdout": parsed_stdout,
+            "stderr": stderr_str,
+            "search_backend": command,
+        }
+
+    @staticmethod
+    async def _run_search_process(
+        command: str,
+        args: List[str],
+        *,
+        semaphore: asyncio.Semaphore,
+        queue_timeout: float,
+        execution_timeout: float,
+        json_output: bool,
+    ) -> Dict[str, Any]:
+        """Run a bounded search process with cancellation-safe cleanup."""
+        acquired = False
+        try:
+            await asyncio.wait_for(semaphore.acquire(), timeout=queue_timeout)
+            acquired = True
+        except asyncio.TimeoutError as exc:
+            raise SearchProcessTimeoutError(
+                command, "queue wait", queue_timeout
+            ) from exc
+
+        process: Optional[asyncio.subprocess.Process] = None
+        try:
+            cmd = [command, "--no-config"]
+            if json_output:
+                cmd.append("--json")
+            cmd.extend(args)
+
+            process_kwargs: Dict[str, Any] = {
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
+            }
+            if os.name == "posix":
+                process_kwargs["start_new_session"] = True
+            elif os.name == "nt":
+                process_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd, **process_kwargs
+                )
+            except FileNotFoundError as exc:
+                raise SearchExecutableNotFoundError(command) from exc
+
+            communicate_task = asyncio.create_task(process.communicate())
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    asyncio.shield(communicate_task), timeout=execution_timeout
+                )
+            except asyncio.TimeoutError as exc:
+                await asyncio.shield(
+                    GrepRetriever._terminate_process(process, communicate_task)
+                )
+                raise SearchProcessTimeoutError(
+                    command, "execution", execution_timeout
+                ) from exc
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    GrepRetriever._terminate_process(process, communicate_task)
+                )
+                raise
+
+            return GrepRetriever._parse_async_result(
+                command,
+                process.returncode,
+                stdout,
+                stderr,
+                json_output=json_output,
+            )
         finally:
-            RGA_SEMAPHORE.release()
+            if acquired:
+                semaphore.release()
+
+    @staticmethod
+    def _rg_compatible_args(args: List[str]) -> List[str]:
+        """Remove rga-only flags before falling back to native ripgrep."""
+        return [arg for arg in args if not arg.startswith("--rga-")]
+
+    @staticmethod
+    async def _run_rga_async(
+        args: List[str],
+        json_output: bool = True,
+        timeout: float = GREP_TIMEOUT,
+        allow_rg_fallback: bool = True,
+    ) -> Dict[str, Any]:
+        """Run rga, falling back to rg when rga is unavailable or times out."""
+        global _RGA_BACKOFF_UNTIL
+
+        if (
+            allow_rg_fallback
+            and GREP_FALLBACK_TO_RG
+            and time.monotonic() < _RGA_BACKOFF_UNTIL
+        ):
+            result = await GrepRetriever._run_search_process(
+                "rg",
+                GrepRetriever._rg_compatible_args(args),
+                semaphore=RG_FALLBACK_SEMAPHORE,
+                queue_timeout=GREP_QUEUE_TIMEOUT,
+                execution_timeout=GREP_FALLBACK_TIMEOUT,
+                json_output=json_output,
+            )
+            result["fallback_reason"] = "rga circuit breaker is open"
+            return result
+
+        try:
+            return await GrepRetriever._run_search_process(
+                "rga",
+                args,
+                semaphore=RGA_SEMAPHORE,
+                queue_timeout=GREP_QUEUE_TIMEOUT,
+                execution_timeout=timeout,
+                json_output=json_output,
+            )
+        except (
+            SearchProcessTimeoutError,
+            SearchExecutableNotFoundError,
+            RuntimeError,
+        ) as exc:
+            if not GREP_FALLBACK_TO_RG or not allow_rg_fallback:
+                raise
+            if (
+                isinstance(exc, SearchExecutableNotFoundError)
+                or (
+                    isinstance(exc, SearchProcessTimeoutError)
+                    and exc.stage == "execution"
+                )
+            ):
+                _RGA_BACKOFF_UNTIL = max(
+                    _RGA_BACKOFF_UNTIL,
+                    time.monotonic() + GREP_RGA_BACKOFF_SECONDS,
+                )
+            logger.warning("{} Falling back to native rg.", exc)
+            result = await GrepRetriever._run_search_process(
+                "rg",
+                GrepRetriever._rg_compatible_args(args),
+                semaphore=RG_FALLBACK_SEMAPHORE,
+                queue_timeout=GREP_QUEUE_TIMEOUT,
+                execution_timeout=GREP_FALLBACK_TIMEOUT,
+                json_output=json_output,
+            )
+            result["fallback_reason"] = str(exc)
+            return result
 
     @staticmethod
     async def _retrieve_single(**kwargs) -> List[Dict[str, Any]]:
@@ -435,7 +637,7 @@ class GrepRetriever(BaseRetriever):
         exclude = kwargs.get("exclude")
         file_type = kwargs.get("file_type")
         path = kwargs.get("path")
-        timeout = kwargs.get("timeout", 60.0)
+        timeout = kwargs.get("timeout", GREP_TIMEOUT)
 
         # Additional ripgrep-all args
         rga_no_cache = kwargs.get("rga_no_cache", False)
@@ -518,6 +720,13 @@ class GrepRetriever(BaseRetriever):
             else:
                 stdout = result["stdout"]
                 parsed = stdout if isinstance(stdout, list) else []
+                backend = str(result.get("search_backend", "rga"))
+                fallback_reason = result.get("fallback_reason")
+                for item in parsed:
+                    if isinstance(item, dict):
+                        item.setdefault("_search_backend", backend)
+                        if fallback_reason:
+                            item.setdefault("_fallback_reason", fallback_reason)
                 if returncode == 2 and not parsed and stderr_str:
                     logger.warning(
                         f"rga exit 2 with no results — preprocessing may have failed "
@@ -556,18 +765,32 @@ class GrepRetriever(BaseRetriever):
                 return result, terms[0]
 
             # Multiple terms + literal mode: search each term separately
-            # then merge results to simulate OR.
+            # then merge results to simulate OR. Bound fan-out and retain
+            # successful terms when another backend attempt fails.
+            term_semaphore = _aio.Semaphore(GREP_KEYWORD_CONCURRENT_LIMIT)
+
             async def _search_one(term: str):
-                return await GrepRetriever._retrieve_single(
-                    pattern=term, **kwargs
-                )
+                async with term_semaphore:
+                    return await GrepRetriever._retrieve_single(
+                        pattern=term, **kwargs
+                    )
 
-            results_lists = await _aio.gather(*[_search_one(t) for t in terms])
+            results_lists = await _aio.gather(
+                *[_search_one(term) for term in terms],
+                return_exceptions=True,
+            )
 
-            # Merge all raw JSON events into a single list
             combined: List[Dict[str, Any]] = []
-            for rl in results_lists:
-                combined.extend(rl)
+            failures: List[Exception] = []
+            for result in results_lists:
+                if isinstance(result, _aio.CancelledError):
+                    raise result
+                if isinstance(result, Exception):
+                    failures.append(result)
+                    continue
+                combined.extend(result)
+            if not combined and failures:
+                raise failures[0]
 
             pattern_desc = " | ".join(terms)
             return combined, pattern_desc
@@ -760,7 +983,7 @@ class GrepRetriever(BaseRetriever):
         exclude: Optional[List[str]] = None,
         file_type: Optional[str] = None,
         rank: bool = True,
-        timeout: float = 60.0,
+        timeout: float = GREP_TIMEOUT,
     ) -> List[Dict[str, Any]]:
         """Search for files by filename patterns (fast file name matching).
         
@@ -1011,7 +1234,10 @@ class GrepRetriever(BaseRetriever):
         if path:
             args.append(path)
 
-        result = await GrepRetriever._run_rga_async(args)
+        result = await GrepRetriever._run_rga_async(
+            args,
+            allow_rg_fallback=False,
+        )
         if result["returncode"] not in (0, 1):
             raise RuntimeError(
                 f"ripgrep-all replace failed: {result['stderr'].strip()}"

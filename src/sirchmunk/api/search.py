@@ -58,8 +58,8 @@ class SearchRequest(BaseModel):
         ),
     )
     mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = Field(
-        default="FAST",
-        description="Search mode: FAST (greedy search, 2-5s), DEEP (comprehensive analysis, 10-30s), or FILENAME_ONLY (file discovery, <1s)"
+        default="DEEP",
+        description="Search mode: DEEP (default, comprehensive analysis, 10-30s), FAST (greedy search, 2-5s), or FILENAME_ONLY (file discovery, <1s)"
     )
     max_depth: Optional[int] = Field(
         default=None,
@@ -89,9 +89,14 @@ class SearchRequest(BaseModel):
         default=None,
         description="File patterns to exclude (glob)"
     )
-    return_context: bool = Field(
-        default=False,
-        description="Return full SearchContext with KnowledgeCluster, answer, and telemetry"
+    return_context: Optional[bool] = Field(
+        default=None,
+        description="Deprecated compatibility shim; use response_format='context'",
+        json_schema_extra={"deprecated": True},
+    )
+    response_format: Literal["rich", "minimal", "context", "json"] = Field(
+        default="rich",
+        description="Search output format: rich Markdown, minimal answer, context object, or serialized context JSON",
     )
     llm_fallback: bool = Field(
         default=False,
@@ -253,13 +258,21 @@ def _sse_event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
+def _resolve_response_format(request: SearchRequest) -> str:
+    """Resolve the canonical response_format, honoring the legacy shim."""
+    if request.return_context:
+        return "context"
+    return request.response_format
+
+
 def _build_search_kwargs(request: SearchRequest) -> dict:
+    response_format = _resolve_response_format(request)
     kwargs = {
         "query": request.query,
         "paths": _normalize_api_paths(request.paths),
         "mode": request.mode,
         "enable_dir_scan": request.enable_dir_scan,
-        "return_context": request.return_context,
+        "response_format": response_format,
         "llm_fallback": request.llm_fallback,
     }
     if request.max_depth is not None:
@@ -279,12 +292,15 @@ def _build_search_kwargs(request: SearchRequest) -> dict:
 
 def _format_result(result, request: SearchRequest) -> dict:
     """Convert search result to a JSON-serialisable dict."""
-    if request.return_context and hasattr(result, "to_dict"):
+    if hasattr(result, "to_dict"):
         return {"type": "context", **result.to_dict()}
+    if isinstance(result, dict):
+        return {"type": "context", **result}
     if isinstance(result, list):
         return {"type": "files", "files": result, "count": len(result)}
     return {
         "type": "summary",
+        "format": _resolve_response_format(request),
         "summary": str(result) if result else "No results found.",
     }
 
@@ -351,7 +367,7 @@ async def execute_search_stream(request: SearchRequest, http_request: Request):
         import httpx
 
         with httpx.stream("POST", "http://host:8584/api/v1/search/stream",
-                          json={"query": "find auth bugs", "mode": "FAST"}) as r:
+                          json={"query": "find auth bugs", "mode": "DEEP"}) as r:
             for line in r.iter_lines():
                 if line.startswith("data: "):
                     print(json.loads(line[6:]))

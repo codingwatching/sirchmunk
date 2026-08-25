@@ -504,12 +504,12 @@ class UnifiedExperimentRunner:
 
         try:
             search_paths = adapter.get_search_paths(sample)
-            search_kwargs = adapter.get_search_kwargs()
+            search_kwargs = dict(adapter.get_search_kwargs())
+            search_kwargs["response_format"] = "context"
 
             result = await searcher.search(
                 query=sample.question,
                 paths=search_paths,
-                return_context=True,
                 **search_kwargs,
             )
             prediction = getattr(result, "answer", "") or str(result)

@@ -7,7 +7,6 @@ at different granularities — from lightweight keyword search to deep
 file reading and knowledge base querying.  All tools are stateless;
 side-effects (token accounting, dedup) are recorded via SearchContext.
 """
-import json
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -16,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
+from sirchmunk.utils.constants import GREP_KEYWORD_CONCURRENT_LIMIT, GREP_TIMEOUT
 from sirchmunk.utils.file_utils import fast_extract
 
 logger = logging.getLogger(__name__)
@@ -163,6 +163,8 @@ class KeywordSearchTool(BaseTool):
         max_snippet_lines: int = 5,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
+        timeout: float = GREP_TIMEOUT,
+        max_concurrent_terms: int = GREP_KEYWORD_CONCURRENT_LIMIT,
     ) -> None:
         self._retriever = retriever
         self._paths = paths
@@ -170,6 +172,8 @@ class KeywordSearchTool(BaseTool):
         self._max_results = max_results
         self._max_snippet_lines = max_snippet_lines
         self._include = include
+        self._timeout = max(1.0, timeout)
+        self._max_concurrent_terms = max(1, max_concurrent_terms)
         # Merge caller-provided excludes with sensible defaults (deduped)
         self._exclude = list(set(self._DEFAULT_EXCLUDE) | set(exclude or []))
 
@@ -204,8 +208,8 @@ class KeywordSearchTool(BaseTool):
         *,
         literal: bool,
         regex: bool,
-    ) -> List[Dict[str, Any]]:
-        """Search each keyword individually and merge all results.
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Search each keyword individually and return results plus failures.
 
         ripgrep's ``-F`` (fixed-string / literal) mode does NOT support
         ``|`` alternation — it treats ``|`` as a literal character.
@@ -220,34 +224,50 @@ class KeywordSearchTool(BaseTool):
         """
         import asyncio as _aio
 
-        # Fire one search per keyword concurrently
+        term_semaphore = _aio.Semaphore(self._max_concurrent_terms)
+
         async def _single(term: str) -> List[Dict[str, Any]]:
-            return await self._retriever.retrieve(
-                terms=term,
-                path=self._paths,
-                logic="or",
-                case_sensitive=False,
-                literal=literal,
-                regex=regex,
-                max_depth=self._max_depth,
-                include=self._include,
-                exclude=self._exclude,
-                timeout=30.0,
-            )
+            async with term_semaphore:
+                return await self._retriever.retrieve(
+                    terms=term,
+                    path=self._paths,
+                    logic="or",
+                    case_sensitive=False,
+                    literal=literal,
+                    regex=regex,
+                    max_depth=self._max_depth,
+                    include=self._include,
+                    exclude=self._exclude,
+                    timeout=self._timeout,
+                )
 
-        raw_lists = await _aio.gather(*[_single(k) for k in keywords])
+        raw_lists = await _aio.gather(
+            *[_single(keyword) for keyword in keywords],
+            return_exceptions=True,
+        )
 
-        # Flatten all raw rga JSON events into one list, then merge
-        # Tag each match event with the keyword that produced it so
-        # the formatter can guarantee keyword diversity in snippets.
+        # Preserve successful partial results even if another term exhausted both
+        # the rga and rg backends. Cancellation still propagates immediately.
         combined: List[Dict[str, Any]] = []
+        failures: List[str] = []
         for keyword, raw in zip(keywords, raw_lists):
+            if isinstance(raw, _aio.CancelledError):
+                raise raw
+            if isinstance(raw, Exception):
+                failures.append(f"{keyword}: {raw}")
+                logger.warning(
+                    "[keyword_search] Search failed for term %r: %s", keyword, raw
+                )
+                continue
             for item in raw:
                 if item.get("type") == "match":
                     item["_keyword"] = keyword
                 combined.append(item)
 
-        return self._retriever.merge_results(combined, limit=self._max_results * 2)
+        return (
+            self._retriever.merge_results(combined, limit=self._max_results * 2),
+            failures,
+        )
 
     async def _do_search_regex(
         self,
@@ -273,7 +293,7 @@ class KeywordSearchTool(BaseTool):
             max_depth=self._max_depth,
             include=self._include,
             exclude=self._exclude,
-            timeout=30.0,
+            timeout=self._timeout,
         )
         return self._retriever.merge_results(raw, limit=self._max_results)
 
@@ -290,16 +310,37 @@ class KeywordSearchTool(BaseTool):
 
         # Strategy 1: per-keyword literal search (safe for metacharacters,
         # avoids the `-F` + `|` bug where rga treats `|` literally)
-        results = await self._do_search_per_term(keywords, literal=True, regex=False)
+        results, search_failures = await self._do_search_per_term(
+            keywords, literal=True, regex=False
+        )
 
         # Strategy 2: escaped-regex OR search (single rga call, handles
         # adapters that only work in regex mode — e.g. some PDF/DOCX)
         if not results:
             logger.info("[keyword_search] Literal per-term empty, trying escaped regex OR")
-            results = await self._do_search_regex(keywords)
+            try:
+                results = await self._do_search_regex(keywords)
+            except Exception as exc:
+                search_failures.append(f"regex fallback: {exc}")
+                logger.warning("[keyword_search] Regex fallback failed: %s", exc)
 
         if not results:
-            return "No results found for the given keywords.", {"keywords": keywords, "count": 0}
+            context.add_log(
+                tool_name=self.name,
+                metadata={
+                    "keywords": keywords,
+                    "files_found": 0,
+                    "files_discovered": [],
+                    "search_failures": search_failures,
+                    "degraded": bool(search_failures),
+                },
+            )
+            return "No results found for the given keywords.", {
+                "keywords": keywords,
+                "count": 0,
+                "search_failures": search_failures,
+                "degraded": bool(search_failures),
+            }
 
         # Deduplicate: per-term literal search may return the same file
         # from multiple keyword passes.  Merge matches by file path.
@@ -332,6 +373,18 @@ class KeywordSearchTool(BaseTool):
         # Approximate token count (~4 chars per token)
         approx_tokens = total_chars // 4
         discovered_paths = list(deduped.keys())
+        search_backends = sorted({
+            str(match.get("_search_backend", "rga"))
+            for item in results
+            for match in item.get("matches", [])
+            if isinstance(match, dict)
+        })
+        fallback_reasons = sorted({
+            str(match["_fallback_reason"])
+            for item in results
+            for match in item.get("matches", [])
+            if isinstance(match, dict) and match.get("_fallback_reason")
+        })
         context.add_log(
             tool_name=self.name,
             tokens=approx_tokens,
@@ -339,6 +392,11 @@ class KeywordSearchTool(BaseTool):
                 "keywords": keywords,
                 "files_found": len(discovered_paths),
                 "files_discovered": discovered_paths,
+                "search_failures": search_failures,
+                "search_backends": search_backends,
+                "fallback_reasons": fallback_reasons,
+                "fallback_used": "rg" in search_backends,
+                "degraded": bool(search_failures),
             },
         )
 
@@ -351,6 +409,11 @@ class KeywordSearchTool(BaseTool):
             "files_found": len(deduped),
             "tokens": approx_tokens,
             "snippets_by_file": snippets_by_file,
+            "search_failures": search_failures,
+            "search_backends": search_backends,
+            "fallback_reasons": fallback_reasons,
+            "fallback_used": "rg" in search_backends,
+            "degraded": bool(search_failures),
         }
 
     @staticmethod

@@ -10,12 +10,13 @@
 [![TailwindCSS](https://img.shields.io/badge/Tailwind-3.4-06B6D4?style=flat-square&logo=tailwindcss&logoColor=white)](https://tailwindcss.com/)
 [![DuckDB](https://img.shields.io/badge/DuckDB-OLAP-FFF000?style=flat-square&logo=duckdb&logoColor=black)](https://duckdb.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
+[![arXiv](https://img.shields.io/badge/arXiv-2608.16185-b31b1b?style=flat-square)](https://arxiv.org/pdf/2608.16185)
 [![ripgrep-all](https://img.shields.io/badge/ripgrep--all-Search-E67E22?style=flat-square&logo=rust&logoColor=white)](https://github.com/phiresky/ripgrep-all)
 [![OpenAI](https://img.shields.io/badge/OpenAI-API-412991?style=flat-square&logo=openai&logoColor=white)](https://github.com/openai/openai-python)
 [![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square)](https://github.com/kreuzberg-dev/kreuzberg)
 [![MCP](https://img.shields.io/badge/MCP-Python_SDK-8B5CF6?style=flat-square&logo=python&logoColor=white)](https://github.com/modelcontextprotocol/python-sdk)
 
-📖 **[官方文档](https://modelscope.github.io/sirchmunk-web/zh/)** 
+📄 **[主论文](https://arxiv.org/pdf/2608.16185)** · 📖 **[官方文档](https://modelscope.github.io/sirchmunk-web/zh/)**
 
 [**快速开始**](#-快速开始) · [**核心特性**](#-核心特性) · [**MCP 服务器**](#-mcp-服务器) · [**Web UI**](#️-web-ui) · [**Docker 部署**](#-docker-部署) · [**工作原理**](#️-工作原理) · [**FAQ**](#-faq)
 
@@ -187,14 +188,14 @@
 <summary><b>历史版本（v0.0.2 – v0.0.5）</b></summary>
 
 * 🚀 **2026.3.5**: **Sirchmunk v0.0.5 发布**
-  - **破坏性变更**：统一搜索 API：重构 search() 接口的返回类型，引入 SearchContext 对象并简化返回参数控制，API 调用更简洁。
+  - **破坏性变更**：统一搜索 API：重构 search() 接口的返回类型，引入 SearchContext 对象，并采用 response_format 统一控制输出。
   - **高可用 RAG 对话**：引入重试机制与细粒度异常处理，大幅提升了 RAG 聊天在复杂网络环境下的稳定性。
   - **稳定 MCP 集成**：修复 mcp run 初始化问题，确保 MCP 协议服务器在各环境下均能顺畅启动。
   - **PyPI 安装修复**：解决了标准 pip 安装后的 Web 源码定位问题，确保 Web UI 即装即用。
 
 * 🚀 **2026.2.27**: **Sirchmunk v0.0.4 发布**
   - **Docker 部署支持**：提供预构建 Docker 镜像，支持容器化一键部署。
-  - **FAST 检索模式**：新增默认贪心搜索模式，采用两级关键词级联与上下文窗口采样策略，仅需 2 次 LLM 调用（2-5s vs 10-30s），大幅提升检索速度。
+  - **FAST 检索模式**：新增贪心搜索模式，采用两级关键词级联与上下文窗口采样策略，仅需 2 次 LLM 调用（2-5s vs 10-30s），大幅提升检索速度。
   - **简化部署链路**：精简命令行与 Web 端的部署和配置流程，降低上手门槛。
   - **Windows 兼容性修复**：修复 Windows 环境下的兼容性问题。
 
@@ -262,17 +263,19 @@ async def main():
     
     agent_search = AgenticSearch(llm=llm)
     
-    # FAST 模式（默认）：贪心搜索，2 次 LLM 调用，2-5s
+    # DEEP 模式（默认）：返回 rich Markdown 报告，进行预算约束证据探索
     result: str = await agent_search.search(
         query="How does transformer attention work?",
         paths=["/path/to/documents"],
+        mode="DEEP",
+        response_format="rich",
     )
     
-    # DEEP 模式：全面分析，预算约束证据探索，10-30s
-    result_deep: str = await agent_search.search(
+    # FAST 模式：贪心搜索，2 次 LLM 调用，2-5s
+    result_fast: str = await agent_search.search(
         query="How does transformer attention work?",
         paths=["/path/to/documents"],
-        mode="DEEP",
+        mode="FAST",
     )
     
     print(result)
@@ -340,14 +343,14 @@ sirchmunk serve --host 0.0.0.0 --port 8000
 #### 搜索
 
 ```bash
-# 在当前目录搜索（默认 FAST 模式）
+# 在当前目录搜索（默认 DEEP 模式，输出 rich 报告）
 sirchmunk search "认证是如何工作的？"
 
 # 在指定路径搜索
 sirchmunk search "查找所有 API 端点" ./src ./docs
 
-# DEEP 模式：预算约束证据探索全面分析
-sirchmunk search "数据库架构" --mode DEEP
+# FAST 模式：贪心搜索，2 次 LLM 调用
+sirchmunk search "数据库架构" --mode FAST
 
 # 快速文件名搜索
 sirchmunk search "config" --mode FILENAME_ONLY
@@ -459,7 +462,7 @@ npx @modelcontextprotocol/inspector sirchmunk mcp serve
 
 ### 特性
 
-- **多模式搜索**：FAST 模式（默认，贪心搜索 2-5s）、DEEP 模式（全面分析 10-30s）、FILENAME_ONLY 模式（快速文件发现）
+- **多模式搜索**：DEEP 模式（默认，全面分析 10-30s）、FAST 模式（贪心搜索 2-5s）、FILENAME_ONLY 模式（快速文件发现）
 - **知识聚类管理**：自动提取、存储和复用知识
 - **标准 MCP 协议**：支持 stdio 和 Streamable HTTP 传输
 
@@ -601,6 +604,8 @@ print(response.json())
   <img src="assets/pic/Sirchmunk_LENS_Framework.png" alt="LENS 框架：在隐式证据空间上进行预算约束证据探索" width="95%">
   <p><sub>LENS 将 in-context search 表述为动态原始文档诱导的隐式证据空间上的预算约束证据探索。</sub></p>
 </div>
+
+Sirchmunk 与 LENS 的完整技术细节请参考 [Sirchmunk 主论文](https://arxiv.org/pdf/2608.16185)。
 
 ### 核心组件
 
@@ -749,12 +754,14 @@ KnowledgeCluster 是一个丰富标注的对象，完整记录了单次搜索周
 - **优先级：** 请求里非空的 `paths` → `SIRCHMUNK_SEARCH_PATHS` → cwd。
 
 ```bash
-# FAST 模式（默认，贪心搜索，2 次 LLM 调用）
+# DEEP 模式（默认 rich 报告，预算约束证据探索）
 curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "认证是如何工作的？",
-    "paths": ["/path/to/project"]
+    "paths": ["/path/to/project"],
+    "mode": "DEEP",
+    "response_format": "rich"
   }'
 
 # 单个路径用字符串（等价于单元素数组）
@@ -776,7 +783,8 @@ curl -X POST http://localhost:8584/api/v1/search \
   -d '{
     "query": "数据库连接池",
     "paths": ["/path/to/project/src"],
-    "mode": "DEEP"
+    "mode": "DEEP",
+    "response_format": "rich"
   }'
 
 # 文件名搜索（快速，无需 LLM）
@@ -800,7 +808,7 @@ curl -X POST http://localhost:8584/api/v1/search \
     "max_loops": 10,
     "include_patterns": ["*.py", "*.java"],
     "exclude_patterns": ["*test*", "*__pycache__*"],
-    "return_context": true
+    "response_format": "rich"
   }'
 
 # 检查服务器状态
@@ -828,8 +836,10 @@ response = requests.post(
 
 data = response.json()
 if data["success"]:
-    payload = data.get("data") or {}
-    print(payload.get("summary", payload))
+        payload = data.get("data") or {}
+        # API 返回 type: "summary" | "files" | "context"。
+        # 对 summary 响应，format 为 "rich"（默认）或 "minimal"。
+        print(payload.get("summary", payload))
 ```
 
 **使用 `httpx`（异步）：**
@@ -908,7 +918,8 @@ curl -N -X POST "http://localhost:8584/api/v1/search/stream" \
   -d '{
     "query": "认证是如何工作的？",
     "paths": ["/path/to/project"],
-    "mode": "FAST"
+    "mode": "DEEP",
+    "response_format": "rich"
   }'
 ```
 
@@ -922,7 +933,8 @@ url = "http://localhost:8584/api/v1/search/stream"
 payload = {
     "query": "认证是如何工作的？",
     "paths": ["/path/to/project"],
-    "mode": "FAST",
+    "mode": "DEEP",
+    "response_format": "rich",
 }
 
 event_type = ""
@@ -1027,7 +1039,8 @@ async function searchStream(baseUrl, body) {
 await searchStream("http://localhost:8584", {
   query: "认证是如何工作的？",
   paths: ["/path/to/project"],
-  mode: "FAST",
+  mode: "DEEP",
+  response_format: "rich",
 });
 ```
 
@@ -1044,7 +1057,7 @@ await searchStream("http://localhost:8584", {
 |------|------|--------|------|
 | `query` | `string` | *必填* | 搜索查询或问题 |
 | `paths` | `string` \| `string[]` | *可选* | 单路径或多路径。省略 / `null` / `""` / `[]` / 仅空白 → 使用服务端 `SIRCHMUNK_SEARCH_PATHS`（如 `~/.sirchmunk/.env`），再回退 cwd。请求中的路径优先于环境变量。 |
-| `mode` | `string` | `"FAST"` | `FAST`、`DEEP` 或 `FILENAME_ONLY` |
+| `mode` | `string` | `"DEEP"` | `DEEP`、`FAST` 或 `FILENAME_ONLY` |
 | `enable_dir_scan` | `bool` | `true` | 是否启用目录扫描（FAST/DEEP）以发现文件 |
 | `max_depth` | `int` | `null` | 最大目录深度 |
 | `top_k_files` | `int` | `null` | 返回的文件数量 |
@@ -1052,7 +1065,7 @@ await searchStream("http://localhost:8584", {
 | `max_token_budget` | `int` | `null` | LLM token 预算（DEEP 模式，默认 128K） |
 | `include_patterns` | `string[]` | `null` | 文件 glob 匹配模式（包含） |
 | `exclude_patterns` | `string[]` | `null` | 文件 glob 匹配模式（排除） |
-| `return_context` | `bool` | `false` | 返回完整 SearchContext（含 KnowledgeCluster 和遥测数据） |
+| `response_format` | `string` | `"rich"` | `"rich"` 富 Markdown 报告、`"minimal"` 短答案、`"context"` SearchContext 对象或 `"json"` 序列化上下文 |
 
 > **注意：** `FILENAME_ONLY` 模式无需 LLM API Key。`FAST` 和 `DEEP` 模式需要配置 LLM。
 

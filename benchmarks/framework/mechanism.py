@@ -36,7 +36,7 @@ class MechanismProbeSearcher:
         self.benchmark_name = benchmark_name
         self.env = env
 
-    async def search(self, query: str, paths=None, return_context: bool = True, **kwargs):
+    async def search(self, query: str, paths=None, response_format: str = "context", **kwargs):
         start = time.time()
         search_paths = [str(p) for p in (paths or [])]
         raw_size = sum(_path_size(Path(p)) for p in search_paths)

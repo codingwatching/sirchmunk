@@ -169,8 +169,32 @@ DEFAULT_TOP_K_FILES=3
 # Number of keyword granularity levels (1-5)
 DEFAULT_KEYWORD_LEVELS=3
 
-# Grep operation timeout in seconds
+# Maximum concurrent rga subprocesses across all searches
+GREP_CONCURRENT_LIMIT=5
+
+# Maximum concurrent keyword terms within one search
+GREP_KEYWORD_CONCURRENT_LIMIT=2
+
+# Maximum concurrent native rg fallback subprocesses
+GREP_FALLBACK_CONCURRENT_LIMIT=2
+
+# rga execution timeout in seconds
 GREP_TIMEOUT=60.0
+
+# Maximum time to wait for an rga/rg concurrency slot
+GREP_QUEUE_TIMEOUT=10.0
+
+# Native rg fallback timeout in seconds
+GREP_FALLBACK_TIMEOUT=15.0
+
+# Maximum time to reap a timed-out or cancelled search process
+GREP_PROCESS_KILL_TIMEOUT=5.0
+
+# Skip rga temporarily after an execution timeout
+GREP_RGA_BACKOFF_SECONDS=60.0
+
+# Fall back to native rg when rga is unavailable or times out
+GREP_FALLBACK_TO_RG=true
 
 # ===== Cluster Settings =====
 # Enable knowledge cluster reuse with embeddings
@@ -554,6 +578,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
 # sirchmunk search
 # ------------------------------------------------------------------
 
+def _response_format_for_output(output_format: str) -> str:
+    """Map CLI output modes to AgenticSearch response_format values."""
+    if output_format == "json":
+        return "json"
+    if output_format == "minimal":
+        return "minimal"
+    return "rich"
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     """Perform a search query.
 
@@ -614,8 +647,8 @@ def cmd_search(args: argparse.Namespace) -> int:
 async def _search_local(
     query: str,
     paths: Optional[list] = None,
-    mode: str = "FAST",
-    output_format: str = "text",
+    mode: str = "DEEP",
+    output_format: str = "rich",
     verbose: bool = False,
     work_path: Optional[Path] = None,
 ) -> int:
@@ -625,7 +658,7 @@ async def _search_local(
         query: Search query
         paths: Paths to search (None lets AgenticSearch resolve via env/cwd fallback)
         mode: Search mode (FAST, DEEP, FILENAME_ONLY)
-        output_format: Output format (text, json)
+        output_format: Output format (rich, text, minimal, json)
         verbose: Enable verbose output
         work_path: Resolved working directory path
 
@@ -661,6 +694,7 @@ async def _search_local(
         work_path=str(work_path),
         verbose=verbose,
     )
+    mode = (mode or "DEEP").upper()
 
     if not verbose:
         print(f"  Searching: {query}")
@@ -674,13 +708,15 @@ async def _search_local(
         query=query,
         paths=paths,
         mode=mode,
-        return_context=output_format == "json",
+        response_format=_response_format_for_output(output_format),
     )
 
     # Output result
     if output_format == "json":
         if hasattr(result, "to_dict"):
             output = json.dumps(result.to_dict(), indent=2, ensure_ascii=False)
+        elif isinstance(result, dict):
+            output = json.dumps(result, indent=2, ensure_ascii=False)
         else:
             output = json.dumps({"result": result}, indent=2, ensure_ascii=False)
         print(output)
@@ -701,8 +737,8 @@ def _search_via_api(
     query: str,
     paths: Optional[list] = None,
     api_url: str = "http://localhost:8584",
-    mode: str = "FAST",
-    output_format: str = "text",
+    mode: str = "DEEP",
+    output_format: str = "rich",
 ) -> int:
     """Execute search via API server with SSE log streaming.
 
@@ -728,12 +764,19 @@ def _search_via_api(
         print("   Install it with: pip install requests")
         return 1
 
+    mode = (mode or "DEEP").upper()
+
     print(f"  Searching via API: {api_url}")
     print(f"   Query: {query}")
     print(f"   Mode: {mode}")
     print()
 
-    payload = {"query": query, "paths": paths, "mode": mode}
+    payload = {
+        "query": query,
+        "paths": paths,
+        "mode": mode,
+        "response_format": _response_format_for_output(output_format),
+    }
 
     try:
         return _search_via_api_stream(api_url, payload, output_format)
@@ -1009,7 +1052,7 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
         print(f"  Port:   {args.port}")
         print(f"  Work:   {work_path}")
         print(f"  Reload: {args.reload}")
-        print(f"  WebUI:  enabled (single port)")
+        print("  WebUI:  enabled (single port)")
         print()
         print(f"  WebUI: http://{display_host}:{args.port}/")
         print(f"  API:   http://{display_host}:{args.port}/api/v1/")
@@ -1075,7 +1118,7 @@ def _serve_dev_mode(args: argparse.Namespace, work_path: Path) -> int:
     print(f"  Sirchmunk Dev Server v{__version__}")
     print("=" * 60)
     print()
-    print(f"  Mode:     Development (hot-reload)")
+    print("  Mode:     Development (hot-reload)")
     print(f"  Backend:  {args.host}:{args.port}")
     print(f"  Frontend: localhost:{frontend_port}")
     print(f"  Web source: {web_dir}")
@@ -1343,7 +1386,6 @@ async def _compile_run(
 ) -> int:
     """Execute compile using AgenticSearch."""
     from sirchmunk.search import AgenticSearch
-    from sirchmunk.llm.openai_chat import OpenAIChat
 
     llm_api_key = os.getenv("LLM_API_KEY", "")
     if not llm_api_key:
@@ -1403,7 +1445,6 @@ async def _compile_run(
 async def _compile_status(paths: list, work_path: Path) -> int:
     """Show compile status."""
     from sirchmunk.search import AgenticSearch
-    from sirchmunk.llm.openai_chat import OpenAIChat
 
     llm = _create_llm()
 
@@ -1554,12 +1595,12 @@ def cmd_upload(args: argparse.Namespace) -> int:
     print(f"Done: {total_uploaded} uploaded, {total_errors} errors")
 
     if total_uploaded > 0:
-        print(f"\nSearch uploaded files with:")
+        print("\nSearch uploaded files with:")
         print(f"  curl -X POST {remote}/api/v1/search \\")
-        print(f"    -H 'Content-Type: application/json' \\")
+        print("    -H 'Content-Type: application/json' \\")
         print(f"    -d '\"query\": \"your question\", \"paths\": [\"{remote}/api/v1/files/collections/{collection}/path\"]'")
         # Also show the direct path approach
-        print(f"\n  Or first get the collection path:")
+        print("\n  Or first get the collection path:")
         print(f"  curl {remote}/api/v1/files/collections/{collection}/path")
 
     return 0 if total_errors == 0 else 1
@@ -1663,8 +1704,11 @@ Examples:
     )
     search_parser.add_argument("query", help="Search query or question")
     search_parser.add_argument("paths", nargs="*", help="Paths to search (default: current directory)")
-    search_parser.add_argument("--mode", "-m", default="FAST", choices=["FAST", "DEEP", "FILENAME_ONLY"])
-    search_parser.add_argument("--output", "-o", default="text", choices=["text", "json"])
+    search_parser.add_argument("--mode", "-m", default="DEEP", choices=["FAST", "DEEP", "FILENAME_ONLY"])
+    search_parser.add_argument(
+        "--output", "-o", default="rich", choices=["text", "rich", "minimal", "json"],
+        help="Output format: rich Markdown (default), minimal answer, or JSON context",
+    )
     search_parser.add_argument("--api", action="store_true", help="Use API server instead of local search")
     search_parser.add_argument("--api-url", default="http://localhost:8584", help="API server URL")
     search_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")

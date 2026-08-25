@@ -254,6 +254,7 @@ class ShadowEvaluator:
         judge = adapter.build_judge()
         base_kwargs = dict(adapter.get_search_kwargs())
         base_kwargs.update(overrides)
+        base_kwargs["response_format"] = "context"
 
         # Run sequentially: shadow eval needs no concurrency and this lowers API pressure
         correct = 0
@@ -267,7 +268,6 @@ class ShadowEvaluator:
                 result = await searcher.search(
                     query=sample.question,
                     paths=search_paths,
-                    return_context=True,
                     **base_kwargs,
                 )
                 prediction = getattr(result, "answer", "") or str(result)

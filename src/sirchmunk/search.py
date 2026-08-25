@@ -35,12 +35,12 @@ from sirchmunk.llm.prompts import (
     DOC_SUMMARY,
     DOC_CHUNK_SUMMARY,
     DOC_MERGE_SUMMARIES,
-    DEEP_SECTION_SELECT,
     DEEP_DATA_REQUIREMENTS,
     DEEP_PAGE_SELECT,
     DEEP_CHECK_REQUIREMENTS,
     DEEP_TOC_ANALYSIS,
 )
+from sirchmunk.renderers.search_response import render_search_response
 from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.scheduler.evolver import KnowledgeEvolver
 from sirchmunk.schema.knowledge import (
@@ -49,10 +49,9 @@ from sirchmunk.schema.knowledge import (
     KnowledgeCluster,
     Lifecycle,
 )
-from sirchmunk.schema.request import ContentItem, Message, Request
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
-from sirchmunk.utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH
+from sirchmunk.utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH, GREP_TIMEOUT
 from sirchmunk.utils.embedding_util import EmbeddingUtil
 from sirchmunk.utils.deps import check_dependencies
 from sirchmunk.utils import create_logger, LogCallback
@@ -972,7 +971,7 @@ class AgenticSearch(BaseSearch):
             else:
                 await self.knowledge_storage.update(cluster)
                 await self._logger.info(f"Updated knowledge cluster {cluster.id} in cache")
-        except Exception as e:
+        except Exception:
             try:
                 await self.knowledge_storage.update(cluster)
                 await self._logger.info(f"Updated knowledge cluster {cluster.id} in cache")
@@ -1049,7 +1048,7 @@ class AgenticSearch(BaseSearch):
         resources = [
             {"type": "file", "value": fp} for fp in (file_paths or [])
         ]
-        # Build evidences from file_paths so return_context=True yields non-empty evidences
+        # Build evidences from file_paths so response_format="context" yields non-empty evidences
         # Use answer content as snippets since we don't have raw evidence in this fallback path
         answer_snippet = answer if answer else ""
         evidences: List[EvidenceUnit] = []
@@ -1840,7 +1839,7 @@ class AgenticSearch(BaseSearch):
         max_depth: Optional[int] = 5,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
-    ) -> "ToolRegistry":
+    ) -> Any:
         """Build (or rebuild) the tool registry for the given search paths.
 
         The registry is cached on ``self._tool_registry`` and re-created
@@ -2037,6 +2036,36 @@ class AgenticSearch(BaseSearch):
         report = await linter.run(auto_fix=auto_fix)
         return report.to_dict()
 
+    @staticmethod
+    def _coerce_response_format(
+        response_format: str,
+        return_context: Optional[bool] = None,
+    ) -> str:
+        """Normalize output format and support the legacy return_context shim."""
+        resolved = (response_format or "rich").lower()
+        if return_context:
+            resolved = "context"
+        if resolved not in {"rich", "minimal", "context", "json"}:
+            raise ValueError(
+                "response_format must be one of: rich, minimal, context, json"
+            )
+        return resolved
+
+    @staticmethod
+    def _render_search_output(
+        context: SearchContext,
+        *,
+        response_format: str,
+    ) -> Union[str, SearchContext, Dict[str, Any]]:
+        """Return a SearchContext using the requested presentation format."""
+        if response_format == "context":
+            return context
+        if response_format == "json":
+            return context.to_dict()
+        if response_format == "minimal":
+            return context.answer
+        return render_search_response(context)
+
     # ------------------------------------------------------------------
     # Unified search entry point
     # ------------------------------------------------------------------
@@ -2046,7 +2075,7 @@ class AgenticSearch(BaseSearch):
         query: str,
         paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
         *,
-        mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = "FAST",
+        mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = "DEEP",
         max_loops: int = 10,
         max_token_budget: int = 128000,
         max_depth: Optional[int] = 5,
@@ -2054,11 +2083,12 @@ class AgenticSearch(BaseSearch):
         enable_dir_scan: bool = False,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
-        return_context: bool = False,
+        return_context: Optional[bool] = None,
         spec_stale_hours: float = 72.0,
         chat_history: Optional[List[Dict[str, str]]] = None,
         llm_fallback: bool = False,
-    ) -> Union[str, SearchContext, List[Dict[str, Any]]]:
+        response_format: Literal["rich", "minimal", "context", "json"] = "rich",
+    ) -> Union[str, SearchContext, List[Dict[str, Any]], Dict[str, Any]]:
         """Perform intelligent search with multi-mode support.
 
         Modes:
@@ -2124,7 +2154,7 @@ class AgenticSearch(BaseSearch):
             query: User's search query.
             paths: Directories / files to search.  Falls back to
                 ``self.paths`` or the current working directory.
-            mode: Search mode — ``"DEEP"``, ``"FAST"``, or ``"FILENAME_ONLY"``.
+            mode: Search mode — ``"DEEP"`` (default), ``"FAST"``, or ``"FILENAME_ONLY"``.
             max_loops: Maximum ReAct iterations (DEEP mode, default: 10).
             max_token_budget: LLM token budget (DEEP mode, default: 128000).
             max_depth: Maximum directory depth for file search (default: 5).
@@ -2135,42 +2165,51 @@ class AgenticSearch(BaseSearch):
                 Used in both FILENAME_ONLY and DEEP modes.
             exclude: File glob patterns to exclude (e.g. ``["*.log"]``).
                 Used in both FILENAME_ONLY and DEEP modes.
-            return_context: If True, return a ``SearchContext`` object
-                that carries ``answer``, ``cluster`` (KnowledgeCluster),
-                and full pipeline telemetry (LLM usage, files read, etc.).
-            spec_stale_hours: Hours before spec cache is stale (default: 72).
-            chat_history: Optional list of chat messages for context (DEEP mode).
-            llm_fallback: When True, if no relevant documents are found,
-                the LLM will attempt to answer the query from its own
-                knowledge. Default False.
+            response_format: Output presentation for FAST/DEEP searches.
+                ``"minimal"`` returns the short answer span, ``"rich"``
+                returns a Markdown evidence report, ``"context"`` returns the
+                SearchContext object, and ``"json"`` returns its serialized dict.
+            return_context: Deprecated compatibility shim.  Passing True maps
+                to ``response_format="context"``; new code should set
+                ``response_format`` directly.
 
         Returns:
-            - ``str``: Answer summary (default).
-            - ``SearchContext``: If *return_context* — contains ``answer``,
-              ``cluster``, and telemetry in a single object.
+            - ``str``: Rich Markdown response by default, or minimal answer
+              when ``response_format="minimal"``.
+            - ``SearchContext``: If ``response_format="context"`` — contains
+              ``answer``, ``cluster``, and telemetry in a single object.
+            - ``Dict``: Serialized SearchContext when ``response_format="json"``.
             - ``List[Dict]``: File matches in FILENAME_ONLY mode.
         """
+        response_format = self._coerce_response_format(response_format, return_context)
+        mode = (mode or "DEEP").upper()
+        if mode not in {"DEEP", "FAST", "FILENAME_ONLY"}:
+            raise ValueError("mode must be one of: DEEP, FAST, FILENAME_ONLY")
+
         paths = self.validate_search_paths(
             self._resolve_paths(paths),
         )
         if not paths:
             msg = "No valid search paths remain after validation."
             _loguru_logger.warning(msg)
-            if return_context:
-                ctx = SearchContext()
-                ctx.answer = msg
-                return ctx
-            return msg
+            ctx = SearchContext(max_token_budget=max_token_budget, max_loops=max_loops)
+            ctx.answer = msg
+            return self._render_search_output(
+                ctx,
+                response_format=response_format,
+            )
 
         await self._logger.info(f"[SearchConfig] PURE_TREE_SEARCH={'enabled' if _PURE_TREE_SEARCH else 'disabled'}")
 
         # ---- Chat intent short-circuit (rule-based, no LLM cost) ----
         if mode != "FILENAME_ONLY" and self._is_chat_query(query):
             answer, cluster, ctx = await self._respond_chat(query, chat_history=chat_history)
-            if return_context:
-                ctx.answer = answer
-                return ctx
-            return answer
+            ctx.answer = answer
+            ctx.cluster = cluster
+            return self._render_search_output(
+                ctx,
+                response_format=response_format,
+            )
 
         # ---- FILENAME_ONLY: pattern-based file discovery, no LLM ----
         if mode == "FILENAME_ONLY":
@@ -2214,19 +2253,21 @@ class AgenticSearch(BaseSearch):
             task.add_done_callback(self._background_tasks.discard)
 
         # ---- Unified return wrapping ----
-        if return_context:
-            prefix = "FS" if mode == "FAST" else "DS"
-            context.answer = answer
-            if (answer or "").strip().lower() == _NO_RESULTS_MESSAGE.lower():
-                context.cluster = cluster
-                return context
+        prefix = "FS" if mode == "FAST" else "DS"
+        context.answer = answer
+        if (answer or "").strip().lower() == _NO_RESULTS_MESSAGE.lower():
+            context.cluster = cluster
+        else:
             # Use read_file_ids from context if available, otherwise empty
             fallback_files = list(context.read_file_ids) if context.read_file_ids else None
             context.cluster = cluster or self._make_answer_cluster(
                 query, answer, prefix, file_paths=fallback_files,
             )
-            return context
-        return answer
+
+        return self._render_search_output(
+            context,
+            response_format=response_format,
+        )
 
     # ------------------------------------------------------------------
     # DEEP mode — parallel multi-path retrieval with ReAct fallback
@@ -3553,7 +3594,6 @@ class AgenticSearch(BaseSearch):
 
         if best_files:
             file_path = best_files[0]["path"]
-            match_objects = best_files[0].get("matches", [])
             wiki_info = ""
             if best_files[0].get("wiki_relevance") is not None:
                 wiki_info = f", wiki={best_files[0]['wiki_relevance']:.1f}"
@@ -3712,10 +3752,14 @@ class AgenticSearch(BaseSearch):
 
                     _ev_source = "none"
                     if ev:
-                        if "Table Evidence" in ev: _ev_source = "table_digest"
-                        elif "Pre-compiled" in ev: _ev_source = "excel_digest"
-                        elif "TreeSample" in str(ev)[:50] or "TreeNav" in str(ev)[:50]: _ev_source = "tree"
-                        else: _ev_source = "rga_or_other"
+                        if "Table Evidence" in ev:
+                            _ev_source = "table_digest"
+                        elif "Pre-compiled" in ev:
+                            _ev_source = "excel_digest"
+                        elif "TreeSample" in str(ev)[:50] or "TreeNav" in str(ev)[:50]:
+                            _ev_source = "tree"
+                        else:
+                            _ev_source = "rga_or_other"
                     _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [D15] ev_source={_ev_source}, ev_len={len(ev) if ev else 0}")
                 return "\n\n---\n\n".join(parts)
 
@@ -3768,7 +3812,7 @@ class AgenticSearch(BaseSearch):
                 document_context=doc_context,
             )
             await self._logger.info(
-                f"[FAST:Step4] Wiki-enhanced answer generation with catalog context"
+                "[FAST:Step4] Wiki-enhanced answer generation with catalog context"
             )
         else:
             answer_prompt = ROI_RESULT_SUMMARY.format(
@@ -4132,7 +4176,7 @@ class AgenticSearch(BaseSearch):
                 results = await self.grep_retriever.retrieve(
                     terms=kw, path=paths, literal=True, regex=False,
                     max_depth=max_depth, include=include, exclude=exclude,
-                    timeout=30.0,
+                    timeout=GREP_TIMEOUT,
                 )
                 if results:
                     all_raw.extend(results)
@@ -4153,7 +4197,7 @@ class AgenticSearch(BaseSearch):
                 results = await self.grep_retriever.retrieve(
                     terms=pattern, path=paths, literal=False, regex=True,
                     max_depth=max_depth, include=include, exclude=exclude,
-                    timeout=30.0,
+                    timeout=GREP_TIMEOUT,
                 )
                 if results:
                     all_raw.extend(results)
@@ -4179,7 +4223,7 @@ class AgenticSearch(BaseSearch):
                 fn_results = await self.grep_retriever.retrieve_by_filename(
                     patterns=[f".*{re.escape(kw)}.*" for kw in keywords],
                     path=paths, case_sensitive=False, max_depth=max_depth,
-                    timeout=30.0,
+                    timeout=GREP_TIMEOUT,
                 )
                 if fn_results:
                     return [{"path": fn_results[0]["path"], "matches": [], "lines": [], "total_matches": 0, "weighted_score": 0.0}]
@@ -5140,8 +5184,8 @@ class AgenticSearch(BaseSearch):
         if not leaves or not components:
             return [], list(components)
         leaf_text = " ".join(
-            (getattr(l, 'title', '') or '') + " " + (getattr(l, 'summary', '') or '')
-            for l in leaves
+            (getattr(leaf, 'title', '') or '') + " " + (getattr(leaf, 'summary', '') or '')
+            for leaf in leaves
         ).lower()
         covered = [c for c in components if c in leaf_text]
         missing = [c for c in components if c not in leaf_text]
@@ -5709,9 +5753,9 @@ class AgenticSearch(BaseSearch):
                         self._append_evidence_part(
                             parts, fname, leaf, leaf.summary,
                         )
-                _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [N4] page_extraction: page_leaves_ok=False")
+                _loguru_logger.debug("SEARCH_WIKI_DEBUG [N4] page_extraction: page_leaves_ok=False")
             else:
-                _loguru_logger.debug(f"SEARCH_WIKI_DEBUG [N4] page_extraction: page_leaves_ok=True")
+                _loguru_logger.debug("SEARCH_WIKI_DEBUG [N4] page_extraction: page_leaves_ok=True")
 
         # ── Phase 3: char_range extraction (compile-consistent content) ──
         if char_leaves:
@@ -5808,11 +5852,11 @@ class AgenticSearch(BaseSearch):
             if _missing:
                 _complement_query = f"{query} — focus on: {', '.join(_missing)}"
                 try:
-                    _existing_ids = {id(l) for l in leaves}
+                    _existing_ids = {id(leaf) for leaf in leaves}
                     comp_leaves = await indexer.navigate(
                         tree, _complement_query, max_results=max_results,
                     )
-                    comp_new = [l for l in (comp_leaves or []) if id(l) not in _existing_ids]
+                    comp_new = [leaf for leaf in (comp_leaves or []) if id(leaf) not in _existing_ids]
                     if comp_new:
                         c_page, c_char, c_summary = self._classify_leaves(comp_new)
                         for cl in c_summary:
@@ -8677,7 +8721,9 @@ class AgenticSearch(BaseSearch):
         and internal insertions ("1996 NBA Slam Dunk Contest", "dice, cards,
         and boards") remain allowed — those refine rather than qualify.
         """
-        norm = lambda s: re.sub(r"[^a-z0-9 ]", " ", s.lower())
+        def norm(value: str) -> str:
+            return re.sub(r"[^a-z0-9 ]", " ", value.lower())
+
         cand = re.sub(r"\s+", " ", norm(candidate)).strip()
         drft = re.sub(r"\s+", " ", norm(draft)).strip()
         return bool(drft) and cand != drft and cand.startswith(drft + " ")
@@ -11092,8 +11138,8 @@ class AgenticSearch(BaseSearch):
         # for paginated files and direct content read for non-paginated ones.
         if not evidence_parts:
             await self._logger.warning(
-                f"[Phase 4] Zero evidence after retrieval loop, "
-                f"activating broad fallback"
+                "[Phase 4] Zero evidence after retrieval loop, "
+                "activating broad fallback"
             )
             _fallback_map = self._broad_fallback_pages(
                 outline_target_files,

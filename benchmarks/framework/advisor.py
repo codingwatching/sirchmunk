@@ -31,6 +31,10 @@ _GLOBAL_CONFIG_KEYS: frozenset = frozenset({
     "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL_NAME", "LLM_TIMEOUT",
     "EMBEDDING_MODEL_ID", "EMBEDDING_CACHE_DIR",
     "SIRCHMUNK_WORK_PATH", "GREP_CONCURRENT_LIMIT",
+    "GREP_KEYWORD_CONCURRENT_LIMIT", "GREP_FALLBACK_CONCURRENT_LIMIT",
+    "GREP_TIMEOUT", "GREP_QUEUE_TIMEOUT", "GREP_FALLBACK_TIMEOUT",
+    "GREP_PROCESS_KILL_TIMEOUT", "GREP_RGA_BACKOFF_SECONDS",
+    "GREP_FALLBACK_TO_RG",
 })
 
 
@@ -191,7 +195,7 @@ class ImprovementAdvisor:
                       + report.failure_type_breakdown.get("refusal", 0)) / total_bad
 
         current_top_k = int(config.get("top_k_files", 5))
-        current_mode = config.get("mode", "FAST")
+        current_mode = config.get("mode", "DEEP")
         top_k_key = str(config.get("top_k_env_key") or _benchmark_env_key(env_file, "TOP_K_FILES"))
         mode_key = str(config.get("mode_env_key") or _benchmark_env_key(env_file, "MODE"))
 

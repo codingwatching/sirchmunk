@@ -23,7 +23,8 @@ curl -s -X POST "http://localhost:8584/api/v1/search" \
   -d '{
     "query": "<your query>",
     "paths": ["/path/to/search_paths"],
-    "mode": "FAST"
+    "mode": "DEEP",
+    "response_format": "rich"
   }'
 ```
 

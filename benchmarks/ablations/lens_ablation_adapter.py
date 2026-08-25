@@ -92,11 +92,11 @@ class LensAblationAdapter(BaselineAdapter):
             "enable_dir_scan": self._profile.enable_dir_scan,
             **self._profile.search_kwargs,
         }
+        kwargs["response_format"] = "context"
         t0 = time.monotonic()
         result = await self._searcher.search(
             query=question,
             paths=context_paths,
-            return_context=True,
             **kwargs,
         )
         elapsed = time.monotonic() - t0

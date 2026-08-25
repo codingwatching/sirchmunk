@@ -6,7 +6,7 @@ Provides LLM token budget enforcement, file-level deduplication, and
 structured logging of all retrieval operations within a single
 search session.
 
-When ``return_context=True`` is passed to ``AgenticSearch.search()``,
+When ``response_format="context"`` is passed to ``AgenticSearch.search()``,
 a ``SearchContext`` is returned directly.  It carries the answer text,
 the ``KnowledgeCluster`` (when available), and all pipeline telemetry.
 """
@@ -52,7 +52,7 @@ class SearchContext:
     Tracks LLM token consumption, file deduplication, and retrieval logs
     across multiple tool calls within one ReAct loop execution.
 
-    When returned to callers (via ``return_context=True``), the ``answer``
+    When returned to callers (via ``response_format="context"``), the ``answer``
     and ``cluster`` fields carry the pipeline output so that a single
     object provides both the result and all telemetry.
 

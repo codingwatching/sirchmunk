@@ -7,6 +7,7 @@ as MCP tools following the Model Context Protocol specification.
 """
 
 import asyncio
+import json
 import logging
 import sys
 from typing import Any, Dict, List, Optional
@@ -51,7 +52,7 @@ def create_server(config: Config) -> FastMCP:
     async def sirchmunk_search(
         query: str,
         paths: Optional[List[str]] = None,
-        mode: str = "FAST",
+        mode: str = "DEEP",
         max_depth: int = 5,
         top_k_files: int = 3,
         max_loops: int = 10,
@@ -59,7 +60,8 @@ def create_server(config: Config) -> FastMCP:
         enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
-        return_context: bool = False,
+        return_context: Optional[bool] = None,
+        response_format: str = "rich",
     ) -> str:
         """Search local files, documents, and raw data on disk. Supports 100+ file formats
         including PDF, Word, Excel, PowerPoint, CSV, JSON, YAML, Markdown, HTML, source code,
@@ -74,10 +76,10 @@ def create_server(config: Config) -> FastMCP:
         - Locate specific files by name or content pattern
 
         Modes:
-        - FAST: Greedy search with 2-level keyword cascade and context-window sampling.
-          Finds the single best file and answers from focused evidence. (2-5s)
         - DEEP: Comprehensive search with LLM-powered analysis. Reads file contents,
           extracts evidence via Monte Carlo sampling, and synthesizes an answer. (10-30s)
+        - FAST: Greedy search with 2-level keyword cascade and context-window sampling.
+          Finds the single best file and answers from focused evidence. (2-5s)
         - FILENAME_ONLY: Fast filename pattern matching across directories. (<1s)
 
         Args:
@@ -87,7 +89,7 @@ def create_server(config: Config) -> FastMCP:
             paths: Local filesystem paths to search (files or directories).
                 Examples: ['/home/user/projects'], ['./src', './docs'], ['/data/reports']
                 Optional — falls back to configured SIRCHMUNK_SEARCH_PATHS or cwd.
-            mode: Search mode - FAST (greedy, default), DEEP (comprehensive), or FILENAME_ONLY (file discovery)
+            mode: Search mode - DEEP (comprehensive, default), FAST (greedy), or FILENAME_ONLY (file discovery)
             max_depth: Maximum directory depth to search (1-20, default: 5)
             top_k_files: Number of top files to analyze (1-20, default: 3)
             max_loops: Maximum ReAct agent iterations for adaptive retrieval (1-20, default: 10)
@@ -95,7 +97,8 @@ def create_server(config: Config) -> FastMCP:
             enable_dir_scan: Enable directory scanning for file discovery (DEEP mode, default: True)
             include: File patterns to include (glob, e.g., ['*.py', '*.md', '*.pdf'])
             exclude: File patterns to exclude (glob, e.g., ['*.pyc', '*.log', 'node_modules'])
-            return_context: Return full SearchContext with KnowledgeCluster and telemetry
+            return_context: Deprecated compatibility shim; True maps to response_format="context"
+            response_format: Output format: rich (default), minimal, context, or json
 
         Returns:
             Search results as formatted text with source references
@@ -104,9 +107,13 @@ def create_server(config: Config) -> FastMCP:
             return "Error: Service not initialized"
 
         logger.info(f"sirchmunk_search: mode={mode}, query='{query[:50]}...'")
+        mode = (mode or "DEEP").upper()
+        response_format = (response_format or "rich").lower()
+        if return_context:
+            response_format = "context"
 
         try:
-            result = await _service.searcher.search(
+            result = await _service.search(
                 query=query,
                 paths=paths,
                 mode=mode,
@@ -117,7 +124,7 @@ def create_server(config: Config) -> FastMCP:
                 enable_dir_scan=enable_dir_scan,
                 include=include,
                 exclude=exclude,
-                return_context=return_context,
+                response_format=response_format,
             )
 
             if result is None:
@@ -126,12 +133,17 @@ def create_server(config: Config) -> FastMCP:
             if isinstance(result, str):
                 return result
 
+            if isinstance(result, dict):
+                return json.dumps(result, indent=2, ensure_ascii=False)
+
             if isinstance(result, list):
                 # FILENAME_ONLY mode returns list of file matches
                 return _format_filename_results(result, query)
 
-            # SearchContext — extract the answer text for the tool response
-            if hasattr(result, "answer"):
+            # SearchContext — return full context JSON when requested explicitly.
+            if hasattr(result, "to_dict"):
+                if response_format in ("context", "json"):
+                    return json.dumps(result.to_dict(), indent=2, ensure_ascii=False)
                 return result.answer or str(result)
 
             return str(result)
@@ -320,11 +332,11 @@ def _format_filename_results(results: List[Dict[str, Any]], query: str) -> str:
         Formatted string representation
     """
     lines = [
-        f"# Filename Search Results",
-        f"",
+        "# Filename Search Results",
+        "",
         f"**Query**: `{query}`",
         f"**Found**: {len(results)} matching file(s)",
-        f"",
+        "",
     ]
     
     for i, result in enumerate(results, 1):
@@ -350,11 +362,11 @@ def _format_cluster_list(clusters: List[Dict[str, Any]], sort_by: str) -> str:
         Formatted string representation
     """
     lines = [
-        f"# Knowledge Clusters",
-        f"",
+        "# Knowledge Clusters",
+        "",
         f"**Total**: {len(clusters)} cluster(s)",
         f"**Sorted by**: {sort_by}",
-        f"",
+        "",
     ]
     
     for i, cluster in enumerate(clusters, 1):
