@@ -257,7 +257,18 @@ class OpenAIChat:
         }
 
         if enable_thinking is not None and profile.thinking_param:
-            if profile.thinking_param == "reasoning_effort":
+            # DeepSeek V4 uses the nested OpenAI-compatible thinking switch.
+            # Keep the legacy boolean parameter for all other providers/models
+            # so their request payloads remain unchanged.
+            is_deepseek_v4 = (
+                profile.name == "deepseek"
+                and (self._model or "").lower().startswith("deepseek-v4-")
+            )
+            if is_deepseek_v4:
+                extra_body["thinking"] = {
+                    "type": "enabled" if enable_thinking else "disabled"
+                }
+            elif profile.thinking_param == "reasoning_effort":
                 if enable_thinking:
                     extra_body["reasoning_effort"] = "high"
             else:
