@@ -8,7 +8,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from loguru import logger
 
@@ -24,7 +24,7 @@ from ..utils.constants import (
     GREP_RGA_BACKOFF_SECONDS,
     GREP_TIMEOUT,
 )
-from ..utils.file_utils import StorageStructure
+from ..utils.file_utils import StorageStructure, fast_extract
 from .base import BaseRetriever
 
 RGA_SEMAPHORE = asyncio.Semaphore(value=GREP_CONCURRENT_LIMIT)
@@ -68,6 +68,142 @@ class GrepRetriever(BaseRetriever):
             self.work_path / StorageStructure.CACHE_DIR / StorageStructure.GREP_DIR
         )
         self.rga_cache.mkdir(parents=True, exist_ok=True)
+        self._native_text_cache: Dict[str, Tuple[int, int, str]] = {}
+
+    async def retrieve_native_formats(
+        self,
+        terms: List[str],
+        path: Union[str, Path, List[str], List[Path], None] = None,
+        *,
+        max_depth: Optional[int] = None,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        max_results: int = 50,
+        max_lines: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Search formats that frequently fail rga preprocessing.
+
+        The fallback is exact-term oriented and only activates for discriminative
+        terms (digits, hyphens, or multi-word phrases).  Extracted text is cached
+        by file size and nanosecond mtime for warm-query reuse.
+        """
+        if os.getenv("SIRCHMUNK_NATIVE_FORMAT_FALLBACK", "true").lower() != "true":
+            return []
+        precise_terms = [
+            str(term).strip() for term in terms
+            if str(term).strip() and (
+                any(char.isdigit() for char in str(term))
+                or "-" in str(term)
+                or " " in str(term).strip()
+            )
+        ]
+        if not precise_terms:
+            return []
+        roots = path if isinstance(path, list) else [path or Path.cwd()]
+        target_extensions = {".log", ".xlsx", ".xls", ".pptx", ".ppt"}
+        excluded = set(exclude or [])
+        candidates: List[Path] = []
+        for raw_root in roots:
+            root = Path(raw_root).expanduser().resolve()
+            if root.is_file():
+                discovered = [root]
+            elif root.is_dir():
+                discovered = root.rglob("*")
+            else:
+                continue
+            for file_path in discovered:
+                if not file_path.is_file() or file_path.suffix.lower() not in target_extensions:
+                    continue
+                if any(file_path.match(pattern) for pattern in excluded):
+                    continue
+                if include and not any(file_path.match(pattern) for pattern in include):
+                    continue
+                if max_depth is not None and root.is_dir():
+                    try:
+                        if len(file_path.relative_to(root).parts) - 1 > max_depth:
+                            continue
+                    except ValueError:
+                        continue
+                candidates.append(file_path)
+
+        semaphore = asyncio.Semaphore(4)
+
+        async def _extract(
+            file_path: Path,
+        ) -> Optional[Tuple[str, str, bool, float]]:
+            async with semaphore:
+                started_at = time.perf_counter()
+                try:
+                    stat = file_path.stat()
+                    key = str(file_path)
+                    cached = self._native_text_cache.get(key)
+                    if cached and cached[:2] == (stat.st_size, stat.st_mtime_ns):
+                        return key, cached[2], True, (
+                            time.perf_counter() - started_at
+                        ) * 1000
+                    output = await fast_extract(file_path)
+                    content = output.content or ""
+                    self._native_text_cache[key] = (
+                        stat.st_size, stat.st_mtime_ns, content,
+                    )
+                    return key, content, False, (
+                        time.perf_counter() - started_at
+                    ) * 1000
+                except Exception as exc:
+                    logger.debug(
+                        "[native_format_search] extraction failed for %s: %s",
+                        file_path, exc,
+                    )
+                    return None
+
+        extracted = await asyncio.gather(
+            *[_extract(file_path) for file_path in candidates],
+        )
+        results: List[Dict[str, Any]] = []
+        lower_terms = [(term, term.lower()) for term in precise_terms]
+        for extracted_item in extracted:
+            if extracted_item is None:
+                continue
+            file_path, content, cache_hit, extraction_ms = extracted_item
+            lines: List[str] = []
+            matched_terms: List[str] = []
+            for line in content.splitlines():
+                lowered = line.lower()
+                line_terms = [original for original, term in lower_terms if term in lowered]
+                if not line_terms:
+                    continue
+                for term in line_terms:
+                    if term not in matched_terms:
+                        matched_terms.append(term)
+                text = line.strip()
+                if text and text not in lines:
+                    lines.append(text)
+                if len(lines) >= max_lines:
+                    break
+            if not lines:
+                continue
+            matches = [
+                {
+                    "type": "match",
+                    "data": {"lines": {"text": line}},
+                    "_keyword": matched_terms[0] if matched_terms else precise_terms[0],
+                    "_search_backend": "native_extract",
+                    "_search_cache_hit": cache_hit,
+                    "_conversion_elapsed_ms": round(extraction_ms, 3),
+                }
+                for line in lines
+            ]
+            results.append({
+                "path": file_path,
+                "matches": matches,
+                "lines": lines,
+                "total_matches": len(lines),
+                "total_score": float(len(matched_terms)),
+            })
+        results.sort(
+            key=lambda item: (-item["total_score"], -item["total_matches"], item["path"]),
+        )
+        return results[:max_results]
 
     async def retrieve(
         self,
@@ -486,10 +622,12 @@ class GrepRetriever(BaseRetriever):
         json_output: bool,
     ) -> Dict[str, Any]:
         """Run a bounded search process with cancellation-safe cleanup."""
+        queued_at = time.perf_counter()
         acquired = False
         try:
             await asyncio.wait_for(semaphore.acquire(), timeout=queue_timeout)
             acquired = True
+            queue_wait_ms = (time.perf_counter() - queued_at) * 1000
         except asyncio.TimeoutError as exc:
             raise SearchProcessTimeoutError(
                 command, "queue wait", queue_timeout
@@ -511,6 +649,7 @@ class GrepRetriever(BaseRetriever):
             elif os.name == "nt":
                 process_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
 
+            execution_started = time.perf_counter()
             try:
                 process = await asyncio.create_subprocess_exec(
                     *cmd, **process_kwargs
@@ -536,13 +675,18 @@ class GrepRetriever(BaseRetriever):
                 )
                 raise
 
-            return GrepRetriever._parse_async_result(
+            result = GrepRetriever._parse_async_result(
                 command,
                 process.returncode,
                 stdout,
                 stderr,
                 json_output=json_output,
             )
+            result["queue_wait_ms"] = queue_wait_ms
+            result["execution_ms"] = (
+                time.perf_counter() - execution_started
+            ) * 1000
+            return result
         finally:
             if acquired:
                 semaphore.release()
@@ -561,6 +705,7 @@ class GrepRetriever(BaseRetriever):
     ) -> Dict[str, Any]:
         """Run rga, falling back to rg when rga is unavailable or times out."""
         global _RGA_BACKOFF_UNTIL
+        started_at = time.perf_counter()
 
         if (
             allow_rg_fallback
@@ -576,10 +721,13 @@ class GrepRetriever(BaseRetriever):
                 json_output=json_output,
             )
             result["fallback_reason"] = "rga circuit breaker is open"
+            result["fallback_used"] = True
+            result["fallback_elapsed_ms"] = result.get("execution_ms", 0.0)
+            result["total_elapsed_ms"] = (time.perf_counter() - started_at) * 1000
             return result
 
         try:
-            return await GrepRetriever._run_search_process(
+            result = await GrepRetriever._run_search_process(
                 "rga",
                 args,
                 semaphore=RGA_SEMAPHORE,
@@ -587,6 +735,10 @@ class GrepRetriever(BaseRetriever):
                 execution_timeout=timeout,
                 json_output=json_output,
             )
+            result["fallback_used"] = False
+            result["fallback_elapsed_ms"] = 0.0
+            result["total_elapsed_ms"] = (time.perf_counter() - started_at) * 1000
+            return result
         except (
             SearchProcessTimeoutError,
             SearchExecutableNotFoundError,
@@ -606,6 +758,7 @@ class GrepRetriever(BaseRetriever):
                     time.monotonic() + GREP_RGA_BACKOFF_SECONDS,
                 )
             logger.warning("{} Falling back to native rg.", exc)
+            fallback_started = time.perf_counter()
             result = await GrepRetriever._run_search_process(
                 "rg",
                 GrepRetriever._rg_compatible_args(args),
@@ -615,6 +768,12 @@ class GrepRetriever(BaseRetriever):
                 json_output=json_output,
             )
             result["fallback_reason"] = str(exc)
+            result["fallback_used"] = True
+            result["fallback_elapsed_ms"] = (
+                time.perf_counter() - fallback_started
+            ) * 1000
+            result["primary_failure_stage"] = getattr(exc, "stage", "execution")
+            result["total_elapsed_ms"] = (time.perf_counter() - started_at) * 1000
             return result
 
     @staticmethod
@@ -696,11 +855,13 @@ class GrepRetriever(BaseRetriever):
                 raise TypeError(f"Unsupported type for 'path': {type(path)}")
 
         # keys: returncode, stdout, stderr
+        started_at = time.perf_counter()
         result: Dict[str, Any] = await GrepRetriever._run_rga_async(
             args=args,
             json_output=not count_only,
             timeout=timeout,
         )
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
 
         returncode = result["returncode"]
         stderr_str = result.get("stderr", "").strip()
@@ -725,6 +886,23 @@ class GrepRetriever(BaseRetriever):
                 for item in parsed:
                     if isinstance(item, dict):
                         item.setdefault("_search_backend", backend)
+                        item.setdefault("_search_elapsed_ms", elapsed_ms)
+                        item.setdefault(
+                            "_search_queue_wait_ms", result.get("queue_wait_ms", 0.0),
+                        )
+                        item.setdefault(
+                            "_search_execution_ms", result.get("execution_ms", 0.0),
+                        )
+                        item.setdefault(
+                            "_fallback_elapsed_ms", result.get("fallback_elapsed_ms", 0.0),
+                        )
+                        item.setdefault(
+                            "_search_cache_enabled", not rga_no_cache,
+                        )
+                        if result.get("primary_failure_stage"):
+                            item.setdefault(
+                                "_primary_failure_stage", result["primary_failure_stage"],
+                            )
                         if fallback_reason:
                             item.setdefault("_fallback_reason", fallback_reason)
                 if returncode == 2 and not parsed and stderr_str:
