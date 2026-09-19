@@ -213,6 +213,14 @@ _SLOT_VERIFY_RETRY: bool = os.getenv("LENS_SLOT_VERIFY_RETRY", "true").lower() =
 # P0-1: evidence triage — reduce warm-start noise before agentic loop.
 _EVIDENCE_TRIAGE: bool = os.getenv("LENS_EVIDENCE_TRIAGE", "true").lower() == "true"
 
+# Plan E: computation trace verification. The answering LLM discloses the exact
+# numeric operands and operation it used; Python re-computes deterministically
+# and corrects the final number. This replaces corpus-specific row/column regex
+# with a general "LLM extracts operands (semantic), code does arithmetic
+# (mechanical)" division of labour, and stays grounded by requiring operands to
+# appear in the evidence. Disable to fall back to inline-expression checking.
+_COMPUTATION_TRACE: bool = os.getenv("LENS_COMPUTATION_TRACE", "true").lower() == "true"
+
 # Phase 1A: Format-agnostic retrieval — use snippet content (not filename
 # semantics) to score files and extract articles from JSON-lines shards.
 # Fixes catastrophic recall failure on corpora with meaningless filenames
@@ -1713,49 +1721,175 @@ class AgenticSearch(BaseSearch):
                         continue
         return results
 
+    _COMPUTATION_TRACE_RE = re.compile(
+        r"<COMPUTATION_TRACE>\s*(\{.*?\})\s*</COMPUTATION_TRACE>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    # Number token used to ground trace operands against the evidence text.
+    _NUMBER_TOKEN_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+
     @staticmethod
-    def _deterministic_aggregation_sum(
-        query: str,
+    def _format_number(value: float) -> str:
+        """Render a computed number without spurious trailing zeros."""
+        if value == int(value):
+            return str(int(value))
+        return f"{value:.10f}".rstrip("0").rstrip(".")
+
+    @classmethod
+    def _reduce_operation(
+        cls,
+        operation: str,
+        operands: List[float],
+    ) -> Optional[float]:
+        """Deterministically evaluate an aggregation over operands.
+
+        The operation vocabulary is intent-level (sum/mean/count/min/max/product/
+        difference/range), not corpus-specific. Synonyms and common CJK terms map
+        onto the same primitives so the trace stays model- and language-agnostic.
+        """
+        if not operands:
+            return None
+        op = (operation or "").strip().lower()
+
+        def _has(*keys: str) -> bool:
+            return any(key in op for key in keys)
+
+        if _has("sum", "total", "add", "总和", "总计", "总值", "合计", "求和", "累计"):
+            return math.fsum(operands)
+        if _has("mean", "average", "avg", "均值", "平均"):
+            return math.fsum(operands) / len(operands)
+        if _has("count", "计数", "个数", "数量"):
+            return float(len(operands))
+        if _has("min", "最小", "最低"):
+            return min(operands)
+        if _has("max", "最大", "最高"):
+            return max(operands)
+        if _has("product", "multiply", "乘积", "乘。"):
+            product = 1.0
+            for value in operands:
+                product *= value
+            return product
+        if _has("range", "极差"):
+            return max(operands) - min(operands)
+        if _has("diff", "difference", "subtract", "差值", "相减", "减"):
+            total = operands[0]
+            for value in operands[1:]:
+                total -= value
+            return total
+        return None
+
+    @classmethod
+    def _grounded_trace_operands(
+        cls,
+        operands: List[float],
         evidence: str,
-    ) -> Optional[str]:
-        """Sum complete ledger rows for an explicit single AggUnit query."""
-        if not re.search(r"\b(?:total|sum)\b|总(?:值|计|和)", query, re.IGNORECASE):
-            return None
-        entities = list(dict.fromkeys(re.findall(
-            r"AggUnit-\d+", query, flags=re.IGNORECASE,
-        )))
-        if len(entities) != 1 or not evidence:
-            return None
-        entity = entities[0]
-        separator = r"\s*(?:,|\||\t)\s*"
-        row_pattern = re.compile(
-            re.escape(entity)
-            + separator
-            + r"[^,|\t\r\n]+"
-            + separator
-            + r"(-?\d+(?:\.\d+)?)",
-            re.IGNORECASE,
-        )
-        values: List[float] = []
-        seen_rows: Set[str] = set()
-        for raw_line in evidence.splitlines():
-            line = raw_line.strip()
-            if not line or line in seen_rows:
-                continue
-            match = row_pattern.search(line)
-            if not match:
-                continue
-            seen_rows.add(line)
+    ) -> bool:
+        """Confirm the trace operands are drawn from the evidence, not invented.
+
+        Trusting the model's *arithmetic* is unsafe, but trusting its *evidence
+        extraction* only holds if the operands actually occur in the evidence.
+        Matching is by numeric value against every number in the evidence, so it
+        is independent of formatting, layout, or entity naming.
+        """
+        if not evidence:
+            return False
+        evidence_values: List[float] = []
+        for token in cls._NUMBER_TOKEN_RE.findall(evidence):
             try:
-                values.append(float(match.group(1)))
+                evidence_values.append(float(token.replace(",", "")))
             except ValueError:
-                return None
-        if len(values) < 2:
+                continue
+        if not evidence_values:
+            return False
+        tolerance = cls._ARITH_TOLERANCE
+        for operand in operands:
+            if not any(abs(operand - value) <= tolerance for value in evidence_values):
+                return False
+        return True
+
+    @classmethod
+    def _parse_computation_trace(
+        cls,
+        source: str,
+    ) -> Optional[Tuple[str, List[float]]]:
+        """Extract ``(operation, operands)`` from a trace payload or block.
+
+        ``source`` may be a bare JSON object (as captured into telemetry) or any
+        text still wrapping it in ``<COMPUTATION_TRACE>`` tags.
+        """
+        if not source:
             return None
-        total = math.fsum(values)
-        if total.is_integer():
-            return str(int(total))
-        return f"{total:.10f}".rstrip("0").rstrip(".")
+        candidate = source.strip()
+        block = cls._COMPUTATION_TRACE_RE.search(candidate)
+        if block:
+            candidate = block.group(1)
+        try:
+            payload = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        operation = str(payload.get("operation") or payload.get("op") or "")
+        raw_operands = payload.get("operands")
+        if not isinstance(raw_operands, list) or len(raw_operands) < 2:
+            return None
+        operands: List[float] = []
+        for item in raw_operands:
+            try:
+                operands.append(float(str(item).replace(",", "").strip()))
+            except (TypeError, ValueError):
+                return None
+        return operation, operands
+
+    def _verify_computation_trace(
+        self,
+        answer: str,
+        evidence: str,
+        context: Optional["SearchContext"],
+    ) -> Optional[Tuple[str, bool]]:
+        """Deterministically re-check a model-disclosed computation trace.
+
+        The trace is read from ``context.telemetry`` first — the ReAct agent
+        captures it from the raw response before answer sanitization strips JSON
+        — and from the answer text as a fallback. Returns ``(answer,
+        was_corrected)`` when a grounded, recomputable trace exists, otherwise
+        ``None`` so the caller can fall back to inline-expression verification.
+        """
+        trace_source = ""
+        telemetry = getattr(context, "telemetry", None)
+        if isinstance(telemetry, dict):
+            trace_source = str(telemetry.get("computation_trace") or "")
+        parsed = self._parse_computation_trace(trace_source)
+        if parsed is None:
+            parsed = self._parse_computation_trace(answer)
+        if parsed is None:
+            return None
+        operation, operands = parsed
+        if not self._grounded_trace_operands(operands, evidence):
+            return None
+        computed = self._reduce_operation(operation, operands)
+        if computed is None:
+            return None
+        expected = self._format_number(computed)
+        current = self._extract_answer_span(answer)
+        current_number = re.search(r"-?\d[\d,]*(?:\.\d+)?", current or "")
+        normalized_current = (
+            current_number.group(0).replace(",", "") if current_number else ""
+        )
+        self._record_context_telemetry(
+            context,
+            computation_deterministic_verified=True,
+            computation_deterministic_result=expected,
+        )
+        if normalized_current == expected:
+            return answer, False
+        self._record_context_telemetry(
+            context,
+            computation_deterministic_corrected=True,
+            computation_answer_before=(current or "")[:200],
+            computation_answer_after=expected,
+        )
+        return self._replace_answer_span(answer, expected), True
 
     async def _verify_computation(
         self,
@@ -1766,37 +1900,29 @@ class AgenticSearch(BaseSearch):
     ) -> Tuple[str, bool]:
         """Verify arithmetic in computation-type answers.
 
-        Extracts arithmetic expressions, evaluates them with Python, and
-        re-prompts the LLM if a discrepancy is detected.
+        Two general, corpus-agnostic strategies, in order of confidence:
+
+        1. A model-disclosed ``<COMPUTATION_TRACE>`` (operands + operation) whose
+           operands are grounded in the evidence is re-computed in Python; the
+           final number is corrected on a mismatch. This trusts the model for
+           evidence extraction (semantic) but never for arithmetic (mechanical).
+        2. Otherwise, inline ``a op b = c`` expressions written in the answer are
+           evaluated and, on discrepancy, the model is re-prompted to revise.
 
         Returns:
             ``(corrected_answer, was_corrected)``.
         """
-        deterministic = self._deterministic_aggregation_sum(query, evidence)
-        if deterministic is not None:
-            current = self._extract_answer_span(answer)
-            current_number = re.search(r"-?\d[\d,]*(?:\.\d+)?", current or "")
-            normalized_current = (
-                current_number.group(0).replace(",", "") if current_number else ""
-            )
-            self._record_context_telemetry(
-                context,
-                computation_deterministic_verified=True,
-                computation_deterministic_result=deterministic,
-            )
-            if normalized_current != deterministic:
-                await self._logger.info(
-                    f"[Phase 4.5:Verify] Deterministic aggregation correction: "
-                    f"{normalized_current or '<missing>'} -> {deterministic}"
-                )
-                self._record_context_telemetry(
-                    context,
-                    computation_deterministic_corrected=True,
-                    computation_answer_before=current[:200],
-                    computation_answer_after=deterministic,
-                )
-                return self._replace_answer_span(answer, deterministic), True
-            return answer, False
+        if _COMPUTATION_TRACE:
+            trace_result = self._verify_computation_trace(answer, evidence, context)
+            if trace_result is not None:
+                verified_answer, was_corrected = trace_result
+                if was_corrected:
+                    await self._logger.info(
+                        "[Phase 4.5:Verify] Grounded computation-trace correction "
+                        f"applied ({self._extract_answer_span(answer) or '<missing>'} "
+                        f"-> {self._extract_answer_span(verified_answer)})"
+                    )
+                return verified_answer, was_corrected
 
         expressions = self._extract_arithmetic_expressions(answer)
         if not expressions:
@@ -11716,7 +11842,41 @@ class AgenticSearch(BaseSearch):
                     "For a monetary or measured quantity, include its magnitude "
                     "and unit as one answer span."
                 )
+        if _COMPUTATION_TRACE and self._answer_may_require_arithmetic(data_reqs):
+            parts.extend([
+                "",
+                "If — and only if — the answer is obtained by arithmetic over several "
+                "numbers from the evidence (e.g. a sum, average, count, min/max, or "
+                "difference), then AFTER <EVIDENCE_SUFFICIENCY> emit one line:",
+                "<COMPUTATION_TRACE>{\"operation\": \"sum|mean|count|min|max|product|"
+                "difference\", \"operands\": [<each exact number you took from the "
+                "evidence>], \"result\": <your computed value>}</COMPUTATION_TRACE>",
+                "List every operand exactly as it appears in the evidence. This block "
+                "is for verification only and never changes what goes in <ANSWER>. "
+                "Omit it entirely when the answer is looked up directly rather than "
+                "computed.",
+            ])
         return "\n".join(parts)
+
+    @staticmethod
+    def _answer_may_require_arithmetic(
+        data_reqs: Optional["DataRequirements"],
+    ) -> bool:
+        """Heuristic gate for requesting a computation trace.
+
+        Kept intentionally permissive: a false positive only adds an optional,
+        ignored block, while the trace itself carries the corpus-agnostic
+        verification signal.
+        """
+        if not data_reqs:
+            return False
+        if getattr(data_reqs, "formula", None):
+            return True
+        answer_type = str(getattr(data_reqs, "expected_answer_type", "") or "").lower()
+        return answer_type in {
+            "number", "integer", "float", "percentage", "percent",
+            "currency", "amount", "quantity",
+        }
 
     _TRIAGE_TOP_K: int = 2
     _TRIAGE_MAX_CHARS: int = 30_000

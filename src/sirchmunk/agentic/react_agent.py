@@ -32,6 +32,13 @@ _SUFFICIENCY_PATTERN = re.compile(
     r"<EVIDENCE_SUFFICIENCY>\s*(sufficient|partial|absent)\s*</EVIDENCE_SUFFICIENCY>",
     re.IGNORECASE,
 )
+# Optional machine-readable computation disclosure. Captured from the raw
+# response (before answer sanitization strips JSON) so the pipeline can
+# deterministically re-check the arithmetic behind a numeric answer.
+_COMPUTATION_TRACE_PATTERN = re.compile(
+    r"<COMPUTATION_TRACE>\s*(\{.*?\})\s*</COMPUTATION_TRACE>",
+    re.DOTALL | re.IGNORECASE,
+)
 
 # Patterns indicating JSON/code garbage in extracted answers
 _GARBAGE_PATTERNS = [
@@ -94,6 +101,23 @@ def _record_sufficiency(context: SearchContext, content: str) -> None:
         telemetry = {}
         setattr(context, "telemetry", telemetry)
     telemetry["evidence_sufficiency"] = sufficiency
+
+
+def _record_computation_trace(context: SearchContext, content: str) -> None:
+    """Stash a raw ``<COMPUTATION_TRACE>`` payload from the final response.
+
+    The trace is captured here, before answer sanitization removes JSON blocks,
+    and handed to the deterministic computation verifier via telemetry. It is
+    advisory only — absence simply means no arithmetic disclosure was made.
+    """
+    match = _COMPUTATION_TRACE_PATTERN.search(content or "")
+    if not match:
+        return
+    telemetry = getattr(context, "telemetry", None)
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+        setattr(context, "telemetry", telemetry)
+    telemetry["computation_trace"] = match.group(1).strip()
 
 
 def _is_garbage_content(text: str) -> bool:
@@ -402,6 +426,7 @@ class ReActSearchAgent:
             if answer:
                 final_answer = answer
                 _record_sufficiency(context, content)
+                _record_computation_trace(context, content)
                 await self._logger.success(f"[ReAct] Answer found at loop {context.loop_count}")
                 break
 

@@ -544,6 +544,84 @@ def test_corpus_topic_map_discovers_cross_document_topics(tmp_path) -> None:
     assert loaded.search(["characters"])[0][0] == "/corpus/film.txt"
 
 
+def test_corpus_topic_map_prunes_high_document_frequency_tokens() -> None:
+    """Non-discriminative tokens are dropped by corpus DF, not a fixed list.
+
+    A token shared by every document (here 'overview') carries no routing
+    signal and is pruned, while a rare token still routes to its file — without
+    any hardcoded stopword vocabulary.
+    """
+    trees = {}
+    for index in range(10):
+        path = f"/corpus/doc_{index}.txt"
+        children = [
+            TreeNode(
+                node_id=f"overview-{index}",
+                title="Overview",
+                summary="",
+                char_range=(0, 10),
+                level=1,
+            )
+        ]
+        if index == 3:
+            children.append(
+                TreeNode(
+                    node_id="rare",
+                    title="Peculiar Turbine Calibration",
+                    summary="",
+                    char_range=(10, 20),
+                    level=1,
+                )
+            )
+        trees[path] = DocumentTree(
+            file_path=path,
+            file_hash="hash",
+            created_at="now",
+            total_chars=20,
+            root=TreeNode(
+                node_id=f"root-{index}",
+                title="Document",
+                summary="",
+                char_range=(0, 20),
+                children=children,
+            ),
+        )
+
+    class _MultiIndexer:
+        def load_tree(self, file_path):
+            return trees.get(str(file_path))
+
+    topic_map = CorpusTopicMap.build_from_indexer(
+        _MultiIndexer(), list(trees), min_documents_for_pruning=8,
+        stop_document_fraction=0.5,
+    )
+
+    # 'overview' is in all 10 docs -> pruned -> no routing signal.
+    assert topic_map.search(["overview"]) == []
+    # A rare, discriminative token still routes to its single file.
+    assert topic_map.search(["turbine"])[0][0] == "/corpus/doc_3.txt"
+
+
+@pytest.mark.asyncio
+async def test_computation_trace_parsed_from_answer_when_no_telemetry() -> None:
+    """Fallback path: a trace embedded in the answer text is still honored."""
+    search = object.__new__(AgenticSearch)
+    search._logger = _FakeLogger()
+    context = SearchContext()
+    answer = (
+        "30316\n"
+        "<COMPUTATION_TRACE>{\"operation\": \"sum\", "
+        "\"operands\": [4996, 3850, 2046], \"result\": 30316}</COMPUTATION_TRACE>"
+    )
+    evidence = "4996\n3850\n2046"
+
+    corrected_answer, corrected = await search._verify_computation(
+        "total", answer, evidence=evidence, context=context,
+    )
+    assert corrected is True
+    assert AgenticSearch._extract_answer_span(corrected_answer) == "10892"
+
+
 @pytest.mark.asyncio
 async def test_structure_anchor_extracts_only_target_region(tmp_path) -> None:
     document = tmp_path / "structured.txt"
@@ -649,19 +727,29 @@ async def test_answer_resolution_preserves_required_numeric_unit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_computation_verifier_corrects_ledger_sum_deterministically() -> None:
+async def test_computation_verifier_corrects_grounded_trace_from_telemetry() -> None:
+    """A grounded computation trace drives deterministic correction.
+
+    The operands are corpus-agnostic (arbitrary entity/columns); correctness
+    comes from re-summing the model-disclosed, evidence-grounded operands, not
+    from any hardcoded row/column regex.
+    """
     search = object.__new__(AgenticSearch)
     search._logger = _FakeLogger()
     context = SearchContext()
+    context.telemetry = {
+        "computation_trace": json.dumps(
+            {"operation": "sum", "operands": [4996, 3850, 2046], "result": 30316}
+        )
+    }
     evidence = "\n".join([
-        "1,AggUnit-7080,Q1,4996,note",
-        "2,AggUnit-7080,Q1,3850,note",
-        "3,AggUnit-7080,Q2,2046,note",
-        "3,AggUnit-7080,Q2,2046,note",
+        "region,north,4996,usd",
+        "region,south,3850,usd",
+        "region,east,2046,usd",
     ])
 
     answer, corrected = await search._verify_computation(
-        "What is the total value across all rows for AggUnit-7080?",
+        "What is the total revenue across all regions?",
         "30316",
         evidence=evidence,
         context=context,
@@ -670,6 +758,69 @@ async def test_computation_verifier_corrects_ledger_sum_deterministically() -> N
     assert corrected is True
     assert AgenticSearch._extract_answer_span(answer) == "10892"
     assert context.telemetry["computation_deterministic_corrected"] is True
+
+
+@pytest.mark.asyncio
+async def test_computation_verifier_supports_mean_operation() -> None:
+    search = object.__new__(AgenticSearch)
+    search._logger = _FakeLogger()
+    context = SearchContext()
+    context.telemetry = {
+        "computation_trace": json.dumps(
+            {"operation": "average", "operands": [10, 20, 30], "result": 999}
+        )
+    }
+    evidence = "scores: 10, 20, 30"
+
+    answer, corrected = await search._verify_computation(
+        "What is the average score?", "999",
+        evidence=evidence, context=context,
+    )
+
+    assert corrected is True
+    assert AgenticSearch._extract_answer_span(answer) == "20"
+
+
+@pytest.mark.asyncio
+async def test_computation_verifier_keeps_correct_answer() -> None:
+    search = object.__new__(AgenticSearch)
+    search._logger = _FakeLogger()
+    context = SearchContext()
+    context.telemetry = {
+        "computation_trace": json.dumps(
+            {"operation": "sum", "operands": [100, 200], "result": 300}
+        )
+    }
+    answer, corrected = await search._verify_computation(
+        "total", "300",
+        evidence="a 100 b 200", context=context,
+    )
+    assert corrected is False
+    assert AgenticSearch._extract_answer_span(answer) == "300"
+    assert context.telemetry["computation_deterministic_verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_computation_verifier_rejects_ungrounded_operands() -> None:
+    """Hallucinated operands (absent from evidence) must not trigger correction."""
+    search = object.__new__(AgenticSearch)
+    search._logger = _FakeLogger()
+    context = SearchContext()
+    context.telemetry = {
+        "computation_trace": json.dumps(
+            {"operation": "sum", "operands": [4996, 9999], "result": 14995}
+        )
+    }
+    evidence = "only one relevant value: 4996"
+
+    answer, corrected = await search._verify_computation(
+        "total", "14995",
+        evidence=evidence, context=context,
+    )
+    # 9999 is not in evidence -> trace is not trusted -> no deterministic
+    # correction, and no inline expression to fall back on.
+    assert corrected is False
+    assert AgenticSearch._extract_answer_span(answer) == "14995"
 
 
 def test_hard_token_budget_rejects_oversized_prompt(monkeypatch) -> None:

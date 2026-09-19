@@ -12,16 +12,38 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-_TOPIC_TOKEN_RE = re.compile(
+# General Unicode tokenizer used when the caller does not inject one. It is a
+# language-agnostic fallback (alphanumeric runs + CJK runs), NOT a curated word
+# list. Discriminative-ness is decided by corpus statistics (document
+# frequency) at build time rather than by any fixed stopword set, so the map
+# adapts to whatever domain and languages the corpus actually contains.
+_DEFAULT_TOKEN_RE = re.compile(
     r"[a-zA-Z0-9][a-zA-Z0-9_\-]{2,}|[\u4e00-\u9fff]{2,}"
 )
-_TOPIC_STOP_WORDS = {
-    "the", "and", "for", "with", "from", "this", "that", "section",
-    "chapter", "document", "introduction", "summary", "overview",
-}
+
+Tokenizer = Callable[[str], Set[str]]
+
+
+def _default_tokenize(text: str) -> Set[str]:
+    """Tokenize a title into lowercase units plus CJK n-grams.
+
+    No stopword filtering happens here; non-discriminative tokens are pruned
+    from the built map by corpus document frequency instead.
+    """
+    tokens: Set[str] = set()
+    for match in _DEFAULT_TOKEN_RE.finditer(text or ""):
+        token = match.group(0).lower()
+        tokens.add(token)
+        if re.fullmatch(r"[\u4e00-\u9fff]{3,}", token):
+            for width in (2, 3):
+                tokens.update(
+                    token[index:index + width]
+                    for index in range(len(token) - width + 1)
+                )
+    return tokens
 
 
 @dataclass(frozen=True)
@@ -44,22 +66,13 @@ class CorpusTopicMap:
 
     topic_to_files: Dict[str, List[TopicReference]] = field(default_factory=dict)
     version: str = "1.0"
+    tokenizer: Optional[Tokenizer] = field(
+        default=None, compare=False, repr=False,
+    )
 
-    @staticmethod
-    def _tokens(text: str) -> Set[str]:
-        tokens: Set[str] = set()
-        for match in _TOPIC_TOKEN_RE.finditer(text or ""):
-            token = match.group(0).lower()
-            if token in _TOPIC_STOP_WORDS:
-                continue
-            tokens.add(token)
-            if re.fullmatch(r"[\u4e00-\u9fff]{3,}", token):
-                for width in (2, 3):
-                    tokens.update(
-                        token[index:index + width]
-                        for index in range(len(token) - width + 1)
-                    )
-        return tokens
+    def _tokens(self, text: str) -> Set[str]:
+        """Tokenize text with the injected tokenizer or the general default."""
+        return (self.tokenizer or _default_tokenize)(text)
 
     @classmethod
     def build_from_indexer(
@@ -68,10 +81,23 @@ class CorpusTopicMap:
         file_paths: Iterable[str],
         *,
         max_postings_per_topic: int = 500,
+        tokenizer: Optional[Tokenizer] = None,
+        stop_document_fraction: float = 0.5,
+        min_documents_for_pruning: int = 8,
     ) -> "CorpusTopicMap":
-        """Build a topic map from cached document trees."""
+        """Build a topic map from cached document trees.
+
+        Non-discriminative tokens are removed by corpus document frequency
+        rather than a fixed stopword list: once the corpus is large enough
+        (``min_documents_for_pruning``), any token appearing in at least
+        ``stop_document_fraction`` of the documents is dropped. This adapts to
+        the corpus's own languages and domain vocabulary.
+        """
+        tokenize = tokenizer or _default_tokenize
         mapping: Dict[str, List[TopicReference]] = {}
         seen: Dict[str, Set[Tuple[str, str]]] = {}
+        document_frequency: Dict[str, Set[str]] = {}
+        total_documents = 0
 
         for file_path in file_paths:
             try:
@@ -80,6 +106,8 @@ class CorpusTopicMap:
                 continue
             if tree is None or tree.root is None:
                 continue
+            total_documents += 1
+            file_key = str(file_path)
             stack = [tree.root]
             while stack:
                 node = stack.pop()
@@ -87,8 +115,9 @@ class CorpusTopicMap:
                 title = str(getattr(node, "title", "") or "").strip()
                 if not title or title == "Document":
                     continue
-                reference = TopicReference(file_path=str(file_path), section_title=title)
-                for token in cls._tokens(title):
+                reference = TopicReference(file_path=file_key, section_title=title)
+                for token in tokenize(title):
+                    document_frequency.setdefault(token, set()).add(file_key)
                     postings = mapping.setdefault(token, [])
                     topic_seen = seen.setdefault(token, set())
                     marker = (reference.file_path, reference.section_title)
@@ -97,7 +126,13 @@ class CorpusTopicMap:
                     topic_seen.add(marker)
                     postings.append(reference)
 
-        return cls(topic_to_files=mapping)
+        if total_documents >= min_documents_for_pruning and stop_document_fraction > 0:
+            cutoff = stop_document_fraction * total_documents
+            for token, files in document_frequency.items():
+                if len(files) >= cutoff:
+                    mapping.pop(token, None)
+
+        return cls(topic_to_files=mapping, tokenizer=tokenizer)
 
     def search(
         self,
