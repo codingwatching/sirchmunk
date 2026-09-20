@@ -169,6 +169,10 @@ For reproducible experiments, see [`benchmarks/README.md`](benchmarks/README.md)
   - **Meta-cluster discovery**: Leiden community detection algorithm partitions the knowledge graph into communities; LLM synthesizes shared queries into meta-clusters (`META` lifecycle) as higher-level abstractions to reduce search complexity.
   - **Background async evolution**: Evolution steps triggered fire-and-forget after search completes without blocking returns; locks and semaphores ensure concurrency safety; manifest persistence enables incremental recovery.
   - **Knowledge graph visualization**: New knowledge cluster graph in the Web UI, intuitively presenting semantic relationships and lifecycle states between clusters, with interactive exploration and filtering.
+
+<details>
+<summary><b>Older releases (v0.0.1 – v0.0.8)</b></summary>
+
 * 🚀 **Jun 18, 2026**: Sirchmunk v0.0.8
   - **Knowledge Compile (Beta)**: New `sirchmunk compile` command for offline document pre-processing — builds hierarchical tree indices and knowledge clusters to boost retrieval precision in both FAST and DEEP modes.
   - **Search pipeline integration**: Compile artifacts (tree indices, document catalog, summary index) are automatically detected and used by the search pipeline when available; graceful fallback to standard retrieval when absent.
@@ -192,9 +196,6 @@ For reproducible experiments, see [`benchmarks/README.md`](benchmarks/README.md)
   - **Document summarization & cross-lingual retrieval**: Summarization pipeline (chunk/merge/rerank), cross-lingual keyword extraction, chat-history relevance filtering
   - **Docker**: `SIRCHMUNK_SEARCH_PATHS` env support; updated entrypoint; document-processing dependencies
   - **OpenAI client**: `_ProviderProfile` for multi-provider management; auto-detect from `base_url`; unified streaming; `thinking_content` support
-
-<details>
-<summary><b>Older releases (v0.0.2 – v0.0.5)</b></summary>
 
 * 🚀 **Mar 5, 2026**: Sirchmunk v0.0.5
   - **Breaking Change**: Unified Search API: Streamlined search() interface with a new SearchContext object and response_format-based output control.
