@@ -159,6 +159,11 @@ For reproducible experiments, see [`benchmarks/README.md`](benchmarks/README.md)
 
 ## 🎉 News
 
+* 🚀 **Sep 20, 2026**: Sirchmunk v0.1.0
+  - **Multi-path DEEP retrieval**: Parallel lexical, exact-entity, directory, structure, and cross-document topic-map routes fused by confidence-weighted RRF, with a soft route-collapse fast-track that shrinks high-confidence single-file lookups to cut latency and tokens while preserving answer quality.
+  - **Large-corpus robustness**: Bounded per-file and per-query retrieval cost — capability-based `rga` adapter whitelist, per-file size cap, a tiered `rg`-first + rich-format pass, and per-file match caps — so huge, archive-heavy, many-file corpora no longer stall or time out; directory scanning is now on by default for stronger filename routing, and a hard token budget keeps each query within a configurable limit.
+  - **Broader format coverage**: Native exact-match fallback for LOG/PPTX/XLSX, plus heuristic document tree v2 (including DOCX/RST) with structure anchors guiding evidence extraction.
+  - **Grounded numeric verification**: Computation answers are re-checked deterministically from model-disclosed, evidence-grounded operands — corpus-agnostic, with no hardcoded dataset rules.
 * 🚀 **Jul 21, 2026**: Sirchmunk v0.0.9
   - **Knowledge self-evolving engine**: New runtime knowledge evolver (`KnowledgeEvolver`) with a four-phase cycle — connect & merge, edge refresh, meta-cluster detection, and global update; the knowledge graph evolves automatically with search usage.
   - **Meta-cluster discovery**: Leiden community detection algorithm partitions the knowledge graph into communities; LLM synthesizes shared queries into meta-clusters (`META` lifecycle) as higher-level abstractions to reduce search complexity.
