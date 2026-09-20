@@ -318,3 +318,35 @@ instances of it.
   documented explicitly at the call site and surfaced in the change's final
   report, together with its applicability boundary and the generalization risk
   it carries.
+
+### 9.6 Retrieval Cost Invariants (Query Hot Path)
+
+The query hot path MUST have a bounded per-file and per-query cost that does not
+grow unbounded with corpus size or shape. These invariants are cost/capability
+policies (corpus-agnostic), enforced centrally in `GrepRetriever` and configured
+in `config/env.example`:
+
+- Per-file size cap: `GREP_MAX_FILESIZE_MB` skips any file over the cap,
+  regardless of type.
+- Bounded adapters only: `GREP_RGA_ADAPTERS` keeps bounded document extractors
+  (poppler/pandoc) and disables the unbounded recursive/streaming adapters
+  (decompress/zip/tar/sqlite/ffmpeg) so archives are never inline-decompressed
+  during a query.
+- Tiered scan: `GREP_TIERED_SCAN` runs a fast native-rg pass over all files
+  unioned with an rga pass restricted to `GREP_RICH_EXTENSIONS`, so rga's
+  per-file adapter dispatch never walks the whole tree.
+- Fail-fast budgets: the rg text pass uses `GREP_TEXT_TIMEOUT`; the rga rich
+  pass uses `GREP_TIMEOUT`; on timeout the search degrades to native rg rather
+  than hanging.
+- Offline-only container recursion: archive/container/compression adapters MAY
+  be enabled ONLY in an offline compile/extraction step (never the query hot
+  path), by overriding `GREP_RGA_ADAPTERS` in that context. Extracted content
+  is then searched as normal files.
+- Amortized rich extraction: `GrepRetriever.prewarm_rich_cache` MAY be called
+  offline to populate the rga cache for pdf/docx-heavy corpora so the first
+  query is warm.
+
+A change that can make a single file or a single query cost grow without bound
+(e.g., enabling inline decompression on the hot path, or pointing rga's adapter
+engine at an unbounded raw tree) violates these invariants and MUST be
+redesigned.
