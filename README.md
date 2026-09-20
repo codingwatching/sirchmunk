@@ -159,11 +159,18 @@ For reproducible experiments, see [`benchmarks/README.md`](benchmarks/README.md)
 
 ## 🎉 News
 
-* 🚀 **Sep 20, 2026**: Sirchmunk v0.1.0
+* 🚀 **Sep 20, 2026**: Sirchmunk v0.2.0
   - **Multi-path DEEP retrieval**: Parallel lexical, exact-entity, directory, structure, and cross-document topic-map routes fused by confidence-weighted RRF, with a soft route-collapse fast-track that shrinks high-confidence single-file lookups to cut latency and tokens while preserving answer quality.
   - **Large-corpus robustness**: Bounded per-file and per-query retrieval cost — capability-based `rga` adapter whitelist, per-file size cap, a tiered `rg`-first + rich-format pass, and per-file match caps — so huge, archive-heavy, many-file corpora no longer stall or time out; directory scanning is now on by default for stronger filename routing, and a hard token budget keeps each query within a configurable limit.
   - **Broader format coverage**: Native exact-match fallback for LOG/PPTX/XLSX, plus heuristic document tree v2 (including DOCX/RST) with structure anchors guiding evidence extraction.
   - **Grounded numeric verification**: Computation answers are re-checked deterministically from model-disclosed, evidence-grounded operands — corpus-agnostic, with no hardcoded dataset rules.
+* 🚀 **Sep 20, 2026**: Sirchmunk v0.1.0
+  - **LENS retrieval framework**: Introduced LENS (Latent Evidence Navigation and Search), a budget-constrained framework that locates source-grounded evidence directly from raw, dynamic corpora, with configurable components — batch evidence ranking, multi-arm navigation, adaptive explore/exploit mixing, reasoning-chain-guided sampling, and statistical stopping decisions.
+  - **Prior-warmed agentic DEEP loop**: Combines pre-retrieved evidence with iterative ReAct exploration and answer synthesis; hop-aware strategies for single-hop, bridge, and comparison questions (with optional second-hop re-search); format-agnostic retrieval for non-semantic filenames, extensionless text, and large JSON/JSONL shards.
+  - **DEEP by default**: Default search mode switched from FAST to DEEP across the Python API, CLI, HTTP API, MCP server, Web UI, Docker examples, and OpenClaw integration.
+  - **Rich responses & unified formats**: Responses carry the final answer, source-linked evidence, retrieval decisions, and token/loop/file-read telemetry; `rich` / `minimal` / `context` / `json` formats standardized across the Python API, CLI, HTTP API, and MCP server; `return_context` superseded by `response_format` (deprecated compatibility shim retained).
+  - **AnswerPolicy seam**: Refusal and forced-guess behavior moved behind an `AnswerPolicy` interface, separating product behavior from benchmark evaluation semantics.
+  - **ResearchOps benchmark framework**: Experiment orchestration with checkpoints, retries, artifact registries, control gates, reporting, and Pareto analysis; HotpotQA support with frozen sample sets, checksums, dynamic G_n/D_n corpus snapshots, raw-corpus synchronization checks, and stale-index evaluation; BM25-RAG, Hybrid-RAG, ReAct, LightRAG v1.3.6, SDK, lexical, indexing, and closed-book baselines under a shared retrieval contract, plus lifecycle/scaling cost evaluation and LENS ablation profiles.
 * 🚀 **Jul 21, 2026**: Sirchmunk v0.0.9
   - **Knowledge self-evolving engine**: New runtime knowledge evolver (`KnowledgeEvolver`) with a four-phase cycle — connect & merge, edge refresh, meta-cluster detection, and global update; the knowledge graph evolves automatically with search usage.
   - **Meta-cluster discovery**: Leiden community detection algorithm partitions the knowledge graph into communities; LLM synthesizes shared queries into meta-clusters (`META` lifecycle) as higher-level abstractions to reduce search complexity.
