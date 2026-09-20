@@ -55,6 +55,11 @@ GREP_RICH_EXTENSIONS = tuple(
 # Fail-fast timeout (seconds) for the rg text pass; the rga rich pass keeps the
 # longer GREP_TIMEOUT because bounded document extraction is inherently slower.
 GREP_TEXT_TIMEOUT = max(1.0, float(os.getenv("GREP_TEXT_TIMEOUT", "15.0")))
+# Cap matches emitted per file (rg/rga -m/--max-count). Bounds JSON output
+# volume so a broad query over a huge corpus cannot blow the scan budget with
+# millions of match lines. Ranking only needs presence + a few snippets per
+# file, so this does not affect which files are found. 0 = unlimited.
+GREP_MAX_MATCHES_PER_FILE = max(0, int(os.getenv("GREP_MAX_MATCHES_PER_FILE", "5")))
 
 # LLM Configuration
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")

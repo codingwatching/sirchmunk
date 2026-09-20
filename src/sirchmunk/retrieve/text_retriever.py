@@ -20,6 +20,7 @@ from ..utils.constants import (
     GREP_FALLBACK_TO_RG,
     GREP_KEYWORD_CONCURRENT_LIMIT,
     GREP_MAX_FILESIZE_MB,
+    GREP_MAX_MATCHES_PER_FILE,
     GREP_PROCESS_KILL_TIMEOUT,
     GREP_QUEUE_TIMEOUT,
     GREP_RGA_ADAPTERS,
@@ -899,9 +900,15 @@ class GrepRetriever(BaseRetriever):
         # Text pass: native rg over everything. rg auto-detects and skips binary
         # files and never decompresses archives, so this is O(bytes) fast and
         # covers all plain-text/markup/code formats (including extensionless).
-        text_args = (
-            GrepRetriever._rg_compatible_args(list(args)) + [pattern] + path_args
-        )
+        text_args = GrepRetriever._rg_compatible_args(list(args))
+        # Cap matches per file on the text pass ONLY: rg over the whole tree can
+        # match a huge number of files (a broad term across a large text corpus),
+        # and unbounded --json output there is what blows the scan budget. The
+        # rga rich pass stays uncapped so a needle deep inside a single pdf/docx
+        # is never truncated out of the evidence.
+        if GREP_MAX_MATCHES_PER_FILE > 0:
+            text_args.append(f"--max-count={GREP_MAX_MATCHES_PER_FILE}")
+        text_args = text_args + [pattern] + path_args
         # Rich pass: rga restricted to the binary document formats rg cannot read.
         rich_globs: List[str] = []
         for ext in GREP_RICH_EXTENSIONS:
