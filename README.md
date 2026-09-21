@@ -736,11 +736,7 @@ The four-phase evolution cycle is orchestrated by the `KnowledgeEvolver`, runnin
 
 Watch how knowledge clusters emerge, merge, and form meta-communities over a series of search interactions:
 
-<div align="center">
-  <video controls autoplay muted loop playsinline width="100%" src="https://github.com/user-attachments/assets/knowledge_evolving.mp4"></video>
-</div>
-
-> 📹 **[Knowledge Evolution Demo](assets/video/knowledge_evolving.mp4)** — Time-lapse replay showing knowledge clusters evolving across 200 queries over 4 documents.
+https://github.com/modelscope/sirchmunk/raw/main/assets/video/knowledge_evolving.mp4
 
 #### Key Properties
 
