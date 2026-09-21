@@ -736,9 +736,9 @@ KnowledgeCluster 是一个丰富标注的对象，完整记录了单次搜索周
 观看知识聚类如何在一系列搜索交互中涌现、合并并形成元社区：
 
 <p align="center">
-  <a href="https://github.com/modelscope/sirchmunk/raw/main/assets/video/knowledge_evolving.mp4">
-    <img src="assets/pic/Sirchmunk_Knowledge_Graph.png" alt="知识进化演示 — 点击播放" width="700"/>
-  </a>
+  <video controls autoplay muted loop playsinline width="700" src="assets/video/knowledge_evolving.mp4">
+    您的浏览器不支持视频标签。
+  </video>
 </p>
 
 #### 核心特性
