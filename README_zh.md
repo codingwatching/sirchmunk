@@ -736,10 +736,8 @@ KnowledgeCluster 是一个丰富标注的对象，完整记录了单次搜索周
 观看知识聚类如何在一系列搜索交互中涌现、合并并形成元社区：
 
 <div align="center">
-  <video controls autoplay muted loop playsinline width="100%" src="https://github.com/user-attachments/assets/knowledge_evolving.mp4"></video>
+  <video controls autoplay muted loop playsinline width="100%" src="https://github.com/user-attachments/assets/6f5109f1-7b61-4134-9447-00787fb87c78"></video>
 </div>
-
-> 📹 **[知识进化演示](assets/video/knowledge_evolving.mp4)** — 时间序列回放，展示知识聚类在 200 次查询、4 篇文档上的演化过程。
 
 #### 核心特性
 
