@@ -719,6 +719,28 @@ KnowledgeCluster 是一个丰富标注的对象，完整记录了单次搜索周
    - 元聚类发现。元聚类由 `Leiden` 算法在聚类图上检测得到；随后，基于各子聚类的查询集，调用 LLM 生成元聚类级查询并计算其嵌入，作为后续相似聚类检索的第一层粗筛索引。
    - 全局重校准。重新计算所有语义边两端聚类的嵌入相似度，据此更新边权重或移除已失效的低相似度边。此步骤同时包含上述三项操作，作为一次完整的周期性全局同步。
 
+#### 知识进化器架构
+
+四阶段进化周期由 `KnowledgeEvolver` 编排，在后台异步运行：
+
+<p align="center">
+  <img src="assets/pic/Knowledge_Evolver_Architecture.png" alt="知识进化器架构" width="700"/>
+</p>
+
+- **顶层**：事件循环监控搜索活动，根据缓冲区计数和步数间隔触发进化阶段。
+- **中间层**：四个阶段顺序执行 — 连接与合并（Connect & Merge）整合相关聚类（相似度 ≥ 0.90 合并，≥ 0.60 建边），刷新边（Refresh Edges）更新聚类间关系，检测元聚类（Detect Meta Clusters）应用 Leiden 社区检测发现高阶结构，全局更新（Global Update）同步生命周期状态。
+- **底层**：结果持久化到 DuckDB + Parquet，增量 manifest 确保崩溃恢复。
+
+**知识进化过程演示**
+
+观看知识聚类如何在一系列搜索交互中涌现、合并并形成元社区：
+
+<div align="center">
+  <video controls autoplay muted loop playsinline width="100%" src="https://github.com/user-attachments/assets/knowledge_evolving.mp4"></video>
+</div>
+
+> 📹 **[知识进化演示](assets/video/knowledge_evolving.mp4)** — 时间序列回放，展示知识聚类在 200 次查询、4 篇文档上的演化过程。
+
 #### 核心特性
 
 - **零成本加速：** 重复或语义相似的查询直接从缓存聚类获取答案，无需任何 LLM 推理，后续搜索几乎瞬时完成。

@@ -720,6 +720,28 @@ A KnowledgeCluster is a richly annotated object that captures the full cognitive
    - Meta-cluster discovery. Meta-clusters are detected on the cluster graph via the `Leiden` algorithm; the LLM then synthesizes a meta-cluster-level query from each group's child query sets, and its embedding serves as a coarse first-pass index for subsequent similar-cluster retrieval.
    - Global recalibration. The system recomputes embedding similarity across every semantic edge and updates weights accordingly — pruning any edge that has fallen below the validity threshold. This step also encompasses the three operations above, serving as a single complete periodic sync.
 
+#### Knowledge Evolver Architecture
+
+The four-phase evolution cycle is orchestrated by the `KnowledgeEvolver`, running asynchronously in the background:
+
+<p align="center">
+  <img src="assets/pic/Knowledge_Evolver_Architecture.png" alt="Knowledge Evolver Architecture" width="700"/>
+</p>
+
+- **Top layer**: Event loop monitors search activity and triggers evolution phases based on buffer counts and step intervals.
+- **Middle layer**: The four phases execute sequentially — Connect & Merge consolidates related clusters (similarity ≥ 0.90 merges, ≥ 0.60 creates edges), Refresh Edges updates inter-cluster relationships, Detect Meta Clusters applies Leiden community detection to discover higher-order structure, and Global Update synchronizes lifecycle states.
+- **Bottom layer**: Results persist to DuckDB + Parquet, with an incremental manifest ensuring crash recovery.
+
+**Knowledge Evolution in Action**
+
+Watch how knowledge clusters emerge, merge, and form meta-communities over a series of search interactions:
+
+<div align="center">
+  <video controls autoplay muted loop playsinline width="100%" src="https://github.com/user-attachments/assets/knowledge_evolving.mp4"></video>
+</div>
+
+> 📹 **[Knowledge Evolution Demo](assets/video/knowledge_evolving.mp4)** — Time-lapse replay showing knowledge clusters evolving across 200 queries over 4 documents.
+
 #### Key Properties
 
 - **Zero-cost acceleration:** Repeated or semantically similar queries are answered from cached clusters without any LLM inference, making subsequent searches near-instantaneous.
